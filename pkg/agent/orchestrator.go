@@ -2,9 +2,11 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/esrrhs/go_llm_engine/pkg/engine"
@@ -22,6 +24,8 @@ type Orchestrator struct {
 	llm     llm.Client
 	sandbox *tools.Sandbox
 	log     *Logger
+	usage   *UsageTracker
+	cpMu    sync.Mutex
 }
 
 // New creates an orchestrator around an existing tree.
@@ -47,6 +51,7 @@ func New(cfg Config, tree *engine.TaskTree, client llm.Client, log *Logger) (*Or
 		llm:     client,
 		sandbox: sandbox,
 		log:     log,
+		usage:   NewUsageTracker(),
 	}, nil
 }
 
@@ -129,67 +134,233 @@ func (o *Orchestrator) Tree() *engine.TaskTree { return o.tree }
 // StorageDir is the persistence directory.
 func (o *Orchestrator) StorageDir() string { return o.cfg.DataDir }
 
-// Run drives the engine until the root completes, fails, or the context is cancelled.
+// parallel returns the effective number of concurrent leaf workers.
+func (o *Orchestrator) parallel() int {
+	if o.cfg.Parallel > 1 {
+		return o.cfg.Parallel
+	}
+	return 1
+}
+
+// Run drives the engine until the root completes, fails, or the context is
+// cancelled. Ready leaves run concurrently, bounded by cfg.Parallel.
 func (o *Orchestrator) Run(ctx context.Context) error {
 	o.log.Banner("go_llm_engine")
 	o.log.Infof("session %s", o.tree.ID)
 	o.log.Infof("model   %s", o.cfg.Model)
 	o.log.Infof("workdir %s", o.sandbox.Root)
 	o.log.Infof("goal    %s", o.cfg.Goal)
+	o.log.Infof("parallel %d", o.parallel())
 	o.printTree()
 
 	if err := o.checkpoint(); err != nil {
 		return err
 	}
 
+	parallel := o.parallel()
+	done := make(chan string, 64)
+	var mu sync.Mutex
+	inFlight := make(map[string]bool, parallel)
+	var wg sync.WaitGroup
+	var firstErr error
+
+	// tryDispatch launches fn. It reports (started, poolFull): started is false
+	// when id is already in flight or the pool is full.
+	tryDispatch := func(id string, fn func(context.Context) error) (started, poolFull bool) {
+		mu.Lock()
+		if inFlight[id] {
+			mu.Unlock()
+			return false, false
+		}
+		if len(inFlight) >= parallel {
+			mu.Unlock()
+			return false, true
+		}
+		inFlight[id] = true
+		mu.Unlock()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := fn(ctx)
+			if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				o.log.Errorf("%s: %v", id, err)
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				mu.Unlock()
+			}
+			mu.Lock()
+			delete(inFlight, id)
+			mu.Unlock()
+			select {
+			case done <- id:
+			default:
+			}
+		}()
+		return true, false
+	}
+
 	idle := 0
+	for {
+		if err := ctx.Err(); err != nil {
+			wg.Wait()
+			o.logUsage()
+			_ = o.checkpoint()
+			return err
+		}
+		if o.sched.IsComplete() {
+			wg.Wait()
+			o.printTree()
+			o.logUsage()
+			o.log.Okf("root task completed")
+			return o.checkpoint()
+		}
+		if o.sched.HasFailed() {
+			wg.Wait()
+			o.printTree()
+			o.logUsage()
+			msg := ""
+			if root, ok := o.tree.CloneNode(o.tree.RootID); ok {
+				msg = root.ErrorMsg
+			}
+			return fmt.Errorf("root task failed: %s", msg)
+		}
+		mu.Lock()
+		err := firstErr
+		busy := len(inFlight)
+		mu.Unlock()
+		if err != nil && busy == 0 {
+			return err
+		}
+
+		progressed := false
+
+		// Decomposition fills the tree; leaves then fill the pool.
+		if node := o.sched.GetNextDecomposableNode(); node != nil {
+			n := node
+			if started, _ := tryDispatch(n.ID, func(c context.Context) error {
+				if derr := o.decompose(c, n); derr != nil {
+					if c.Err() != nil {
+						_ = o.sched.UpdateNodeState(n.ID, models.TaskStatePending, "interrupted")
+					} else {
+						o.log.Errorf("decompose %s: %v", n.ID, derr)
+						_ = o.sched.UpdateNodeState(n.ID, models.TaskStateFailed, derr.Error())
+					}
+				}
+				return nil
+			}); started {
+				progressed = true
+			}
+		}
+		for _, leaf := range o.sched.GetReadyLeafNodes() {
+			lf := leaf
+			started, poolFull := tryDispatch(lf.ID, func(c context.Context) error {
+				return o.executeLeaf(c, lf)
+			})
+			if poolFull {
+				break
+			}
+			if started {
+				progressed = true
+			}
+		}
+
+		if !progressed {
+			mu.Lock()
+			busy = len(inFlight)
+			mu.Unlock()
+			if busy == 0 {
+				idle++
+				if idle > 3 {
+					wg.Wait()
+					o.logUsage()
+					return fmt.Errorf("no runnable tasks (%s)", o.sched.DescribeStuck())
+				}
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+			idle = 0
+			select {
+			case <-done:
+			case <-ctx.Done():
+			}
+			_ = o.checkpoint()
+			o.printTree()
+			continue
+		}
+		idle = 0
+	}
+}
+
+// RunPlan decomposes the goal into a full tree of leaves without executing any
+// of them. The saved session can later be executed with -resume.
+func (o *Orchestrator) RunPlan(ctx context.Context) error {
+	o.log.Banner("go_llm_engine (plan)")
+	o.log.Infof("session %s", o.tree.ID)
+	o.log.Infof("model   %s", o.cfg.Model)
+	o.log.Infof("workdir %s", o.sandbox.Root)
+	o.log.Infof("goal    %s", o.cfg.Goal)
+
+	if err := o.checkpoint(); err != nil {
+		return err
+	}
 	for {
 		if err := ctx.Err(); err != nil {
 			_ = o.checkpoint()
 			return err
 		}
-		if o.sched.IsComplete() {
-			o.printTree()
-			o.log.Okf("root task completed")
-			return o.checkpoint()
+		node := o.sched.GetNextDecomposableNode()
+		if node == nil {
+			break
 		}
-		if o.sched.HasFailed() {
-			root := o.tree.GetRoot()
-			msg := ""
-			if root != nil {
-				msg = root.ErrorMsg
+		o.log.Actionf("plan: decompose %s — %s", node.ID, node.Title)
+		if err := o.decompose(ctx, node); err != nil {
+			if ctx.Err() != nil {
+				_ = o.sched.UpdateNodeState(node.ID, models.TaskStatePending, "interrupted")
+				_ = o.checkpoint()
+				return err
 			}
-			o.printTree()
-			return fmt.Errorf("root task failed: %s", msg)
-		}
-
-		if node := o.sched.GetNextDecomposableNode(); node != nil {
-			idle = 0
-			if err := o.decompose(ctx, node); err != nil {
-				o.log.Errorf("decompose %s: %v", node.ID, err)
-				_ = o.sched.UpdateNodeState(node.ID, models.TaskStateFailed, err.Error())
-			}
+			o.log.Errorf("decompose %s: %v", node.ID, err)
+			_ = o.sched.UpdateNodeState(node.ID, models.TaskStateFailed, err.Error())
 			_ = o.checkpoint()
-			o.printTree()
-			continue
-		}
-
-		ready := o.sched.GetReadyLeafNodes()
-		if len(ready) == 0 {
-			idle++
-			if idle > 3 {
-				return fmt.Errorf("no runnable tasks (%s)", o.sched.DescribeStuck())
-			}
-			time.Sleep(50 * time.Millisecond)
-			continue
-		}
-		idle = 0
-		leaf := ready[0]
-		if err := o.executeLeaf(ctx, leaf); err != nil {
-			return err
+			return fmt.Errorf("plan failed at %s: %w", node.ID, err)
 		}
 		_ = o.checkpoint()
 		o.printTree()
+	}
+
+	o.printTree()
+	_, total, _ := o.tree.GetLeafProgress()
+	o.logUsage()
+	o.log.Okf("plan ready: %d leaf tasks (execute with: -resume -session %s)", total, o.tree.ID)
+	return o.checkpoint()
+}
+
+// chat wraps o.llm.Chat and records token usage under a call kind.
+func (o *Orchestrator) chat(ctx context.Context, kind string, req llm.Request) (*llm.Response, error) {
+	resp, err := o.llm.Chat(ctx, req)
+	if resp != nil {
+		o.usage.Add(kind, resp.Usage)
+	}
+	return resp, err
+}
+
+func (o *Orchestrator) logUsage() {
+	u, calls := o.usage.Total()
+	if calls == 0 {
+		return
+	}
+	o.log.Infof("llm usage: %d calls, prompt %d + completion %d = %d tokens",
+		calls, u.PromptTokens, u.CompletionTokens, u.TotalTokens)
+	if !o.cfg.Verbose {
+		return
+	}
+	keys, kinds := o.usage.SortedKinds()
+	for _, k := range keys {
+		v := kinds[k]
+		o.log.Debugf("  %s: %d prompt + %d completion = %d tokens",
+			k, v.PromptTokens, v.CompletionTokens, v.TotalTokens)
 	}
 }
 
@@ -313,6 +484,8 @@ func (o *Orchestrator) handleLeafFailure(leaf *models.TaskNode, errMsg string) e
 }
 
 func (o *Orchestrator) checkpoint() error {
+	o.cpMu.Lock()
+	defer o.cpMu.Unlock()
 	if err := o.storage.SaveTree(o.tree); err != nil {
 		return err
 	}

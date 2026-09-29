@@ -34,7 +34,7 @@ func (o *Orchestrator) runWorker(ctx context.Context, node *models.TaskNode, pre
 		}
 		o.log.Actionf("worker %s step %d/%d", node.ID, step, maxSteps)
 
-		resp, err := o.llm.Chat(ctx, llm.Request{
+		resp, err := o.chat(ctx, "worker", llm.Request{
 			Model:       o.cfg.Model,
 			Messages:    messages,
 			Tools:       native,

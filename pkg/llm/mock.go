@@ -1,16 +1,23 @@
 package llm
 
-import "context"
+import (
+	"context"
+	"sync"
+)
 
 // ScriptedClient returns canned responses in order. Used by tests.
+// Safe for concurrent use (parallel leaf execution calls Chat concurrently).
 type ScriptedClient struct {
 	Handle func(ctx context.Context, req Request) (*Response, error)
 
+	mu       sync.Mutex
 	Requests []Request
 }
 
 func (c *ScriptedClient) Chat(ctx context.Context, req Request) (*Response, error) {
+	c.mu.Lock()
 	c.Requests = append(c.Requests, req)
+	c.mu.Unlock()
 	if c.Handle == nil {
 		return nil, nil
 	}
@@ -21,14 +28,25 @@ func (c *ScriptedClient) Chat(ctx context.Context, req Request) (*Response, erro
 type SequenceClient struct {
 	Responses []*Response
 	Errs      []error
-	I         int
-	Requests  []Request
+
+	mu       sync.Mutex
+	i        int
+	Requests []Request
+}
+
+// Index returns how many responses have been served.
+func (c *SequenceClient) Index() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.i
 }
 
 func (c *SequenceClient) Chat(ctx context.Context, req Request) (*Response, error) {
+	c.mu.Lock()
 	c.Requests = append(c.Requests, req)
-	i := c.I
-	c.I++
+	i := c.i
+	c.i++
+	c.mu.Unlock()
 	if i < len(c.Errs) && c.Errs[i] != nil {
 		return nil, c.Errs[i]
 	}

@@ -65,7 +65,7 @@ func (o *Orchestrator) decompose(ctx context.Context, node *models.TaskNode) err
 		}
 
 		o.log.Actionf("decompose %s (attempt %d)", node.ID, attempt)
-		resp, err := o.llm.Chat(ctx, llm.Request{
+		resp, err := o.chat(ctx, "decompose", llm.Request{
 			Model:       o.cfg.Model,
 			Messages:    messages,
 			Temperature: o.cfg.Temperature,

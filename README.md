@@ -23,6 +23,13 @@ export OPENAI_MODEL=qwen2.5-coder:14b
 ./go_llm_engine -workdir ./ws "用 Go 写一个 /health 返回 ok 的 HTTP 服务，并带单测"
 ```
 
+先只拆解不执行，人工检查任务树后再跑：
+
+```bash
+./go_llm_engine -plan -workdir ./ws "目标"   # 生成任务树后退出
+./go_llm_engine -resume -workdir ./ws        # 执行已规划的任务
+```
+
 常用参数：
 
 | 参数 | 含义 |
@@ -31,11 +38,13 @@ export OPENAI_MODEL=qwen2.5-coder:14b
 | `-resume` | 从上次会话继续（默认读 `.go_llm_engine/LATEST`） |
 | `-session` | 指定会话 ID |
 | `-status` | 只打印任务树，不执行 |
+| `-plan` | 只拆解出任务树并保存，不执行（配合 `-resume` 使用） |
+| `-parallel` | 同时执行的叶子数，默认 `1`；仅当叶子写不同文件时建议 >1 |
 | `-max-retries` | 叶子验收失败最多重试几次，`0`（默认）为无限 |
 | `-retry-max-wait` | 指数退避上限，默认 `30s` |
 | `-native-tools` | 改用 OpenAI `tool_calls`（强模型可开；弱模型默认 JSON 更稳） |
 | `-extra` | 合并进请求体的 JSON，例如 Qwen3：`'{"enable_thinking":false}'` |
-| `-v` | 打印模型原文和工具输出 |
+| `-v` | 打印模型原文和工具输出（结束时附带分项 token 用量） |
 
 中断（Ctrl+C）会保存任务树，之后：
 
@@ -58,6 +67,7 @@ export OPENAI_MODEL=qwen2.5-coder:14b
 ```
 
 叶子执行**不携带**其它叶子的对话历史，只注入：当前任务、契约、父节点/依赖摘要、少量相关文件、验收命令。
+没有依赖关系的就绪叶子可以并发执行（`-parallel N`，默认 `1`）；运行结束会汇总本次所有 LLM 调用的 token 用量。
 
 ---
 
@@ -108,5 +118,6 @@ go test ./...
 - [x] 阶段 3：Decomposer 与契约生成
 - [x] 阶段 4：隔离 Worker、Verifier、失败再拆
 - [x] 阶段 5：CLI、断点续跑、树状进度、mock 端到端
+- [x] 阶段 6：并行叶子执行（`-parallel`）、token 用量统计、plan-only 规划（`-plan`）
 
 弱模型上的 Prompt 与拆分粒度仍需按具体模型微调（`-max-depth`、`-max-steps`、`-extra`）。

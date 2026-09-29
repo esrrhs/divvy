@@ -45,6 +45,8 @@ func run(args []string) error {
 	maxDepth := fs.Int("max-depth", cfg.MaxDepth, "max decomposition depth")
 	maxTokens := fs.Int("max-tokens", cfg.MaxTokens, "max completion tokens")
 	timeout := fs.Duration("timeout", cfg.RequestTimeout, "per-request timeout")
+	parallelN := fs.Int("parallel", cfg.Parallel, "leaves to execute concurrently (only safe when leaves touch different files)")
+	plan := fs.Bool("plan", false, "decompose into a task tree and exit without executing (run later with -resume)")
 	native := fs.Bool("native-tools", false, "use OpenAI tool_calls instead of JSON actions")
 	noStream := fs.Bool("no-stream", false, "disable SSE streaming")
 	resume := fs.Bool("resume", false, "resume a previous session")
@@ -71,6 +73,7 @@ func run(args []string) error {
 	cfg.MaxDepth = *maxDepth
 	cfg.MaxTokens = *maxTokens
 	cfg.RequestTimeout = *timeout
+	cfg.Parallel = *parallelN
 	cfg.NativeTools = *native
 	cfg.Stream = !*noStream
 	cfg.Verbose = *verbose
@@ -119,7 +122,11 @@ func run(args []string) error {
 	defer cancel()
 
 	start := time.Now()
-	err = o.Run(ctx)
+	if *plan {
+		err = o.RunPlan(ctx)
+	} else {
+		err = o.Run(ctx)
+	}
 	if err == context.Canceled || err == context.DeadlineExceeded {
 		log.Warnf("interrupted after %s. resume with:\n  go_llm_engine -resume -session %s -workdir %s",
 			time.Since(start).Truncate(time.Second), o.SessionID(), cfg.WorkDir)
@@ -138,6 +145,7 @@ const usageText = `go_llm_engine — divide-and-conquer coding agent for small/c
 
 Usage:
   go_llm_engine [flags] <goal>
+  go_llm_engine -plan [flags] <goal>
   go_llm_engine -resume [-session ID]
   go_llm_engine -status [-session ID]
 
@@ -148,6 +156,10 @@ Examples:
 
   go_llm_engine -workdir ./ws "用 Go 写一个 /health 返回 ok 的 HTTP 服务，并带单测"
 
+  go_llm_engine -plan -workdir ./ws "目标"   # 只拆解，检查任务树
+  go_llm_engine -resume -workdir ./ws        # 再执行
+
+  go_llm_engine -parallel 4 -workdir ./ws "拆成多个独立模块的目标"
   go_llm_engine -resume
   go_llm_engine -status
 

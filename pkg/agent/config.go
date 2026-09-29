@@ -30,6 +30,7 @@ type Config struct {
 	MaxSubtasks    int
 	MaxRedecompose int
 	DecomposeTries int // 0 = retry forever
+	Parallel       int // concurrent leaf executions; <= 1 means serial
 
 	RetryMinInterval time.Duration
 	RetryMaxInterval time.Duration
@@ -56,6 +57,7 @@ func DefaultConfig() Config {
 		MaxSubtasks:      6,
 		MaxRedecompose:   2,
 		DecomposeTries:   0,
+		Parallel:         1,
 		RetryMinInterval: time.Second,
 		RetryMaxInterval: 30 * time.Second,
 		Stream:           true,
