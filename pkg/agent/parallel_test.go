@@ -225,6 +225,14 @@ func TestOrchestrator_UsageTracked(t *testing.T) {
 	if len(keys) != 2 || kinds["decompose"].TotalTokens != 10 || kinds["worker"].TotalTokens != 20 {
 		t.Fatalf("per-kind usage unexpected: %v", kinds)
 	}
+
+	root := o.tree.GetRoot()
+	if root.TokenUsage.Calls != wantCalls || root.TokenUsage.TotalTokens != 10*wantCalls {
+		t.Fatalf("node usage: %+v, want %d calls / %d tokens", root.TokenUsage, wantCalls, 10*wantCalls)
+	}
+	if got := o.tree.TotalTokenUsage(); got.Calls != wantCalls || got.TotalTokens != 10*wantCalls {
+		t.Fatalf("tree usage: %+v", got)
+	}
 }
 
 // TestOrchestrator_PlanOnlyThenResume runs -plan without executing, then resumes.

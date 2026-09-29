@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,6 +27,7 @@ type Orchestrator struct {
 	log     *Logger
 	usage   *UsageTracker
 	cpMu    sync.Mutex
+	mergeMu sync.Mutex
 }
 
 // New creates an orchestrator around an existing tree.
@@ -36,6 +38,9 @@ func New(cfg Config, tree *engine.TaskTree, client llm.Client, log *Logger) (*Or
 	sandbox, err := tools.NewSandbox(cfg.WorkDir)
 	if err != nil {
 		return nil, err
+	}
+	if cfg.GitCommit && !tools.IsRepo(sandbox.Root) {
+		return nil, fmt.Errorf("-git-commit requires %s to be a git repository", sandbox.Root)
 	}
 	storage, err := engine.NewStorage(cfg.DataDir)
 	if err != nil {
@@ -151,6 +156,9 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 	o.log.Infof("workdir %s", o.sandbox.Root)
 	o.log.Infof("goal    %s", o.cfg.Goal)
 	o.log.Infof("parallel %d", o.parallel())
+	if saved := o.tree.TotalTokenUsage(); saved.Calls > 0 {
+		o.log.Infof("tokens so far: %d (%d calls)", saved.TotalTokens, saved.Calls)
+	}
 	o.printTree()
 
 	if err := o.checkpoint(); err != nil {
@@ -330,29 +338,66 @@ func (o *Orchestrator) RunPlan(ctx context.Context) error {
 		o.printTree()
 	}
 
+	warns := o.planWarnings()
+	for _, w := range warns {
+		o.log.Warnf("plan check: %s", w)
+	}
+
 	o.printTree()
 	_, total, _ := o.tree.GetLeafProgress()
 	o.logUsage()
-	o.log.Okf("plan ready: %d leaf tasks (execute with: -resume -session %s)", total, o.tree.ID)
-	return o.checkpoint()
+	if len(warns) > 0 {
+		o.log.Warnf("plan ready: %d leaf tasks, %d warning(s) (execute with: -resume -session %s)",
+			total, len(warns), o.tree.ID)
+	} else {
+		o.log.Okf("plan ready: %d leaf tasks, no issues (execute with: -resume -session %s)",
+			total, o.tree.ID)
+	}
+	if err := o.checkpoint(); err != nil {
+		return err
+	}
+	if o.cfg.Strict && len(warns) > 0 {
+		return fmt.Errorf("plan check failed: %d warning(s)", len(warns))
+	}
+	return nil
 }
 
-// chat wraps o.llm.Chat and records token usage under a call kind.
-func (o *Orchestrator) chat(ctx context.Context, kind string, req llm.Request) (*llm.Response, error) {
+// chat wraps o.llm.Chat and records token usage under a call kind and node.
+func (o *Orchestrator) chat(ctx context.Context, kind, nodeID string, req llm.Request) (*llm.Response, error) {
 	resp, err := o.llm.Chat(ctx, req)
-	if resp != nil {
-		o.usage.Add(kind, resp.Usage)
+	if resp == nil {
+		return resp, err
+	}
+	if resp.Usage.TotalTokens == 0 {
+		resp.Usage.TotalTokens = resp.Usage.PromptTokens + resp.Usage.CompletionTokens
+	}
+	o.usage.Add(kind, resp.Usage)
+	if nodeID != "" {
+		_ = o.tree.UpdateNode(nodeID, func(n *models.TaskNode) error {
+			n.TokenUsage.Calls++
+			n.TokenUsage.PromptTokens += resp.Usage.PromptTokens
+			n.TokenUsage.CompletionTokens += resp.Usage.CompletionTokens
+			n.TokenUsage.TotalTokens += resp.Usage.TotalTokens
+			return nil
+		})
 	}
 	return resp, err
 }
 
 func (o *Orchestrator) logUsage() {
 	u, calls := o.usage.Total()
-	if calls == 0 {
+	saved := o.tree.TotalTokenUsage()
+	if calls == 0 && saved.Calls == 0 {
 		return
 	}
-	o.log.Infof("llm usage: %d calls, prompt %d + completion %d = %d tokens",
-		calls, u.PromptTokens, u.CompletionTokens, u.TotalTokens)
+	if calls > 0 {
+		o.log.Infof("llm usage (this run): %d calls, prompt %d + completion %d = %d tokens",
+			calls, u.PromptTokens, u.CompletionTokens, u.TotalTokens)
+	}
+	if saved.Calls > 0 {
+		o.log.Infof("llm usage (session total): %d calls, prompt %d + completion %d = %d tokens",
+			saved.Calls, saved.PromptTokens, saved.CompletionTokens, saved.TotalTokens)
+	}
 	if !o.cfg.Verbose {
 		return
 	}
@@ -365,6 +410,25 @@ func (o *Orchestrator) logUsage() {
 }
 
 func (o *Orchestrator) executeLeaf(ctx context.Context, leaf *models.TaskNode) error {
+	// In isolated mode the leaf works in a mirror of the workspace; changes
+	// reach the real workspace only after verification passes. Retries of the
+	// same leaf reuse the mirror so a partial attempt can iterate on its error.
+	var mirror *tools.Mirror
+	sb := o.sandbox
+	if o.cfg.Isolate {
+		var err error
+		mirror, err = tools.NewMirror(o.sandbox.Root)
+		if err != nil {
+			return err
+		}
+		defer mirror.Close()
+		sb, err = mirror.Sandbox()
+		if err != nil {
+			return err
+		}
+		o.log.Infof("isolated %s in %s", leaf.ID, tools.TrimPath(sb.Root))
+	}
+
 	prevErr := ""
 	for attempt := 1; ; attempt++ {
 		live, ok := o.tree.CloneNode(leaf.ID)
@@ -378,7 +442,7 @@ func (o *Orchestrator) executeLeaf(ctx context.Context, leaf *models.TaskNode) e
 			return err
 		}
 
-		summary, err := o.runWorker(ctx, leaf, prevErr)
+		summary, err := o.runWorker(ctx, sb, leaf, prevErr)
 		if err != nil {
 			if ctx.Err() != nil {
 				_ = o.sched.UpdateNodeState(leaf.ID, models.TaskStatePending, "interrupted")
@@ -394,18 +458,41 @@ func (o *Orchestrator) executeLeaf(ctx context.Context, leaf *models.TaskNode) e
 			if err := o.retryOrGiveUp(ctx, leaf, attempt, prevErr); err != nil {
 				return err
 			}
+			if !retryable(o, leaf.ID) {
+				return nil
+			}
 			continue
 		}
 
 		if err := o.sched.UpdateNodeState(leaf.ID, models.TaskStateVerifying, ""); err != nil {
 			return err
 		}
-		vr := o.verify(ctx, leaf)
+		vr := o.verify(ctx, sb, leaf)
 		if ctx.Err() != nil {
 			_ = o.sched.UpdateNodeState(leaf.ID, models.TaskStatePending, "interrupted")
 			return ctx.Err()
 		}
 		if vr.OK {
+			if mirror != nil || o.cfg.GitCommit {
+				var merr error
+				summary, merr = o.publishLeaf(mirror, leaf, summary)
+				if merr != nil {
+					prevErr = merr.Error()
+					_ = o.tree.UpdateNode(leaf.ID, func(n *models.TaskNode) error {
+						n.RetryCount++
+						n.ErrorMsg = prevErr
+						return nil
+					})
+					o.log.Warnf("publish failed for %s (attempt %d): %v", leaf.ID, attempt, merr)
+					if err := o.retryOrGiveUp(ctx, leaf, attempt, prevErr); err != nil {
+						return err
+					}
+					if !retryable(o, leaf.ID) {
+						return nil
+					}
+					continue
+				}
+			}
 			_ = o.tree.UpdateNode(leaf.ID, func(n *models.TaskNode) error {
 				n.ResultSummary = summary
 				n.ErrorMsg = ""
@@ -428,7 +515,60 @@ func (o *Orchestrator) executeLeaf(ctx context.Context, leaf *models.TaskNode) e
 		if err := o.retryOrGiveUp(ctx, leaf, attempt, vr.Output); err != nil {
 			return err
 		}
+		if !retryable(o, leaf.ID) {
+			return nil
+		}
 	}
+}
+
+// retryable reports whether the leaf should keep retrying inside this worker:
+// only if it is still a pending leaf. A node that gave up (FAILED) or was
+// re-split into a compound goes back to the main loop instead.
+func retryable(o *Orchestrator, id string) bool {
+	live, ok := o.tree.CloneNode(id)
+	return ok && live.Type == models.NodeTypeLeaf && live.State == models.TaskStatePending
+}
+
+// publishLeaf folds a verified leaf's mirror into the shared workspace and,
+// when GitCommit is on, records one git commit — atomically with respect to
+// other leaves so each commit contains exactly its own leaf's changes.
+// Commit problems are logged but not fatal: verification already passed.
+func (o *Orchestrator) publishLeaf(mirror *tools.Mirror, leaf *models.TaskNode, summary string) (string, error) {
+	o.mergeMu.Lock()
+	defer o.mergeMu.Unlock()
+
+	if mirror != nil {
+		merged, deleted, err := mirror.MergeBack()
+		if err != nil {
+			return summary, err
+		}
+		if len(merged) > 0 {
+			summary += "\nMerged files: " + strings.Join(merged, ", ")
+			o.log.Okf("merged %d file(s) from %s", len(merged), leaf.ID)
+		}
+		for _, d := range deleted {
+			o.log.Actionf("merged deletion of %s from %s", d, leaf.ID)
+		}
+	}
+
+	if o.cfg.GitCommit {
+		msg := fmt.Sprintf("leaf(%s): %s\n\n%s", leaf.ID, leaf.Title, firstLine(summary))
+		committed, hash, err := tools.CommitAll(o.sandbox.Root, msg)
+		if err != nil {
+			o.log.Errorf("git commit for %s: %v", leaf.ID, err)
+		} else if committed {
+			summary += "\nCommit: " + hash
+			o.log.Okf("committed %s as %s", leaf.ID, hash)
+		}
+	}
+	return summary, nil
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	return strings.TrimSpace(s)
 }
 
 func (o *Orchestrator) retryOrGiveUp(ctx context.Context, leaf *models.TaskNode, attempt int, errMsg string) error {

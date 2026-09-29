@@ -5,6 +5,15 @@ import (
 	"time"
 )
 
+// TokenUsage records LLM token consumption attributed to a node.
+// It persists in the session tree so resumed sessions accumulate totals.
+type TokenUsage struct {
+	Calls            int `json:"calls,omitempty"`
+	PromptTokens     int `json:"prompt_tokens,omitempty"`
+	CompletionTokens int `json:"completion_tokens,omitempty"`
+	TotalTokens      int `json:"total_tokens,omitempty"`
+}
+
 // TaskNode represents a single unit of goal/work in the decomposition tree.
 type TaskNode struct {
 	ID          string       `json:"id"`
@@ -19,13 +28,14 @@ type TaskNode struct {
 	DoD         DoD          `json:"dod"`
 
 	// Execution & retry tracking
-	RetryCount     int       `json:"retry_count"`
-	MaxRetries     int       `json:"max_retries"`
-	DecomposeCount int       `json:"decompose_count,omitempty"`
-	ErrorMsg       string    `json:"error_msg,omitempty"`
-	ResultSummary  string    `json:"result_summary,omitempty"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	RetryCount     int        `json:"retry_count"`
+	MaxRetries     int        `json:"max_retries"`
+	DecomposeCount int        `json:"decompose_count,omitempty"`
+	ErrorMsg       string     `json:"error_msg,omitempty"`
+	ResultSummary  string     `json:"result_summary,omitempty"`
+	TokenUsage     TokenUsage `json:"token_usage"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
 }
 
 // NewTaskNode initializes a new task node with sensible defaults.

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/esrrhs/go_llm_engine/pkg/models"
+	"github.com/esrrhs/go_llm_engine/pkg/tools"
 )
 
 // VerifyResult is the outcome of running Definition of Done commands.
@@ -17,10 +18,10 @@ type VerifyResult struct {
 	ExitCode int
 }
 
-func (o *Orchestrator) verify(ctx context.Context, node *models.TaskNode) VerifyResult {
+func (o *Orchestrator) verify(ctx context.Context, sb *tools.Sandbox, node *models.TaskNode) VerifyResult {
 	cmds := node.DoD.Commands
 	if len(cmds) == 0 {
-		ensureDoD(&node.DoD, node.Contract.Outputs, o.hasGoMod())
+		ensureDoD(&node.DoD, node.Contract.Outputs, tools.HasGoMod(sb.Root))
 		cmds = node.DoD.Commands
 	}
 	timeout := time.Duration(node.DoD.TimeoutSec) * time.Second
@@ -31,7 +32,7 @@ func (o *Orchestrator) verify(ctx context.Context, node *models.TaskNode) Verify
 	var combined strings.Builder
 	for _, cmd := range cmds {
 		o.log.Actionf("verify: %s", cmd)
-		res, err := o.sandbox.RunBash(ctx, cmd, timeout)
+		res, err := sb.RunBash(ctx, cmd, timeout)
 		if err != nil {
 			msg := fmt.Sprintf("command %q failed to start: %v", cmd, err)
 			o.log.Errorf("%s", msg)

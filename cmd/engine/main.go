@@ -45,8 +45,11 @@ func run(args []string) error {
 	maxDepth := fs.Int("max-depth", cfg.MaxDepth, "max decomposition depth")
 	maxTokens := fs.Int("max-tokens", cfg.MaxTokens, "max completion tokens")
 	timeout := fs.Duration("timeout", cfg.RequestTimeout, "per-request timeout")
-	parallelN := fs.Int("parallel", cfg.Parallel, "leaves to execute concurrently (only safe when leaves touch different files)")
+	parallelN := fs.Int("parallel", cfg.Parallel, "leaves to execute concurrently (only safe when leaves touch different files, unless -isolate)")
+	isolate := fs.Bool("isolate", false, "run each leaf in a workspace mirror, merge only on success (default: on when -parallel > 1)")
 	plan := fs.Bool("plan", false, "decompose into a task tree and exit without executing (run later with -resume)")
+	strict := fs.Bool("strict", false, "with -plan: exit non-zero when the plan check reports warnings")
+	gitCommit := fs.Bool("git-commit", false, "git commit each leaf's merged changes (workdir must be a git repo)")
 	native := fs.Bool("native-tools", false, "use OpenAI tool_calls instead of JSON actions")
 	noStream := fs.Bool("no-stream", false, "disable SSE streaming")
 	resume := fs.Bool("resume", false, "resume a previous session")
@@ -77,7 +80,22 @@ func run(args []string) error {
 	cfg.NativeTools = *native
 	cfg.Stream = !*noStream
 	cfg.Verbose = *verbose
+	cfg.GitCommit = *gitCommit
+	cfg.Strict = *strict
 	cfg.Goal = strings.TrimSpace(strings.Join(fs.Args(), " "))
+
+	// -isolate defaults to on whenever several leaves may run at once.
+	explicitIsolate := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "isolate" {
+			explicitIsolate = true
+		}
+	})
+	if !explicitIsolate {
+		cfg.Isolate = cfg.Parallel > 1
+	} else {
+		cfg.Isolate = *isolate
+	}
 
 	absWork, err := filepath.Abs(cfg.WorkDir)
 	if err != nil {
@@ -157,9 +175,12 @@ Examples:
   go_llm_engine -workdir ./ws "用 Go 写一个 /health 返回 ok 的 HTTP 服务，并带单测"
 
   go_llm_engine -plan -workdir ./ws "目标"   # 只拆解，检查任务树
+  go_llm_engine -plan -strict -workdir ./ws "目标"   # 拆解 + 严格检查（CI 友好）
   go_llm_engine -resume -workdir ./ws        # 再执行
 
   go_llm_engine -parallel 4 -workdir ./ws "拆成多个独立模块的目标"
+  go_llm_engine -git-commit -workdir ./ws "每个叶子一个提交，便于审计回滚"
+  go_llm_engine -isolate -workdir ./ws "叶子失败不污染工作区"
   go_llm_engine -resume
   go_llm_engine -status
 

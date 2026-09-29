@@ -31,6 +31,7 @@ type Config struct {
 	MaxRedecompose int
 	DecomposeTries int // 0 = retry forever
 	Parallel       int // concurrent leaf executions; <= 1 means serial
+	Isolate        bool // run each leaf in a mirror copy of the workspace; merge only on success
 
 	RetryMinInterval time.Duration
 	RetryMaxInterval time.Duration
@@ -38,6 +39,9 @@ type Config struct {
 	NativeTools bool
 	Stream      bool
 	Verbose     bool
+
+	GitCommit bool // commit each leaf's merged changes to the workdir git repo
+	Strict    bool // plan mode: fail on plan-check warnings
 }
 
 // DefaultConfig fills in usable defaults.

@@ -3,6 +3,7 @@ package engine
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -219,6 +220,36 @@ func (t *TaskTree) NodeIDsInStates(states ...models.TaskState) []string {
 	}
 	return ids
 }
+
+// Leaves returns clones of all leaf nodes, ordered by ID.
+func (t *TaskTree) Leaves() []*models.TaskNode {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	out := make([]*models.TaskNode, 0)
+	for _, n := range t.Nodes {
+		if n.Type == models.NodeTypeLeaf {
+			out = append(out, n.Clone())
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// TotalTokenUsage sums the token usage saved on every node.
+func (t *TaskTree) TotalTokenUsage() models.TokenUsage {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	var out models.TokenUsage
+	for _, n := range t.Nodes {
+		out.Calls += n.TokenUsage.Calls
+		out.PromptTokens += n.TokenUsage.PromptTokens
+		out.CompletionTokens += n.TokenUsage.CompletionTokens
+		out.TotalTokens += n.TokenUsage.TotalTokens
+	}
+	return out
+}
 func (t *TaskTree) ConvertToLeaf(id string, contract models.ContractSpec, dod models.DoD) error {
 	return t.UpdateNode(id, func(n *models.TaskNode) error {
 		if len(n.ChildrenIDs) > 0 {
@@ -291,10 +322,14 @@ func (t *TaskTree) renderNodeRecursive(sb *strings.Builder, node *models.TaskNod
 	if isLast {
 		marker = "└── "
 	}
+	var tokens string
+	if node.TokenUsage.Calls > 0 {
+		tokens = fmt.Sprintf(" [%s tok]", formatTokens(node.TokenUsage.TotalTokens))
+	}
 	if node.ID == t.RootID {
-		sb.WriteString(fmt.Sprintf("[%s] %s (Root: %s)\n", node.State, node.Title, node.ID))
+		sb.WriteString(fmt.Sprintf("[%s] %s (Root: %s)%s\n", node.State, node.Title, node.ID, tokens))
 	} else {
-		sb.WriteString(fmt.Sprintf("%s%s[%s] %s (%s: %s)\n", prefix, marker, node.State, node.Title, node.Type, node.ID))
+		sb.WriteString(fmt.Sprintf("%s%s[%s] %s (%s: %s)%s\n", prefix, marker, node.State, node.Title, node.Type, node.ID, tokens))
 	}
 
 	childPrefix := prefix
@@ -312,6 +347,18 @@ func (t *TaskTree) renderNodeRecursive(sb *strings.Builder, node *models.TaskNod
 		if ok {
 			t.renderNodeRecursive(sb, child, childPrefix, i == numChildren-1)
 		}
+	}
+}
+
+// formatTokens renders a token count compactly for the tree view.
+func formatTokens(n int) string {
+	switch {
+	case n >= 1_000_000:
+		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
+	case n >= 1_000:
+		return fmt.Sprintf("%.1fk", float64(n)/1_000)
+	default:
+		return fmt.Sprintf("%d", n)
 	}
 }
 

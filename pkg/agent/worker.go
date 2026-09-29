@@ -11,10 +11,10 @@ import (
 	"github.com/esrrhs/go_llm_engine/pkg/tools"
 )
 
-func (o *Orchestrator) runWorker(ctx context.Context, node *models.TaskNode, prevError string) (string, error) {
+func (o *Orchestrator) runWorker(ctx context.Context, sb *tools.Sandbox, node *models.TaskNode, prevError string) (string, error) {
 	messages := []llm.Message{
 		{Role: llm.RoleSystem, Content: workerSystem},
-		{Role: llm.RoleUser, Content: o.projectContext(node, prevError)},
+		{Role: llm.RoleUser, Content: o.projectContext(sb, node, prevError)},
 	}
 
 	var native []llm.Tool
@@ -34,7 +34,7 @@ func (o *Orchestrator) runWorker(ctx context.Context, node *models.TaskNode, pre
 		}
 		o.log.Actionf("worker %s step %d/%d", node.ID, step, maxSteps)
 
-		resp, err := o.chat(ctx, "worker", llm.Request{
+		resp, err := o.chat(ctx, "worker", node.ID, llm.Request{
 			Model:       o.cfg.Model,
 			Messages:    messages,
 			Tools:       native,
@@ -73,7 +73,7 @@ func (o *Orchestrator) runWorker(ctx context.Context, node *models.TaskNode, pre
 				return summary, nil
 			}
 
-			out, callErr := o.sandbox.Call(ctx, act.Name, act.Args)
+			out, callErr := sb.Call(ctx, act.Name, act.Args)
 			if callErr != nil {
 				out = "ERROR: " + callErr.Error()
 				o.log.Warnf("%s", out)
@@ -198,9 +198,9 @@ func trimHistory(messages []llm.Message, max int) []llm.Message {
 	return out
 }
 
-func (o *Orchestrator) projectContext(node *models.TaskNode, prevError string) string {
+func (o *Orchestrator) projectContext(sb *tools.Sandbox, node *models.TaskNode, prevError string) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "Workspace: %s\n\n", o.sandbox.Root)
+	fmt.Fprintf(&b, "Workspace: %s\n\n", sb.Root)
 	fmt.Fprintf(&b, "Task ID: %s\nTitle: %s\nDescription:\n%s\n\n", node.ID, node.Title, node.Description)
 	b.WriteString("Contract:\n")
 	b.WriteString(formatContract(node.Contract))
@@ -226,14 +226,14 @@ func (o *Orchestrator) projectContext(node *models.TaskNode, prevError string) s
 	}
 
 	b.WriteString("\nWorkspace files:\n")
-	b.WriteString(o.sandbox.Snapshot())
+	b.WriteString(sb.Snapshot())
 
 	injected := 0
 	for _, in := range node.Contract.Inputs {
 		if !looksLikePath(in) {
 			continue
 		}
-		content, err := o.sandbox.ReadFile(in)
+		content, err := sb.ReadFile(in)
 		if err != nil {
 			continue
 		}
