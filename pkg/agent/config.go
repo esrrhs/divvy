@@ -29,8 +29,8 @@ type Config struct {
 	MaxDepth       int
 	MaxSubtasks    int
 	MaxRedecompose int
-	DecomposeTries int // 0 = retry forever
-	Parallel       int // concurrent leaf executions; <= 1 means serial
+	DecomposeTries int  // 0 = retry forever
+	Parallel       int  // concurrent leaf executions; <= 1 means serial
 	Isolate        bool // run each leaf in a mirror copy of the workspace; merge only on success
 
 	RetryMinInterval time.Duration
@@ -42,6 +42,14 @@ type Config struct {
 
 	GitCommit bool // commit each leaf's merged changes to the workdir git repo
 	Strict    bool // plan mode: fail on plan-check warnings
+
+	// Cost & budget. PricingJSON is a custom price table as JSON text or a
+	// path to a JSON file; empty means the built-in table only. MaxCost and
+	// BudgetTokens are session-wide ceilings (0 = unlimited) that include
+	// tokens spent before a resume.
+	PricingJSON  string
+	MaxCost      float64 // USD
+	BudgetTokens int
 }
 
 // DefaultConfig fills in usable defaults.
@@ -65,6 +73,7 @@ func DefaultConfig() Config {
 		RetryMinInterval: time.Second,
 		RetryMaxInterval: 30 * time.Second,
 		Stream:           true,
+		PricingJSON:      strings.TrimSpace(os.Getenv("LLM_PRICING")),
 	}
 }
 

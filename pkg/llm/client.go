@@ -45,6 +45,10 @@ func NewOpenAIClient(apiKey, baseURL string, timeout time.Duration) *OpenAIClien
 	}
 }
 
+type streamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
+}
+
 type apiRequest struct {
 	Model       string    `json:"model"`
 	Messages    []Message `json:"messages"`
@@ -52,6 +56,9 @@ type apiRequest struct {
 	Temperature float64   `json:"temperature,omitempty"`
 	MaxTokens   int       `json:"max_tokens,omitempty"`
 	Stream      bool      `json:"stream,omitempty"`
+	// StreamOptions asks for usage in the final SSE chunk (OpenAI-compatible
+	// providers ignore or honor it; a rejection falls back to non-streaming).
+	StreamOptions *streamOptions `json:"stream_options,omitempty"`
 }
 
 type apiResponse struct {
@@ -131,6 +138,9 @@ func (c *OpenAIClient) do(ctx context.Context, req Request, stream bool) (*Respo
 		Temperature: req.Temperature,
 		MaxTokens:   req.MaxTokens,
 		Stream:      stream,
+	}
+	if stream {
+		payload.StreamOptions = &streamOptions{IncludeUsage: true}
 	}
 
 	body, err := json.Marshal(payload)

@@ -3,6 +3,7 @@ bin/
 *.exe
 *.test
 /engine
+/go_llm_engine
 
 # Local session storage
 .go_llm_engine/
@@ -10,3 +11,4 @@ bin/
 # Local workspaces
 ws/
 workspace/
+ws_qwen/

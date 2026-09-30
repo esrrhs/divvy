@@ -48,15 +48,18 @@ func (o *Orchestrator) verify(ctx context.Context, sb *tools.Sandbox, node *mode
 			o.log.Errorf("verify failed: %s (exit %d)", cmd, res.ExitCode)
 			return VerifyResult{OK: false, Command: cmd, Output: combined.String(), ExitCode: res.ExitCode}
 		}
-		if node.DoD.ExpectedOutput != "" {
-			blob := res.Stdout + res.Stderr
-			if !strings.Contains(blob, node.DoD.ExpectedOutput) {
-				msg := combined.String() + fmt.Sprintf("expected output %q not found\n", node.DoD.ExpectedOutput)
-				o.log.Errorf("verify output mismatch: %s", cmd)
-				return VerifyResult{OK: false, Command: cmd, Output: msg, ExitCode: res.ExitCode}
-			}
-		}
 		o.log.Okf("verify passed: %s", cmd)
+	}
+	// expected_output is a DoD-level assertion: it only has to appear in the
+	// combined output of all commands (a quiet build followed by a verbose
+	// test must still pass), not in every single command's output.
+	if node.DoD.ExpectedOutput != "" {
+		blob := combined.String()
+		if !strings.Contains(blob, node.DoD.ExpectedOutput) {
+			msg := blob + fmt.Sprintf("expected output %q not found\n", node.DoD.ExpectedOutput)
+			o.log.Errorf("verify output mismatch: expected %q", node.DoD.ExpectedOutput)
+			return VerifyResult{OK: false, Command: cmds[len(cmds)-1], Output: msg}
+		}
 	}
 	return VerifyResult{OK: true, Output: combined.String()}
 }

@@ -13,7 +13,7 @@ go install github.com/esrrhs/go_llm_engine/cmd/engine@latest
 go build -o go_llm_engine ./cmd/engine
 ```
 
-任意 **OpenAI 兼容** 接口都可以，包括 OpenAI、vLLM、Ollama、本地网关：
+任意 **OpenAI 兼容** 接口都可以，包括 OpenAI、vLLM、Ollama、本地网关。本地 Ollama 实战配置见 [docs/qwen3.8-local.md](docs/qwen3.8-local.md)、[docs/debug-local-ollama.md](docs/debug-local-ollama.md)：
 
 ```bash
 export OPENAI_API_KEY=sk-...
@@ -47,6 +47,9 @@ export OPENAI_MODEL=qwen2.5-coder:14b
 | `-retry-max-wait` | 指数退避上限，默认 `30s` |
 | `-native-tools` | 改用 OpenAI `tool_calls`（强模型可开；弱模型默认 JSON 更稳） |
 | `-extra` | 合并进请求体的 JSON，例如 Qwen3：`'{"enable_thinking":false}'` |
+| `-max-cost` | 会话成本上限（美元），含 resume 之前的花费；超限即停并保存，`0` 为不限 |
+| `-budget-tokens` | 会话 token 上限，含 resume 之前的花费；超限即停并保存，`0` 为不限 |
+| `-pricing` | 自定义价目表：JSON 文本或 JSON 文件路径，如 `'{"my-model":{"input":0.15,"output":0.6}}'`（每百万 token 美元价） |
 | `-v` | 打印模型原文和工具输出（结束时附带分项 token 用量） |
 
 中断（Ctrl+C）会保存任务树，之后：
@@ -77,6 +80,14 @@ export OPENAI_MODEL=qwen2.5-coder:14b
 
 `-plan` 在拆解完成后会做完整性检查并对弱契约告警：无验收命令、验收只有占位符（`ls`）、无产出声明、兄弟叶子声明了相同产出文件。
 
+### 成本估算与预算护栏
+
+引擎内置常见 OpenAI 模型的近似价目（每百万 token 美元价），用 `-pricing` 可覆盖或追加自有/本地模型的价格（JSON 文本或文件路径，键名同时支持精确匹配和最长子串匹配）。
+
+- 每次调用的成本按节点随 token 用量一起显示：树视图节点标签、结束/`-status` 用量汇总（本次 + 会话累计）。
+- `-max-cost`（美元）与 `-budget-tokens` 是**会话级硬上限**，计入 resume 之前已持久化的花费；超限立即取消运行、把在途节点复位为 `PENDING` 并保存任务树。提高上限后用 `-resume` 继续即可，不会重试或重复烧钱。
+- 模型在价目表中无对应价格时不显示估算（本地零成本模型的典型情况），token 预算仍然生效。
+
 ---
 
 ## 核心理念
@@ -101,8 +112,9 @@ export OPENAI_MODEL=qwen2.5-coder:14b
 | `pkg/models` | 任务节点、状态机、契约、DoD |
 | `pkg/engine` | 任务树、调度（依赖/就绪/冒泡）、原子 JSON 持久化 |
 | `pkg/llm` | OpenAI 兼容客户端、流式、重试、弱模型 JSON 容错解析 |
+| `pkg/cost` | 模型价目表、token→美元成本估算 |
 | `pkg/tools` | 工作区沙箱工具 |
-| `pkg/agent` | Decomposer、Worker、Verifier、Orchestrator |
+| `pkg/agent` | Decomposer、Worker、Verifier、Orchestrator、预算护栏 |
 | `cmd/engine` | CLI |
 
 状态：`PENDING` → `DECOMPOSING` / `RUNNING` → `VERIFYING` → `COMPLETED` / `FAILED`。
@@ -130,5 +142,6 @@ go test ./...
 - [x] 阶段 7：叶子级工作区隔离（`-isolate`：快照 → 隔离执行 → 验收后合并/失败回滚）
 - [x] 阶段 8：按节点 token 用量持久化（resume 累计）、plan 契约完整性检查
 - [x] 阶段 9：执行审计与成本可见性（`-git-commit` 每叶子一提交、`-plan -strict`、树视图 token 显示）
+- [x] 阶段 10：成本估算与预算护栏（内置/自定义价目表、节点级美元成本、`-max-cost`/`-budget-tokens` 会话级硬上限）
 
 弱模型上的 Prompt 与拆分粒度仍需按具体模型微调（`-max-depth`、`-max-steps`、`-extra`）。

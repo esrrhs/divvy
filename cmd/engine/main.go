@@ -52,6 +52,9 @@ func run(args []string) error {
 	gitCommit := fs.Bool("git-commit", false, "git commit each leaf's merged changes (workdir must be a git repo)")
 	native := fs.Bool("native-tools", false, "use OpenAI tool_calls instead of JSON actions")
 	noStream := fs.Bool("no-stream", false, "disable SSE streaming")
+	maxCost := fs.Float64("max-cost", cfg.MaxCost, "session cost ceiling in USD, incl. pre-resume spend (0 = unlimited)")
+	budgetTokens := fs.Int("budget-tokens", cfg.BudgetTokens, "session token ceiling, incl. pre-resume spend (0 = unlimited)")
+	pricing := fs.String("pricing", cfg.PricingJSON, "custom price table as JSON text or path to a JSON file ({\"model\":{\"input\":0.15,\"output\":0.6}} per 1M tokens)")
 	resume := fs.Bool("resume", false, "resume a previous session")
 	status := fs.Bool("status", false, "print saved tree and exit")
 	verbose := fs.Bool("v", false, "verbose logs (raw model snippets, tool output)")
@@ -82,6 +85,9 @@ func run(args []string) error {
 	cfg.Verbose = *verbose
 	cfg.GitCommit = *gitCommit
 	cfg.Strict = *strict
+	cfg.MaxCost = *maxCost
+	cfg.BudgetTokens = *budgetTokens
+	cfg.PricingJSON = *pricing
 	cfg.Goal = strings.TrimSpace(strings.Join(fs.Args(), " "))
 
 	// -isolate defaults to on whenever several leaves may run at once.
@@ -120,6 +126,12 @@ func run(args []string) error {
 	}
 	if cfg.RequiresAPIKey() && cfg.APIKey == "" {
 		return fmt.Errorf("missing API key: set OPENAI_API_KEY or pass -api-key")
+	}
+	if cfg.MaxCost < 0 {
+		return fmt.Errorf("-max-cost must be >= 0")
+	}
+	if cfg.BudgetTokens < 0 {
+		return fmt.Errorf("-budget-tokens must be >= 0")
 	}
 
 	client := llm.NewOpenAIClient(cfg.APIKey, cfg.BaseURL, cfg.RequestTimeout)
@@ -178,6 +190,7 @@ Examples:
   go_llm_engine -plan -strict -workdir ./ws "目标"   # 拆解 + 严格检查（CI 友好）
   go_llm_engine -resume -workdir ./ws        # 再执行
 
+  go_llm_engine -max-cost 1 -budget-tokens 200000 -workdir ./ws "目标"
   go_llm_engine -parallel 4 -workdir ./ws "拆成多个独立模块的目标"
   go_llm_engine -git-commit -workdir ./ws "每个叶子一个提交，便于审计回滚"
   go_llm_engine -isolate -workdir ./ws "叶子失败不污染工作区"
@@ -188,6 +201,7 @@ Environment:
   OPENAI_API_KEY / LLM_API_KEY
   OPENAI_BASE_URL / LLM_BASE_URL   (OpenAI-compatible, include /v1)
   OPENAI_MODEL / LLM_MODEL
+  LLM_PRICING                      (custom price table JSON text or file path)
 
 Flags:
 `

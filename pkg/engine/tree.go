@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/esrrhs/go_llm_engine/pkg/cost"
 	"github.com/esrrhs/go_llm_engine/pkg/models"
 )
 
@@ -20,6 +21,12 @@ type TaskTree struct {
 	Nodes     map[string]*models.TaskNode `json:"nodes"`
 	CreatedAt time.Time                   `json:"created_at"`
 	UpdatedAt time.Time                   `json:"updated_at"`
+
+	// ModelName is the model used by the session; drives per-node cost labels.
+	ModelName string `json:"model_name,omitempty"`
+	// PriceFor resolves ModelName to a token price; when set the tree view
+	// annotates each node with its estimated USD cost. Not serialized.
+	PriceFor func(model string) (cost.Price, bool) `json:"-"`
 
 	mu sync.RWMutex
 }
@@ -325,6 +332,9 @@ func (t *TaskTree) renderNodeRecursive(sb *strings.Builder, node *models.TaskNod
 	var tokens string
 	if node.TokenUsage.Calls > 0 {
 		tokens = fmt.Sprintf(" [%s tok]", formatTokens(node.TokenUsage.TotalTokens))
+		if c, ok := t.nodeCost(node); ok {
+			tokens += " " + cost.FormatUSD(c)
+		}
 	}
 	if node.ID == t.RootID {
 		sb.WriteString(fmt.Sprintf("[%s] %s (Root: %s)%s\n", node.State, node.Title, node.ID, tokens))
@@ -348,6 +358,20 @@ func (t *TaskTree) renderNodeRecursive(sb *strings.Builder, node *models.TaskNod
 			t.renderNodeRecursive(sb, child, childPrefix, i == numChildren-1)
 		}
 	}
+}
+
+// nodeCost estimates a node's USD cost from its token usage and the session
+// model price. Returns ok=false when no price is known for the model.
+func (t *TaskTree) nodeCost(node *models.TaskNode) (float64, bool) {
+	if t.PriceFor == nil || t.ModelName == "" {
+		return 0, false
+	}
+	price, ok := t.PriceFor(t.ModelName)
+	if !ok {
+		return 0, false
+	}
+	c := price.Cost(node.TokenUsage.PromptTokens, node.TokenUsage.CompletionTokens)
+	return c, true
 }
 
 // formatTokens renders a token count compactly for the tree view.

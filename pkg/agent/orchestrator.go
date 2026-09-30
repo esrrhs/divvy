@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/esrrhs/go_llm_engine/pkg/cost"
 	"github.com/esrrhs/go_llm_engine/pkg/engine"
 	"github.com/esrrhs/go_llm_engine/pkg/llm"
 	"github.com/esrrhs/go_llm_engine/pkg/models"
@@ -26,6 +27,8 @@ type Orchestrator struct {
 	sandbox *tools.Sandbox
 	log     *Logger
 	usage   *UsageTracker
+	pricing *cost.Pricing
+	budget  *budgetGuard
 	cpMu    sync.Mutex
 	mergeMu sync.Mutex
 }
@@ -46,8 +49,14 @@ func New(cfg Config, tree *engine.TaskTree, client llm.Client, log *Logger) (*Or
 	if err != nil {
 		return nil, err
 	}
+	pricing, err := loadPricing(cfg.PricingJSON)
+	if err != nil {
+		return nil, err
+	}
 	tree.WorkDir = sandbox.Root
 	tree.Goal = cfg.Goal
+	tree.ModelName = cfg.Model
+	tree.PriceFor = pricing.PriceFor
 	return &Orchestrator{
 		cfg:     cfg,
 		tree:    tree,
@@ -57,6 +66,7 @@ func New(cfg Config, tree *engine.TaskTree, client llm.Client, log *Logger) (*Or
 		sandbox: sandbox,
 		log:     log,
 		usage:   NewUsageTracker(),
+		pricing: pricing,
 	}, nil
 }
 
@@ -150,6 +160,7 @@ func (o *Orchestrator) parallel() int {
 // Run drives the engine until the root completes, fails, or the context is
 // cancelled. Ready leaves run concurrently, bounded by cfg.Parallel.
 func (o *Orchestrator) Run(ctx context.Context) error {
+	ctx = o.startBudget(ctx)
 	o.log.Banner("go_llm_engine")
 	o.log.Infof("session %s", o.tree.ID)
 	o.log.Infof("model   %s", o.cfg.Model)
@@ -304,6 +315,7 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 // RunPlan decomposes the goal into a full tree of leaves without executing any
 // of them. The saved session can later be executed with -resume.
 func (o *Orchestrator) RunPlan(ctx context.Context) error {
+	ctx = o.startBudget(ctx)
 	o.log.Banner("go_llm_engine (plan)")
 	o.log.Infof("session %s", o.tree.ID)
 	o.log.Infof("model   %s", o.cfg.Model)
@@ -381,6 +393,9 @@ func (o *Orchestrator) chat(ctx context.Context, kind, nodeID string, req llm.Re
 			return nil
 		})
 	}
+	if err == nil && o.budget != nil && o.budget.check() {
+		return resp, context.Canceled
+	}
 	return resp, err
 }
 
@@ -390,13 +405,22 @@ func (o *Orchestrator) logUsage() {
 	if calls == 0 && saved.Calls == 0 {
 		return
 	}
+	price, priced := o.pricing.PriceFor(o.cfg.Model)
 	if calls > 0 {
-		o.log.Infof("llm usage (this run): %d calls, prompt %d + completion %d = %d tokens",
+		line := fmt.Sprintf("llm usage (this run): %d calls, prompt %d + completion %d = %d tokens",
 			calls, u.PromptTokens, u.CompletionTokens, u.TotalTokens)
+		if priced {
+			line += ", est. cost " + cost.FormatUSD(price.Cost(u.PromptTokens, u.CompletionTokens))
+		}
+		o.log.Infof("%s", line)
 	}
 	if saved.Calls > 0 {
-		o.log.Infof("llm usage (session total): %d calls, prompt %d + completion %d = %d tokens",
+		line := fmt.Sprintf("llm usage (session total): %d calls, prompt %d + completion %d = %d tokens",
 			saved.Calls, saved.PromptTokens, saved.CompletionTokens, saved.TotalTokens)
+		if priced {
+			line += ", est. cost " + cost.FormatUSD(price.Cost(saved.PromptTokens, saved.CompletionTokens))
+		}
+		o.log.Infof("%s", line)
 	}
 	if !o.cfg.Verbose {
 		return
@@ -644,5 +668,6 @@ func (o *Orchestrator) printTree() {
 // Status prints the current tree without running.
 func (o *Orchestrator) Status() {
 	o.printTree()
+	o.logUsage()
 	o.log.Infof("session file: %s", o.storage.GetTreeFilePath(o.tree.ID))
 }
