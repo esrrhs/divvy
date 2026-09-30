@@ -60,6 +60,16 @@ func TestScheduler_DependencyResolutionAndReadyNodes(t *testing.T) {
 		t.Fatalf("expected root to auto-complete, got %s", root.State)
 	}
 
+	// Compound root must pass goal-level acceptance before truly complete.
+	if !scheduler.RootNeedsAcceptance() || scheduler.IsComplete() {
+		t.Fatal("root should need acceptance at this point")
+	}
+	if err := tree.UpdateNode("root", func(n *models.TaskNode) error {
+		n.IntegrationVerified = true
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if !scheduler.IsComplete() {
 		t.Fatalf("expected scheduler.IsComplete() to be true")
 	}
@@ -95,6 +105,16 @@ func TestScheduler_ThreeLevelCompletion(t *testing.T) {
 	mid, _ := tree.GetNode("mid")
 	if mid.State != models.TaskStateCompleted {
 		t.Fatalf("mid=%s", mid.State)
+	}
+	// Root bubbled COMPLETED but awaits goal-level acceptance.
+	if !s.RootNeedsAcceptance() {
+		t.Fatal("root should need acceptance")
+	}
+	if err := tree.UpdateNode("root", func(n *models.TaskNode) error {
+		n.IntegrationVerified = true
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 	if !s.IsComplete() {
 		t.Fatalf("root=%s", tree.GetRoot().State)

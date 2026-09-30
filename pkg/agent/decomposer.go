@@ -131,6 +131,18 @@ func (o *Orchestrator) applyDecompose(node *models.TaskNode, parsed decomposeRes
 		parsed.Subtasks = parsed.Subtasks[:o.cfg.MaxSubtasks]
 	}
 
+	// The top-level DoD is the goal-level acceptance run after every child
+	// completes. Persist it on the compound node; give it sane defaults when
+	// the model omitted commands.
+	goalDoD := parsed.DoD
+	ensureGoalDoD(&goalDoD, o.hasGoMod())
+	if err := o.tree.UpdateNode(node.ID, func(n *models.TaskNode) error {
+		n.DoD = goalDoD
+		return nil
+	}); err != nil {
+		return err
+	}
+
 	children, err := normalizeChildren(parsed.Subtasks, o.tree, node)
 	if err != nil {
 		return err
@@ -269,6 +281,23 @@ func ensureDoD(dod *models.DoD, outputs []string, hasGoMod bool) {
 	}
 	if len(dod.Commands) == 0 {
 		dod.Commands = defaultDoDCommands(outputs, hasGoMod)
+	}
+}
+
+// ensureGoalDoD fills a compound node's goal-level acceptance DoD. When the
+// model provided no commands, fall back to building the root package
+// ("go build ." fails when no entry package exists, catching a missing
+// integration leaf) plus a whole-tree build.
+func ensureGoalDoD(dod *models.DoD, hasGoMod bool) {
+	if dod.TimeoutSec <= 0 {
+		dod.TimeoutSec = 120
+	}
+	if len(dod.Commands) == 0 {
+		if hasGoMod {
+			dod.Commands = []string{"go build .", "go build ./..."}
+		} else {
+			dod.Commands = []string{"ls"}
+		}
 	}
 }
 

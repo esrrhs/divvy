@@ -33,7 +33,48 @@ func (o *Orchestrator) planWarnings() []string {
 			}
 		}
 	}
+
+	// Runnable deliverable checks: a goal for a program/server/CLI must have
+	// a leaf that produces an entry point and a goal-level acceptance DoD.
+	if goalIsRunnable(o.tree.Goal) {
+		if !o.treeHasEntryPoint() {
+			warns = append(warns, "runnable goal but no leaf declares an entry point (e.g. main.go); deliverable cannot start")
+		}
+		if root, ok := o.tree.CloneNode(o.tree.RootID); ok && len(root.DoD.Commands) == 0 {
+			warns = append(warns, "no goal-level acceptance commands for a runnable deliverable")
+		}
+	}
 	return warns
+}
+
+// goalIsRunnable reports whether the goal asks for a program that must run
+// (server/API/CLI/daemon), as opposed to a library or a one-off change.
+func goalIsRunnable(goal string) bool {
+	g := strings.ToLower(goal)
+	keywords := []string{
+		"http", "api", "server", "服务", "服务端", "监听", "程序", "cli",
+		"daemon", "命令行", "可执行", "web ", "微服务", "listen",
+	}
+	for _, k := range keywords {
+		if strings.Contains(g, k) {
+			return true
+		}
+	}
+	return false
+}
+
+// treeHasEntryPoint reports whether any leaf produces an executable entry
+// file (main.go or an otherwise-named main package file ending _main.go).
+func (o *Orchestrator) treeHasEntryPoint() bool {
+	for _, leaf := range o.tree.Leaves() {
+		for _, out := range leaf.Contract.Outputs {
+			p := strings.ToLower(strings.TrimSpace(out))
+			if p == "main.go" || strings.HasSuffix(p, "/main.go") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // placeholderDoD reports whether every command is the do-nothing default.

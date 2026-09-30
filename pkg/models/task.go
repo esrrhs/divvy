@@ -34,8 +34,12 @@ type TaskNode struct {
 	ErrorMsg       string     `json:"error_msg,omitempty"`
 	ResultSummary  string     `json:"result_summary,omitempty"`
 	TokenUsage     TokenUsage `json:"token_usage"`
-	CreatedAt      time.Time  `json:"created_at"`
-	UpdatedAt      time.Time  `json:"updated_at"`
+	// IntegrationVerified marks that the goal-level acceptance DoD has passed
+	// for a compound node after all children completed. A COMPLETED compound
+	// without this flag still needs end-to-end verification.
+	IntegrationVerified bool      `json:"integration_verified,omitempty"`
+	CreatedAt           time.Time `json:"created_at"`
+	UpdatedAt           time.Time `json:"updated_at"`
 }
 
 // NewTaskNode initializes a new task node with sensible defaults.

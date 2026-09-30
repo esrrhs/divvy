@@ -228,6 +228,22 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 			_ = o.checkpoint()
 			return err
 		}
+		// Goal-level acceptance: when every child of a compound root is done,
+		// run the end-to-end DoD before the root is allowed to complete.
+		if o.sched.RootNeedsAcceptance() {
+			if err := o.verifyRootAcceptance(ctx); err != nil {
+				if ctx.Err() != nil {
+					wg.Wait()
+					o.logUsage()
+					_ = o.checkpoint()
+					return ctx.Err()
+				}
+				return err
+			}
+			_ = o.checkpoint()
+			o.printTree()
+			continue
+		}
 		if o.sched.IsComplete() {
 			wg.Wait()
 			o.printTree()

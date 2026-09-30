@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/esrrhs/go_llm_engine/pkg/agent"
+	"github.com/esrrhs/go_llm_engine/pkg/engine"
 	"github.com/esrrhs/go_llm_engine/pkg/llm"
 )
 
@@ -56,6 +57,7 @@ func run(args []string) error {
 	budgetTokens := fs.Int("budget-tokens", cfg.BudgetTokens, "session token ceiling, incl. pre-resume spend (0 = unlimited)")
 	pricing := fs.String("pricing", cfg.PricingJSON, "custom price table as JSON text or path to a JSON file ({\"model\":{\"input\":0.15,\"output\":0.6}} per 1M tokens)")
 	resume := fs.Bool("resume", false, "resume a previous session")
+	listSessions := fs.Bool("sessions", false, "list saved sessions and exit")
 	status := fs.Bool("status", false, "print saved tree and exit")
 	verbose := fs.Bool("v", false, "verbose logs (raw model snippets, tool output)")
 
@@ -110,6 +112,32 @@ func run(args []string) error {
 	cfg.WorkDir = absWork
 
 	log := agent.NewLogger(cfg.Verbose)
+
+	if *listSessions {
+		storage, err := engine.NewStorage(cfg.DataDir)
+		if err != nil {
+			return err
+		}
+		sessions, err := storage.ListSessions()
+		if err != nil {
+			return err
+		}
+		if len(sessions) == 0 {
+			fmt.Printf("no saved sessions in %s\n", cfg.DataDir)
+			return nil
+		}
+		fmt.Printf("%-28s %-9s %-8s %s\n", "SESSION", "STATE", "LEAVES", "UPDATED  GOAL")
+		for _, s := range sessions {
+			goal := s.Goal
+			if len(goal) > 60 {
+				goal = goal[:60] + "..."
+			}
+			fmt.Printf("%-28s %-9s %-8s %s  %s\n",
+				s.ID, s.RootState, fmt.Sprintf("%d/%d", s.LeavesDone, s.LeavesAll),
+				s.UpdatedAt.Format("01-02 15:04"), goal)
+		}
+		return nil
+	}
 
 	if *status {
 		o, err := agent.Load(cfg, nil, log)

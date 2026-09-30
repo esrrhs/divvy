@@ -162,6 +162,10 @@ func previewArgs(act taggedAction) string {
 	case tools.ToolRunBash:
 		c, _ := stringFromArgs(act.Args, "command")
 		return truncate(c, 80)
+	case tools.ToolSearchFiles:
+		p, _ := stringFromArgs(act.Args, "pattern")
+		gl, _ := stringFromArgs(act.Args, "glob")
+		return truncate(p+" ["+gl+"]", 80)
 	case tools.ToolFinish:
 		s, _ := stringFromArgs(act.Args, "summary")
 		return truncate(s, 80)

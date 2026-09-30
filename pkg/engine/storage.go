@@ -4,6 +4,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/esrrhs/go_llm_engine/pkg/models"
 )
 
 // Storage handles persisting and reloading TaskTree states.
@@ -98,4 +103,53 @@ func (s *Storage) TreeExists(sessionID string) bool {
 	targetPath := s.GetTreeFilePath(sessionID)
 	_, err := os.Stat(targetPath)
 	return err == nil
+}
+
+// SessionInfo is a lightweight summary of one saved session.
+type SessionInfo struct {
+	ID         string
+	Goal       string
+	UpdatedAt  time.Time
+	RootState  models.TaskState
+	LeavesDone int
+	LeavesAll  int
+}
+
+// ListSessions scans the storage directory for saved trees, newest first.
+// Unreadable or non-tree JSON files are skipped.
+func (s *Storage) ListSessions() ([]SessionInfo, error) {
+	entries, err := os.ReadDir(s.baseDir)
+	if err != nil {
+		return nil, err
+	}
+	var out []SessionInfo
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		id := strings.TrimSuffix(e.Name(), ".json")
+		tree, err := s.LoadTree(id)
+		if err != nil {
+			continue
+		}
+		done, total, _ := tree.GetLeafProgress()
+		info := SessionInfo{
+			ID:         id,
+			Goal:       tree.Goal,
+			UpdatedAt:  tree.UpdatedAt,
+			LeavesDone: done,
+			LeavesAll:  total,
+		}
+		if root, ok := tree.GetNode(tree.RootID); ok {
+			info.RootState = root.State
+			// Trees saved outside the orchestrator may have an empty Goal;
+			// the root title/description still identifies the session.
+			if info.Goal == "" {
+				info.Goal = root.Title
+			}
+		}
+		out = append(out, info)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].UpdatedAt.After(out[j].UpdatedAt) })
+	return out, nil
 }

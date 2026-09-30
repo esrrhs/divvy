@@ -218,7 +218,10 @@ func (s *Scheduler) checkAndUpdateParent(parentID string) {
 	}
 }
 
-// IsComplete returns true if the entire tree has successfully reached COMPLETED state.
+// IsComplete returns true only if the entire tree reached COMPLETED and, for
+// a compound root, its goal-level acceptance DoD passed
+// (IntegrationVerified). For an atomic leaf root the leaf's own DoD is the
+// acceptance, so COMPLETED suffices. Children being done is not enough.
 func (s *Scheduler) IsComplete() bool {
 	s.tree.mu.RLock()
 	defer s.tree.mu.RUnlock()
@@ -227,7 +230,24 @@ func (s *Scheduler) IsComplete() bool {
 	if !exists {
 		return false
 	}
-	return root.State == models.TaskStateCompleted
+	if root.State != models.TaskStateCompleted {
+		return false
+	}
+	return root.Type == models.NodeTypeLeaf || root.IntegrationVerified
+}
+
+// RootNeedsAcceptance reports whether a compound root's children all
+// completed (root bubbled COMPLETED) but goal-level acceptance has not been
+// verified yet.
+func (s *Scheduler) RootNeedsAcceptance() bool {
+	s.tree.mu.RLock()
+	defer s.tree.mu.RUnlock()
+	root, exists := s.tree.Nodes[s.tree.RootID]
+	if !exists {
+		return false
+	}
+	return root.Type == models.NodeTypeCompound &&
+		root.State == models.TaskStateCompleted && !root.IntegrationVerified
 }
 
 // HasFailed returns true if the root is in a terminal FAILED state.

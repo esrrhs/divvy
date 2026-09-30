@@ -16,6 +16,7 @@ const (
 	ToolWriteFile    = "write_file"
 	ToolReplaceLines = "replace_lines"
 	ToolRunBash      = "run_bash"
+	ToolSearchFiles  = "search_files"
 	ToolFinish       = "finish"
 )
 
@@ -29,6 +30,7 @@ Tools (call exactly one per turn):
 - replace_lines: {"path":"file.go","start_line":1,"end_line":3,"content":"new lines"}
   alternative: {"path":"file.go","old_string":"exact old","new_string":"exact new"}
 - run_bash: {"command":"go test ./..."}
+- search_files: {"pattern":"func Add","glob":"*.go"}
 - finish: {"summary":"what was done"}
 `)
 }
@@ -75,6 +77,12 @@ func NativeTools() []map[string]any {
 		fn(ToolRunBash, "Run a shell command in the workspace.", obj(map[string]any{
 			"command": str("Shell command"),
 		}, []string{"command"})),
+		fn(ToolSearchFiles, "Search file contents with a regular expression and report file:line matches.", obj(map[string]any{
+			"pattern":        str("Regular expression to find"),
+			"path":           str("Workspace-relative directory to search (default: workspace root)"),
+			"glob":           str("Optional glob filter, e.g. *.go or pkg/*_test.go"),
+			"case_sensitive": map[string]any{"type": "boolean"},
+		}, []string{"pattern"})),
 		fn(ToolFinish, "Mark the atomic task complete.", obj(map[string]any{
 			"summary": str("Short summary of what was done"),
 		}, []string{})),
@@ -160,6 +168,16 @@ func (s *Sandbox) Call(ctx context.Context, name string, args map[string]any) (s
 		}
 		return formatExec(res), nil
 
+	case ToolSearchFiles:
+		pattern, err := requireString(args, "pattern")
+		if err != nil {
+			return "", err
+		}
+		rootDir, _ := stringArg(args, "path")
+		glob, _ := stringArg(args, "glob")
+		caseSensitive := boolArg(args, "case_sensitive", false)
+		return s.SearchFiles(pattern, rootDir, glob, caseSensitive)
+
 	case ToolFinish:
 		summary, _ := stringArg(args, "summary")
 		if summary == "" {
@@ -168,7 +186,7 @@ func (s *Sandbox) Call(ctx context.Context, name string, args map[string]any) (s
 		return summary, nil
 
 	default:
-		return "", fmt.Errorf("unknown tool %q; use list_dir, read_file, write_file, replace_lines, run_bash, finish", name)
+		return "", fmt.Errorf("unknown tool %q; use list_dir, read_file, write_file, replace_lines, run_bash, search_files, finish", name)
 	}
 }
 
