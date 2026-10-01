@@ -60,10 +60,12 @@ Tools:
   or {"path":"file.go","old_string":"exact old text","new_string":"exact new text"}
 - run_bash: {"command":"go test ./..."}
 - search_files: {"pattern":"func Add","glob":"*.go"}  (regex; use it to locate code instead of reading many files)
+- ask: {"question":"specific question whose answer you need"}  (only in an interactive guided run; asks the user and waits)
 - finish: {"summary":"what you did"}
 
 Rules:
 - Do exactly this one task. Do not expand scope.
+- Use ask only when a decision genuinely depends on the user (ambiguous requirement), not for things you can decide yourself.
 - To locate existing code, prefer search_files over reading whole files.
 - Prefer write_file for new files. Prefer old_string/new_string for small edits.
 - Stay inside the workspace. Do not access the network unless the task requires it.

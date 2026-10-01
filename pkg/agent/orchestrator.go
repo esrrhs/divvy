@@ -31,6 +31,10 @@ type Orchestrator struct {
 	budget  *budgetGuard
 	cpMu    sync.Mutex
 	mergeMu sync.Mutex
+
+	// askHook, when set, lets a leaf worker ask the user a question mid-run
+	// and block on the answer. Nil in batch mode; the guided flow sets it.
+	askHook func(question string) string
 }
 
 // New creates an orchestrator around an existing tree.
@@ -388,6 +392,49 @@ func (o *Orchestrator) RunPlan(ctx context.Context) error {
 		return fmt.Errorf("plan check failed: %d warning(s)", len(warns))
 	}
 	return nil
+}
+
+// buildPlan decomposes every pending node until the tree is fully planned.
+// It is the interactive equivalent of the decomposition half of RunPlan.
+func (o *Orchestrator) buildPlan(ctx context.Context) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			_ = o.checkpoint()
+			return err
+		}
+		node := o.sched.GetNextDecomposableNode()
+		if node == nil {
+			return nil
+		}
+		o.log.Actionf("plan: decompose %s — %s", node.ID, node.Title)
+		if err := o.decompose(ctx, node); err != nil {
+			if ctx.Err() != nil {
+				_ = o.sched.UpdateNodeState(node.ID, models.TaskStatePending, "interrupted")
+				_ = o.checkpoint()
+				return ctx.Err()
+			}
+			_ = o.sched.UpdateNodeState(node.ID, models.TaskStateFailed, err.Error())
+			_ = o.checkpoint()
+			return fmt.Errorf("planning failed at %s: %w", node.ID, err)
+		}
+		_ = o.checkpoint()
+	}
+}
+
+// replan discards the root's current children and re-decomposes with the
+// user's adjustment feedback incorporated into the root description.
+func (o *Orchestrator) replan(ctx context.Context, feedback string) error {
+	if err := o.tree.ResetChildren(o.tree.RootID); err != nil {
+		return err
+	}
+	if err := o.tree.UpdateNode(o.tree.RootID, func(n *models.TaskNode) error {
+		n.Description = fmt.Sprintf("%s\n[User plan adjustment — the new plan MUST reflect this]: %s",
+			strings.TrimSpace(n.Description), strings.TrimSpace(feedback))
+		return nil
+	}); err != nil {
+		return err
+	}
+	return o.buildPlan(ctx)
 }
 
 // chat wraps o.llm.Chat and records token usage under a call kind and node.

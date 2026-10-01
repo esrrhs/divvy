@@ -57,6 +57,8 @@ func run(args []string) error {
 	budgetTokens := fs.Int("budget-tokens", cfg.BudgetTokens, "session token ceiling, incl. pre-resume spend (0 = unlimited)")
 	pricing := fs.String("pricing", cfg.PricingJSON, "custom price table as JSON text or path to a JSON file ({\"model\":{\"input\":0.15,\"output\":0.6}} per 1M tokens)")
 	resume := fs.Bool("resume", false, "resume a previous session")
+	interactive := fs.Bool("interactive", false, "interactive REPL mode (multi-turn)")
+	guided := fs.Bool("guided", false, "human-in-the-loop: plan, review/approve, then execute (mid-run plan edits and questions)")
 	listSessions := fs.Bool("sessions", false, "list saved sessions and exit")
 	status := fs.Bool("status", false, "print saved tree and exit")
 	verbose := fs.Bool("v", false, "verbose logs (raw model snippets, tool output)")
@@ -112,6 +114,53 @@ func run(args []string) error {
 	cfg.WorkDir = absWork
 
 	log := agent.NewLogger(cfg.Verbose)
+
+	if *interactive {
+		if cfg.RequiresAPIKey() && cfg.APIKey == "" {
+			return fmt.Errorf("missing API key: set OPENAI_API_KEY or pass -api-key")
+		}
+		client := llm.NewOpenAIClient(cfg.APIKey, cfg.BaseURL, cfg.RequestTimeout)
+		client.ExtraJSON = cfg.ExtraJSON
+		client.MaxBackoff = cfg.RetryMaxInterval
+
+		repl, err := agent.NewREPL(cfg, client)
+		if err != nil {
+			return err
+		}
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer cancel()
+		return repl.Run(ctx, agent.NewStdioREPL(os.Stdin, os.Stdout))
+	}
+
+	if *guided {
+		if cfg.RequiresAPIKey() && cfg.APIKey == "" {
+			return fmt.Errorf("missing API key: set OPENAI_API_KEY or pass -api-key")
+		}
+		client := llm.NewOpenAIClient(cfg.APIKey, cfg.BaseURL, cfg.RequestTimeout)
+		client.ExtraJSON = cfg.ExtraJSON
+		client.MaxBackoff = cfg.RetryMaxInterval
+
+		var o *agent.Orchestrator
+		if *resume {
+			o, err = agent.Load(cfg, client, log)
+		} else {
+			o, err = agent.NewFromGoal(cfg, client, log)
+		}
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer cancel()
+
+		gErr := agent.NewGuider(o, agent.NewStdioGuided(os.Stdin, os.Stdout)).Run(ctx)
+		if gErr == agent.ErrPaused {
+			log.Infof("paused. resume the guided flow with:\n  go_llm_engine -guided -resume -session %s -workdir %s",
+				o.SessionID(), cfg.WorkDir)
+			return nil
+		}
+		return gErr
+	}
 
 	if *listSessions {
 		storage, err := engine.NewStorage(cfg.DataDir)
@@ -204,6 +253,8 @@ const usageText = `go_llm_engine — divide-and-conquer coding agent for small/c
 Usage:
   go_llm_engine [flags] <goal>
   go_llm_engine -plan [flags] <goal>
+  go_llm_engine -interactive [flags] [first message]
+  go_llm_engine -guided [flags] <goal>
   go_llm_engine -resume [-session ID]
   go_llm_engine -status [-session ID]
 
@@ -216,6 +267,7 @@ Examples:
 
   go_llm_engine -plan -workdir ./ws "目标"   # 只拆解，检查任务树
   go_llm_engine -plan -strict -workdir ./ws "目标"   # 拆解 + 严格检查（CI 友好）
+  go_llm_engine -interactive -workdir .      # 交互式多轮开发（/help、/exit）
   go_llm_engine -resume -workdir ./ws        # 再执行
 
   go_llm_engine -max-cost 1 -budget-tokens 200000 -workdir ./ws "目标"

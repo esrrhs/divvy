@@ -73,6 +73,25 @@ func (o *Orchestrator) runWorker(ctx context.Context, sb *tools.Sandbox, node *m
 				return summary, nil
 			}
 
+			// "ask" questions the user mid-task (only available in a guided
+			// interactive session). In batch mode there is no user; tell the
+			// model to make a reasonable assumption and continue.
+			if act.Name == "ask" {
+				question, _ := stringFromArgs(act.Args, "question")
+				var answer string
+				if o.askHook == nil {
+					answer = "No interactive user is available in this run. Make a reasonable assumption and continue; do not call ask again."
+				} else {
+					o.log.Actionf("%s asks: %s", node.ID, question)
+					answer = o.askHook(question)
+				}
+				messages = append(messages, llm.Message{
+					Role:    llm.RoleUser,
+					Content: fmt.Sprintf("User answer:\n%s", answer),
+				})
+				continue
+			}
+
 			out, callErr := sb.Call(ctx, act.Name, act.Args)
 			if callErr != nil {
 				out = "ERROR: " + callErr.Error()

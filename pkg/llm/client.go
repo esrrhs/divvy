@@ -100,6 +100,10 @@ func (c *OpenAIClient) Chat(ctx context.Context, req Request) (*Response, error)
 	var lastErr error
 
 	for attempt := 0; ; attempt++ {
+		// Never start or retry a request once the caller gave up.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if c.MaxRetries > 0 && attempt >= c.MaxRetries {
 			if lastErr != nil {
 				return nil, lastErr
@@ -120,6 +124,11 @@ func (c *OpenAIClient) Chat(ctx context.Context, req Request) (*Response, error)
 			return resp, nil
 		}
 		lastErr = err
+		// A canceled/deadline context is terminal even if the transport
+		// reported it as a retryable network error.
+		if cerr := ctx.Err(); cerr != nil {
+			return nil, cerr
+		}
 		if !retryable(err) {
 			if stream {
 				useStream = false
