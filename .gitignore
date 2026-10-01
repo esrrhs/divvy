@@ -11,5 +11,4 @@ bin/
 # Local workspaces
 ws/
 workspace/
-ws_qwen/
-ws_real/
+ws_*/

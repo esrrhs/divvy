@@ -36,6 +36,7 @@ Rules:
 - The TOP-LEVEL dod is goal-level acceptance, not a build of one package: its commands must actually EXERCISE the finished deliverable end to end. For an HTTP service, build it, start it briefly, hit a real endpoint with curl, then stop it. Example command:
   go build -o /tmp/smoke_app . && (/tmp/smoke_app & SRV=$!; sleep 1; curl -sf http://127.0.0.1:18080/tasks; RC=$?; kill $SRV; exit $RC)
   For a CLI: build then run the binary with real arguments and check its output. curl must use -f so an HTTP error makes the check fail.
+- expected_output, when set, must be LITERAL TEXT that a command actually prints (e.g. "ok", "PASS", a number), and it is matched against combined output. NEVER put a prose description like "Build succeeds" or "test passes": a successful go build/go test prints nothing, so such text can never match. Leave it empty unless a command really prints the text.
 - dependencies may only list sibling ids, never "root" unless it is a sibling.
 - ids: lowercase snake_case, unique, stable.
 - Do not create planning-only or documentation-only tasks.

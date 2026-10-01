@@ -54,12 +54,68 @@ func (o *Orchestrator) verify(ctx context.Context, sb *tools.Sandbox, node *mode
 	// combined output of all commands (a quiet build followed by a verbose
 	// test must still pass), not in every single command's output.
 	if node.DoD.ExpectedOutput != "" {
+		want := strings.TrimSpace(node.DoD.ExpectedOutput)
 		blob := combined.String()
-		if !strings.Contains(blob, node.DoD.ExpectedOutput) {
-			msg := blob + fmt.Sprintf("expected output %q not found\n", node.DoD.ExpectedOutput)
-			o.log.Errorf("verify output mismatch: expected %q", node.DoD.ExpectedOutput)
+		if !strings.Contains(blob, want) {
+			// Weak models often misuse expected_output as a prose description
+			// of what should happen ("Build succeeds") rather than text the
+			// command prints. When every command succeeded and the expected
+			// text is clearly such a phrase (multi-word sentence, not a
+			// literal token/string), treat exit codes as the verdict instead
+			// of failing on an unmatchable sentence.
+			if looksLikeExpectationPhrase(want, blob) {
+				o.log.Warnf("expected_output %q reads like a description, not printed text; trusting exit codes", want)
+				return VerifyResult{OK: true, Output: combined.String()}
+			}
+			msg := blob + fmt.Sprintf("expected output %q not found\n", want)
+			o.log.Errorf("verify output mismatch: expected %q", want)
 			return VerifyResult{OK: false, Command: cmds[len(cmds)-1], Output: msg}
 		}
 	}
 	return VerifyResult{OK: true, Output: combined.String()}
+}
+
+// looksLikeExpectationPhrase reports whether an unmatched expected_output is
+// a prose description rather than literal output text. Heuristic: it contains
+// spaces forming multiple words or common verbs, and the successful commands
+// printed essentially nothing (a quiet build/test). A concrete token like
+// "ok", "PASS", a number, or a path must still be matched.
+func looksLikeExpectationPhrase(want, blob string) bool {
+	w := strings.TrimSpace(want)
+	words := strings.Fields(w)
+	if len(words) < 2 {
+		// Single token is almost certainly literal output, keep enforcing it.
+		return false
+	}
+	// Multi-word sentence that starts with a capital / reads like English or
+	// Chinese description: treat as prose.
+	hasVerb := strings.Contains(strings.ToLower(w), "succeed") ||
+		strings.Contains(strings.ToLower(w), "success") ||
+		strings.Contains(strings.ToLower(w), "build") ||
+		strings.Contains(strings.ToLower(w), "pass") ||
+		strings.Contains(strings.ToLower(w), "works") ||
+		strings.Contains(strings.ToLower(w), "returns") ||
+		strings.Contains(strings.ToLower(w), "应") ||
+		strings.Contains(w, "成功") ||
+		strings.Contains(w, "应该")
+	if !hasVerb {
+		return false
+	}
+	// Only relax when the commands genuinely produced no stdout: if they
+	// printed something, a real mismatch should still fail.
+	return commandOutputEmpty(blob)
+}
+
+// commandOutputEmpty checks whether the captured combined output carries no
+// command stdout/stderr body (only the "$ cmd / exit 0" framing).
+func commandOutputEmpty(blob string) bool {
+	for _, line := range strings.Split(blob, "\n") {
+		if strings.HasPrefix(line, "$ ") || strings.HasPrefix(line, "exit ") {
+			continue
+		}
+		if strings.TrimSpace(line) != "" {
+			return false
+		}
+	}
+	return true
 }

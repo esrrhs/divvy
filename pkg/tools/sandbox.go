@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 	"unicode/utf8"
 )
@@ -342,6 +343,25 @@ func (s *Sandbox) RunBash(ctx context.Context, command string, timeout time.Dura
 
 	cmd := exec.CommandContext(ctx, "sh", "-c", command)
 	cmd.Dir = s.Root
+	// Run the shell in its own process group so a timeout can kill the whole
+	// group, including background children (e.g. a started server). Killing
+	// only sh leaves such children alive and sh waits on them forever, which
+	// makes the timeout ineffective and the leaf hang.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		// Negative pid targets the process group.
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	// Give killed processes a moment to be reaped.
+	cmd.WaitDelay = 2 * time.Second
+
+	// After the shell exits — even on success — kill any process still in its
+	// group. A background child started in a subshell is reparented to pid 1
+	// while the outer shell returns successfully, so neither a timeout nor
+	// sh's exit would otherwise stop it and the server leaks forever. A normal
+	// foreground command leaves the group empty; ESRCH is ignored.
+	defer func() { _ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }()
+
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = capWriter{w: &stdout, n: s.maxOut()}
 	cmd.Stderr = capWriter{w: &stderr, n: s.maxOut()}
@@ -354,6 +374,10 @@ func (s *Sandbox) RunBash(ctx context.Context, command string, timeout time.Dura
 	if ctx.Err() == context.DeadlineExceeded {
 		res.TimedOut = true
 		res.ExitCode = -1
+		// Make the hang reason visible so a leaf can correct its command.
+		if res.Stderr == "" {
+			res.Stderr = fmt.Sprintf("command timed out after %s (process group killed)", timeout)
+		}
 		return res, nil
 	}
 	if err != nil {

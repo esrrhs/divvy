@@ -3,9 +3,12 @@ package tools
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestSandbox_PathEscapeAndCRUD(t *testing.T) {
@@ -58,6 +61,64 @@ func TestSandbox_PathEscapeAndCRUD(t *testing.T) {
 		t.Fatalf("bash: %+v", res)
 	}
 
+	// A command that leaves a background child holding the inherited stdout
+	// pipe blocks cmd.Wait (pipe EOF never arrives) until the timeout. The
+	// whole process group must then be killed, promptly and without leaking
+	// the child — this is the leaf-hang / server-leak guard.
+	start := time.Now()
+	res, err = sb.RunBash(context.Background(),
+		"sleep 48 & wait", 500*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.TimedOut || res.ExitCode != -1 {
+		t.Fatalf("expected timeout, got %+v", res)
+	}
+	if time.Since(start) > 6*time.Second {
+		t.Fatalf("timeout was not enforced promptly: %s", time.Since(start))
+	}
+	if leaked := pgrepSleep(48); leaked != "" {
+		t.Fatalf("background child leaked after timeout: %s", leaked)
+	}
+
+	// Same guarantee when the child is orphaned in a subshell and the outer
+	// shell itself exits immediately: pipe EOF still blocks to the timeout,
+	// process-group cleanup kills the orphan.
+	res, err = sb.RunBash(context.Background(),
+		"(sleep 49 &)", 500*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.TimedOut {
+		t.Fatalf("orphaned child holding the pipe should also hit timeout: %+v", res)
+	}
+	if leaked := pgrepSleep(49); leaked != "" {
+		t.Fatalf("orphaned child leaked: %s", leaked)
+	}
+}
+
+// pgrepSleep reports surviving sleep processes by the distinctive argument.
+// By the time this runs the parent sh is reaped, so a match means the sleep
+// itself leaked; we avoid pgrep -x sleep which matches unrelated sleeps.
+func pgrepSleep(seconds int) string {
+	target := "sleep " + strconv.Itoa(seconds)
+	for i := 0; i < 20; i++ {
+		out, err := exec.Command("pgrep", "-f", target).Output()
+		if err != nil || strings.TrimSpace(string(out)) == "" {
+			return ""
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	out, _ := exec.Command("pgrep", "-f", target).Output()
+	return strings.TrimSpace(string(out))
+}
+
+func TestSandbox_CallWrite(t *testing.T) {
+	dir := t.TempDir()
+	sb, err := NewSandbox(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	out, err := sb.Call(context.Background(), "write_file", map[string]any{
 		"path":    "b.txt",
 		"content": "hello",
