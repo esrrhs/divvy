@@ -11,7 +11,7 @@ import (
 )
 
 // scriptedClient returns queued content responses; it records the last
-// request so tests can assert the conversation is threaded across turns.
+// request so tests can assert what the foreman carried.
 type scriptedClient struct {
 	responses []string
 	calls     int
@@ -56,6 +56,7 @@ func newTestREPL(t *testing.T, client llm.Client) *REPL {
 	t.Helper()
 	cfg := DefaultConfig()
 	cfg.WorkDir = t.TempDir()
+	cfg.DataDir = t.TempDir()
 	cfg.MaxSteps = 10
 	repl, err := NewREPL(cfg, client)
 	if err != nil {
@@ -64,181 +65,158 @@ func newTestREPL(t *testing.T, client llm.Client) *REPL {
 	return repl
 }
 
-func TestREPL_ToolThenReply(t *testing.T) {
-	// Initial goal: model calls write_file, then responds.
+func TestREPL_DispatchLeafThenReply(t *testing.T) {
+	// Foreman dispatches one leaf; the leaf writes a real file in its own
+	// worker context and finishes; the foreman then reports to the user.
 	client := &scriptedClient{responses: []string{
-		`{"thought":"creating","action":"write_file","args":{"path":"hello.txt","content":"hi there"}}`,
-		`{"thought":"done","action":"respond","args":{"message":"created the file"}}`,
+		`{"thought":"need a file","action":"dispatch","args":{"tasks":[{"title":"create hello","description":"Create file hello.txt containing exactly: hi there"}]}}`,
+		`{"thought":"write","action":"write_file","args":{"path":"hello.txt","content":"hi there"}}`,
+		`{"thought":"done","action":"finish","args":{"summary":"created hello.txt"}}`,
+		`{"thought":"report","action":"respond","args":{"message":"created the file"}}`,
 	}}
 	repl := newTestREPL(t, client)
-	repl.cfg.Goal = "make a file"
+	repl.o.cfg.Goal = "make a file"
 
 	mio := &scriptedIO{lines: []string{"/exit"}}
 	if err := repl.Run(context.Background(), mio); err != nil {
 		t.Fatal(err)
 	}
 
-	if client.calls != 2 {
-		t.Fatalf("expected 2 model calls, got %d", client.calls)
+	if client.calls != 4 {
+		t.Fatalf("expected 4 calls (dispatch, leaf x2, respond), got %d", client.calls)
+	}
+	if repl.leaves != 1 {
+		t.Fatalf("expected exactly 1 leaf run, got %d", repl.leaves)
 	}
 	if !strings.Contains(mio.out.String(), "created the file") {
-		t.Fatalf("missing reply in output:\n%s", mio.out.String())
+		t.Fatalf("missing foreman reply:\n%s", mio.out.String())
 	}
-	// The tool really ran in the workspace.
-	got, err := repl.sandbox.ReadFile("hello.txt")
+	// The leaf really did the work in the workspace.
+	got, err := repl.o.sandbox.ReadFile("hello.txt")
 	if err != nil || got != "hi there" {
-		t.Fatalf("file not written by tool: %q %v", got, err)
+		t.Fatalf("file not written by leaf: %q %v", got, err)
 	}
 }
 
-func TestREPL_MultiTurnRetainsHistory(t *testing.T) {
-	// Turn 1: one tool + respond. Turn 2 (from user line): respond again.
+func TestREPL_MultiTurnCarriesCompressedSummary(t *testing.T) {
+	// Turn 1: dispatch → leaf finish → respond. Turn 2: the foreman answers
+	// directly. The turn-2 request must contain the compressed work log of
+	// turn 1 (including its reply marker) but none of the raw turn-1 JSON.
 	client := &scriptedClient{responses: []string{
-		`{"action":"list_dir","args":{}}`,
-		`{"action":"respond","args":{"message":"first answer"}}`,
-		`{"action":"respond","args":{"message":"second answer"}}`,
+		`{"thought":"plan","action":"dispatch","args":{"tasks":[{"title":"do first","description":"Do the first piece of work"}]}}`,
+		`{"thought":"done","action":"finish","args":{"summary":"first-leaf-result"}}`,
+		`{"thought":"report","action":"respond","args":{"message":"first-done-marker"}}`,
+		`{"thought":"answer","action":"respond","args":{"message":"second reply marker"}}`,
 	}}
 	repl := newTestREPL(t, client)
-	repl.cfg.Goal = "first request"
 
-	mio := &scriptedIO{lines: []string{"follow up request", "/exit"}}
+	mio := &scriptedIO{lines: []string{"first request", "second request", "/exit"}}
 	if err := repl.Run(context.Background(), mio); err != nil {
 		t.Fatal(err)
 	}
+	if client.calls != 4 {
+		t.Fatalf("expected 4 calls, got %d", client.calls)
+	}
 
-	out := mio.out.String()
-	if !strings.Contains(out, "first answer") || !strings.Contains(out, "second answer") {
-		t.Fatalf("both turns should reply:\n%s", out)
+	// Final request: system + work-log user message + current user message.
+	if len(client.lastMsgs) != 3 {
+		t.Fatalf("turn 2 should carry system + work log + current msg, got %d messages: %+v", len(client.lastMsgs), client.lastMsgs)
 	}
-	if client.calls != 3 {
-		t.Fatalf("expected 3 calls across 2 turns, got %d", client.calls)
+	blob := ""
+	for _, m := range client.lastMsgs {
+		blob += m.Content
 	}
-	// The final request must carry the earlier conversation (system + first
-	// turn user/tool/assistant exchange + second turn user), proving history
-	// is retained rather than reset between turns.
-	if len(client.lastMsgs) < 5 {
-		t.Fatalf("expected threaded history in final request, got %d messages", len(client.lastMsgs))
+	if !strings.Contains(blob, "first-done-marker") || !strings.Contains(blob, "first-leaf-result") {
+		t.Fatalf("work log missing turn-1 summary:\n%s", blob)
+	}
+	if strings.Contains(blob, "Do the first piece of work") {
+		t.Fatal("raw turn-1 leaf instruction must not be carried; only its compressed summary")
+	}
+	if len(repl.summaries) != 2 {
+		t.Fatalf("expected 2 compressed turns kept (one per turn), got %d", len(repl.summaries))
 	}
 }
 
 func TestREPL_InvalidActionGetsCorrected(t *testing.T) {
 	client := &scriptedClient{responses: []string{
 		`not a json action`,
-		`{"action":"respond","args":{"message":"recovered"}}`,
+		`{"thought":"ok","action":"respond","args":{"message":"recovered"}}`,
 	}}
 	repl := newTestREPL(t, client)
-	repl.cfg.Goal = "do something"
+	repl.o.cfg.Goal = "do something"
 
 	mio := &scriptedIO{lines: []string{"/exit"}}
 	if err := repl.Run(context.Background(), mio); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(mio.out.String(), "recovered") {
-		t.Fatalf("model should recover after invalid action:\n%s", mio.out.String())
+		t.Fatalf("foreman should recover after invalid action:\n%s", mio.out.String())
+	}
+}
+
+func TestREPL_ForemanRespondsWithoutLeaf(t *testing.T) {
+	// A direct answer dispatches no leaves; the reply is still shown.
+	client := &scriptedClient{responses: []string{
+		`{"thought":"just answer","action":"respond","args":{"message":"direct answer"}}`,
+	}}
+	repl := newTestREPL(t, client)
+	repl.o.cfg.Goal = "hello"
+
+	mio := &scriptedIO{lines: []string{"/exit"}}
+	if err := repl.Run(context.Background(), mio); err != nil {
+		t.Fatal(err)
+	}
+	if repl.leaves != 0 {
+		t.Fatalf("no leaf should run, got %d", repl.leaves)
+	}
+	if !strings.Contains(mio.out.String(), "direct answer") {
+		t.Fatal("missing direct answer")
 	}
 }
 
 func TestREPL_SlashCommands(t *testing.T) {
-	client := &scriptedClient{responses: []string{
-		`{"action":"respond","args":{"message":"ok"}}`,
-	}}
+	client := &scriptedClient{responses: []string{""}}
 	repl := newTestREPL(t, client)
+	repl.summaries = []string{"an earlier turn"}
 
 	mio := &scriptedIO{lines: []string{"/help", "/clear", "/status", "/bogus", "/quit"}}
 	if err := repl.Run(context.Background(), mio); err != nil {
 		t.Fatal(err)
 	}
 	out := mio.out.String()
-	if !strings.Contains(out, "Commands:") {
-		t.Fatal(" /help did not print")
+	for _, want := range []string{"Architecture", "work log cleared", "leaf runs:", "unknown command"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in:\n%s", want, out)
+		}
 	}
-	if !strings.Contains(out, "conversation cleared") {
-		t.Fatal("/clear did not print")
-	}
-	if !strings.Contains(out, "workspace:") {
-		t.Fatal("/status did not print")
-	}
-	if !strings.Contains(out, "unknown command") {
-		t.Fatal("unknown slash command not handled")
+	if len(repl.summaries) != 0 {
+		t.Fatal("/clear should drop the work log")
 	}
 }
 
 func TestREPL_EOFEndsSession(t *testing.T) {
-	client := &scriptedClient{responses: []string{
-		`{"action":"respond","args":{"message":"ok"}}`,
-	}}
+	client := &scriptedClient{responses: []string{""}}
 	repl := newTestREPL(t, client)
-	repl.cfg.Goal = "initial"
-
-	// No queued lines → immediate EOF after the initial turn.
+	// No goal, no queued lines → immediate EOF.
 	if err := repl.Run(context.Background(), &scriptedIO{}); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func TestREPL_ToolErrorFedBack(t *testing.T) {
-	// A tool call with invalid args produces an error that is fed back; the
-	// model then responds. The session stays alive.
-	client := &scriptedClient{responses: []string{
-		`{"action":"read_file","args":{}}`,
-		`{"action":"respond","args":{"message":"noted"}}`,
+func TestParseForemanTasks(t *testing.T) {
+	a := &llm.Action{Args: map[string]any{
+		"tasks": []any{
+			map[string]any{"title": "A", "description": "do A"},
+			map[string]any{"description": "some long unnamed task"},
+			map[string]any{"title": "", "description": "   "},
+			"not-an-object",
+		},
 	}}
-	repl := newTestREPL(t, client)
-	repl.cfg.Goal = "read a missing file"
-
-	mio := &scriptedIO{lines: []string{"/exit"}}
-	if err := repl.Run(context.Background(), mio); err != nil {
-		t.Fatal(err)
+	tasks := parseForemanTasks(a)
+	if len(tasks) != 2 {
+		t.Fatalf("expected 2 valid tasks, got %d: %+v", len(tasks), tasks)
 	}
-	if client.calls != 2 {
-		t.Fatalf("error should be fed back for a second call, got %d", client.calls)
-	}
-}
-
-func TestREPL_TrimMsgs(t *testing.T) {
-	repl := newTestREPL(t, &scriptedClient{responses: []string{`{"action":"respond","args":{"message":"x"}}`}})
-	for i := 0; i < 50; i++ {
-		repl.msgs = append(repl.msgs, llm.Message{Role: llm.RoleUser, Content: fmt.Sprintf("msg-%d", i)})
-	}
-
-	repl.trimMsgs()
-
-	if len(repl.msgs) != replMaxMsgs {
-		t.Fatalf("expected %d messages after trim, got %d", replMaxMsgs, len(repl.msgs))
-	}
-	if repl.msgs[0].Content != "msg-0" {
-		t.Fatal("the first message (original intent) must always be kept")
-	}
-	if repl.msgs[len(repl.msgs)-1].Content != "msg-49" {
-		t.Fatal("the most recent tail must be kept")
-	}
-	for _, m := range repl.msgs {
-		if m.Content == "msg-10" {
-			t.Fatal("a middle message should have been dropped")
-		}
-	}
-	if repl.trimmed != 10 {
-		t.Fatalf("expected trimmed counter 10, got %d", repl.trimmed)
-	}
-
-	// Within the window, another trim is a no-op.
-	repl.trimMsgs()
-	if repl.trimmed != 10 || len(repl.msgs) != replMaxMsgs {
-		t.Fatal("repeated trim within the window must change nothing")
-	}
-}
-
-func TestREPL_StatusShowsTrimmed(t *testing.T) {
-	repl := newTestREPL(t, &scriptedClient{responses: []string{`{"action":"respond","args":{"message":"x"}}`}})
-	for i := 0; i < 50; i++ {
-		repl.msgs = append(repl.msgs, llm.Message{Role: llm.RoleUser, Content: fmt.Sprintf("msg-%d", i)})
-	}
-	repl.trimMsgs()
-
-	mio := &scriptedIO{}
-	repl.slash(context.Background(), "/status", mio)
-	out := mio.out.String()
-	if !strings.Contains(out, "trimmed:") || !strings.Contains(out, "10") {
-		t.Fatalf("/status should report the trimmed count:\n%s", out)
+	if tasks[0].title != "A" || tasks[1].title != "some long unnamed task" {
+		t.Fatalf("unexpected titles: %+v", tasks)
 	}
 }

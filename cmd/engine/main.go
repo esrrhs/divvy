@@ -94,6 +94,25 @@ func run(args []string) error {
 	cfg.PricingJSON = *pricing
 	cfg.Goal = strings.TrimSpace(strings.Join(fs.Args(), " "))
 
+	// Interactive sessions don't persist a task tree; unless the user set
+	// -datadir explicitly, keep its storage in a temp dir instead of
+	// creating .go_llm_engine inside the live workspace.
+	if *interactive {
+		explicitData := false
+		fs.Visit(func(f *flag.Flag) {
+			if f.Name == "datadir" {
+				explicitData = true
+			}
+		})
+		if !explicitData {
+			d, merr := os.MkdirTemp("", "go_llm_engine_repl_")
+			if merr != nil {
+				return merr
+			}
+			cfg.DataDir = d
+		}
+	}
+
 	// -isolate defaults to on whenever several leaves may run at once.
 	explicitIsolate := false
 	fs.Visit(func(f *flag.Flag) {

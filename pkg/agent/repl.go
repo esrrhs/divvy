@@ -7,7 +7,9 @@ import (
 	"io"
 	"strings"
 
+	"github.com/esrrhs/go_llm_engine/pkg/engine"
 	"github.com/esrrhs/go_llm_engine/pkg/llm"
+	"github.com/esrrhs/go_llm_engine/pkg/models"
 	"github.com/esrrhs/go_llm_engine/pkg/tools"
 )
 
@@ -18,47 +20,49 @@ type REPLIO interface {
 	Printf(format string, a ...any)
 }
 
-// replMaxMsgs bounds the conversation carried per request. The first user
-// message is always retained (original intent), plus the most recent tail.
-const replMaxMsgs = 40
+const (
+	// replMaxSummaries bounds how many compressed earlier turns are carried.
+	replMaxSummaries = 8
+	// replMaxDispatch bounds how many dispatch rounds one user turn may take.
+	replMaxDispatch = 10
+)
 
-// REPL is the interactive coding session. Unlike the batch orchestrator it
-// keeps a live conversation across turns; the model drives the same workspace
-// tools and returns control to the user after each reply.
+// REPL is the interactive session built as a foreman plus independent leaf
+// workers: a lightweight outer conversation understands the user and decides
+// what work to dispatch; every actual file/shell action happens inside a leaf
+// with its own fresh context (runWorker), and the outer layer only ever sees
+// the leaf's short summary. Earlier turns survive only as compressed
+// summaries, never as raw conversation.
 type REPL struct {
-	cfg      Config
-	client   llm.Client
-	sandbox  *tools.Sandbox
-	system   string
-	msgs     []llm.Message
+	o         *Orchestrator
+	summaries []string
+
+	// Token usage of the outer (foreman) calls; worker usage is tracked on
+	// the orchestrator's usage tracker.
 	prompt   int
 	complete int
-	trimmed  int
+	leaves   int
 }
 
 // NewREPL builds an interactive session operating directly in cfg.WorkDir
 // (no mirror isolation — it is the user's live workspace).
 func NewREPL(cfg Config, client llm.Client) (*REPL, error) {
-	sb, err := tools.NewSandbox(cfg.WorkDir)
+	tree := engine.NewTaskTree("interactive", "interactive session", "interactive session")
+	o, err := New(cfg, tree, client, NewLogger(cfg.Verbose))
 	if err != nil {
 		return nil, err
 	}
-	return &REPL{
-		cfg:     cfg,
-		client:  client,
-		sandbox: sb,
-		system:  replSystemPrompt(),
-	}, nil
+	return &REPL{o: o}, nil
 }
 
-// Run drives the prompt → agent-turn loop until /exit, EOF, or cancellation.
+// Run drives the prompt → foreman/leaf loop until /exit, EOF, or cancellation.
 // If cfg.Goal is set it is executed as the first turn automatically.
 func (r *REPL) Run(ctx context.Context, term REPLIO) error {
-	term.Printf("go_llm_engine interactive REPL — model %s, workspace %s\n", r.cfg.Model, r.sandbox.Root)
-	term.Printf("type /help for commands, /exit to quit\n")
+	term.Printf("go_llm_engine interactive — model %s, workspace %s\n", r.o.cfg.Model, r.o.sandbox.Root)
+	term.Printf("foreman + independent leaf workers; type /help for commands\n")
 
-	if strings.TrimSpace(r.cfg.Goal) != "" {
-		if err := r.turn(ctx, r.cfg.Goal, term); err != nil {
+	if strings.TrimSpace(r.o.cfg.Goal) != "" {
+		if err := r.turn(ctx, r.o.cfg.Goal, term); err != nil {
 			return err
 		}
 	}
@@ -105,117 +109,185 @@ func (r *REPL) slash(ctx context.Context, cmd string, term REPLIO) bool {
 		term.Printf("bye\n")
 		return true
 	case "/clear":
-		r.msgs = nil
-		r.trimmed = 0
-		term.Printf("conversation cleared (workspace untouched)\n")
+		r.summaries = nil
+		term.Printf("work log cleared (files untouched)\n")
 	case "/help":
 		term.Printf(replHelp)
 	case "/status":
-		term.Printf("model:      %s\nworkspace:  %s\nmessages:   %d\ntokens:     %d prompt + %d completion\n",
-			r.cfg.Model, r.sandbox.Root, len(r.msgs), r.prompt, r.complete)
-		if r.trimmed > 0 {
-			term.Printf("trimmed:    %d older message(s) dropped; window is %d (first request always kept)\n",
-				r.trimmed, replMaxMsgs)
-		}
+		wp, wc := r.o.usage.Total()
+		term.Printf("model:      %s\nworkspace:  %s\nleaf runs:  %d\nforeman:    %d prompt + %d completion tokens\nleaf work:  %d prompt + %d completion tokens\nwork log:   %d compressed turn(s) kept (max %d)\n",
+			r.o.cfg.Model, r.o.sandbox.Root, r.leaves,
+			r.prompt, r.complete, wp, wc, len(r.summaries), replMaxSummaries)
 	default:
 		term.Printf("unknown command %q — try /help\n", cmd)
 	}
 	return false
 }
 
-// turn runs one user request through the agent: repeatedly call the model,
-// execute tool actions, feed results back, until the model emits a "respond"
-// (its reply to the user) or the per-turn step limit is reached.
+// foremanTask is one self-contained unit of work handed to a leaf.
+type foremanTask struct {
+	title       string
+	description string
+}
+
+// turn runs one user request through the foreman. The foreman either responds
+// directly (clarify/summarize/chat) or dispatches one or more independent
+// leaf workers; their summaries are fed back, and this repeats until the
+// foreman responds. Only a compressed summary of the turn survives.
 func (r *REPL) turn(ctx context.Context, userText string, term REPLIO) error {
-	// Keep the live history bounded once this turn finishes (or aborts), so a
-	// long session does not resend every old message on every later request.
-	defer r.trimMsgs()
+	conv := []llm.Message{{Role: llm.RoleUser, Content: userText}}
 
-	r.msgs = append(r.msgs, llm.Message{Role: llm.RoleUser, Content: userText})
-
-	maxSteps := r.cfg.MaxSteps
-	if maxSteps <= 0 {
-		maxSteps = 20
-	}
-
-	for step := 1; step <= maxSteps; step++ {
+	var leafResults []string
+	for step := 1; step <= replMaxDispatch; step++ {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 
-		msgs := make([]llm.Message, 0, len(r.msgs)+1)
-		msgs = append(msgs, llm.Message{Role: llm.RoleSystem, Content: r.system})
-		msgs = append(msgs, r.msgs...)
-
-		resp, err := r.client.Chat(ctx, llm.Request{
-			Model:       r.cfg.Model,
-			Messages:    msgs,
-			Temperature: r.cfg.Temperature,
-			MaxTokens:   r.cfg.MaxTokens,
-		})
+		raw, err := r.outerChat(ctx, conv)
 		if err != nil {
-			return fmt.Errorf("model request failed: %w", err)
+			return err
 		}
-		r.addUsage(resp.Usage)
 
-		raw := strings.TrimSpace(resp.Content)
-		action, perr := llm.ParseAction(raw)
+		act, perr := llm.ParseAction(raw)
 		if perr != nil {
-			// Feed a correction hint and try again within the step budget.
-			r.msgs = append(r.msgs,
+			conv = append(conv,
 				llm.Message{Role: llm.RoleAssistant, Content: raw},
-				llm.Message{Role: llm.RoleUser, Content: "That was not a valid action. Reply with exactly one JSON object: {\"thought\":...,\"action\":...,\"args\":{...}}"},
+				llm.Message{Role: llm.RoleUser, Content: "That was not a valid action. Reply with exactly one JSON object."},
 			)
 			continue
 		}
 
-		// End of turn: reply to the user. "finish" is the worker spelling;
-		// accept it defensively as a reply.
-		if action.Name == "respond" || action.Name == "finish" {
-			text := replyText(action)
-			r.msgs = append(r.msgs, llm.Message{Role: llm.RoleAssistant, Content: raw})
+		if act.Name == "respond" || act.Name == "finish" {
+			text := replyText(act)
 			if strings.TrimSpace(text) != "" {
 				term.Printf("%s\n", text)
 			}
+			r.recordTurn(userText, leafResults, text)
 			return nil
 		}
 
-		// Otherwise it is a workspace tool: show activity, run it, feed the
-		// result back so the model can continue.
-		term.Printf("  -> %s\n", replDescribe(action))
-		out, callErr := r.sandbox.Call(ctx, action.Name, action.Args)
-		result := out
-		if callErr != nil {
-			result = "ERROR: " + callErr.Error()
+		if act.Name != "dispatch" {
+			conv = append(conv,
+				llm.Message{Role: llm.RoleAssistant, Content: raw},
+				llm.Message{Role: llm.RoleUser, Content: `You have no file or shell tools of your own. Use {"action":"dispatch","args":{"tasks":[...]}} to do work, or {"action":"respond",...} to talk.`},
+			)
+			continue
 		}
-		r.msgs = append(r.msgs,
-			llm.Message{Role: llm.RoleAssistant, Content: raw},
-			llm.Message{Role: llm.RoleUser, Content: "Tool result:\n" + result},
-		)
+
+		tasks := parseForemanTasks(act)
+		if len(tasks) == 0 {
+			conv = append(conv,
+				llm.Message{Role: llm.RoleAssistant, Content: raw},
+				llm.Message{Role: llm.RoleUser, Content: "dispatch needs a non-empty \"tasks\" array; each task needs title and description."},
+			)
+			continue
+		}
+
+		conv = append(conv, llm.Message{Role: llm.RoleAssistant, Content: raw})
+
+		for _, t := range tasks {
+			term.Printf("  -> leaf %d: %s\n", r.leaves+1, t.title)
+			node := r.newLeafNode(t)
+			summary, werr := r.o.runWorker(ctx, r.o.sandbox, node, "")
+			r.leaves++
+			result := summary
+			if werr != nil {
+				result = "ERROR: " + werr.Error()
+			}
+			leafResults = append(leafResults, t.title+": "+result)
+		}
+
+		conv = append(conv, llm.Message{
+			Role:    llm.RoleUser,
+			Content: "Leaf result(s):\n" + strings.Join(leafResults, "\n"),
+		})
 	}
 
-	term.Printf("[stopped after %d tool steps; send another message or adjust the request]\n", maxSteps)
+	term.Printf("[stopped after %d dispatch rounds; send another message or adjust the request]\n", replMaxDispatch)
 	return nil
 }
 
-func (r *REPL) addUsage(u llm.Usage) {
-	r.prompt += u.PromptTokens
-	r.complete += u.CompletionTokens
+// newLeafNode builds the synthetic leaf a dispatched task runs in. The node is
+// self-contained; the compressed work log is appended so workers retain
+// continuity with earlier turns despite their fresh context.
+func (r *REPL) newLeafNode(t foremanTask) *models.TaskNode {
+	desc := strings.TrimSpace(t.description)
+	if len(r.summaries) > 0 {
+		desc += "\n\nRecent work log (compressed summaries — use these for context):\n" +
+			strings.Join(r.summaries, "\n")
+	}
+	return models.NewTaskNode(
+		fmt.Sprintf("leaf_%d", r.leaves+1), "",
+		strings.TrimSpace(t.title), desc, models.NodeTypeLeaf, 0)
 }
 
-// trimMsgs drops the middle of the conversation when it exceeds the window,
-// keeping the first user message (original intent) and the most recent tail.
-func (r *REPL) trimMsgs() {
-	if len(r.msgs) <= replMaxMsgs {
-		return
+// outerChat performs one foreman model call with system prompt, compressed
+// work log, and the ephemeral conversation for this turn only.
+func (r *REPL) outerChat(ctx context.Context, conv []llm.Message) (string, error) {
+	msgs := make([]llm.Message, 0, len(conv)+2)
+	msgs = append(msgs, llm.Message{Role: llm.RoleSystem, Content: r.foremanSystem()})
+	if len(r.summaries) > 0 {
+		msgs = append(msgs, llm.Message{
+			Role:    llm.RoleUser,
+			Content: "Earlier work log (compressed summaries, not raw conversation):\n" + strings.Join(r.summaries, "\n"),
+		})
 	}
-	const head = 1
-	tail := replMaxMsgs - head
-	out := make([]llm.Message, 0, replMaxMsgs)
-	out = append(out, r.msgs[:head]...)
-	out = append(out, r.msgs[len(r.msgs)-tail:]...)
-	r.trimmed += len(r.msgs) - len(out)
-	r.msgs = out
+	msgs = append(msgs, conv...)
+
+	resp, err := r.o.llm.Chat(ctx, llm.Request{
+		Model:       r.o.cfg.Model,
+		Messages:    msgs,
+		Temperature: r.o.cfg.Temperature,
+		MaxTokens:   r.o.cfg.MaxTokens,
+	})
+	if err != nil {
+		return "", fmt.Errorf("foreman request failed: %w", err)
+	}
+	r.prompt += resp.Usage.PromptTokens
+	r.complete += resp.Usage.CompletionTokens
+	return resp.Content, nil
+}
+
+// recordTurn compresses the finished turn into a short structured summary and
+// keeps only the most recent replMaxSummaries entries.
+func (r *REPL) recordTurn(userText string, leafResults []string, reply string) {
+	var b strings.Builder
+	fmt.Fprintf(&b, "you: %s", truncate(strings.TrimSpace(userText), 120))
+	for _, lr := range leafResults {
+		fmt.Fprintf(&b, "\n  leaf: %s", truncate(lr, 200))
+	}
+	fmt.Fprintf(&b, "\n  reply: %s", truncate(strings.TrimSpace(reply), 160))
+
+	r.summaries = append(r.summaries, b.String())
+	if len(r.summaries) > replMaxSummaries {
+		r.summaries = r.summaries[len(r.summaries)-replMaxSummaries:]
+	}
+}
+
+func parseForemanTasks(a *llm.Action) []foremanTask {
+	raw, ok := a.Args["tasks"].([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]foremanTask, 0, len(raw))
+	for _, item := range raw {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		title, _ := stringFromArgs(m, "title")
+		desc, _ := stringFromArgs(m, "description")
+		title = strings.TrimSpace(title)
+		desc = strings.TrimSpace(desc)
+		if title == "" && desc == "" {
+			continue
+		}
+		if title == "" {
+			title = firstLine(desc)
+		}
+		out = append(out, foremanTask{title: title, description: desc})
+	}
+	return out
 }
 
 func replyText(a *llm.Action) string {
@@ -228,23 +300,23 @@ func replyText(a *llm.Action) string {
 	return a.Thought
 }
 
-func replDescribe(a *llm.Action) string {
-	get := func(k string) string {
-		if s, ok := a.Args[k].(string); ok {
-			return s
-		}
-		return ""
-	}
-	switch a.Name {
-	case "list_dir", "read_file", "write_file", "replace_lines":
-		return a.Name + " " + get("path")
-	case "run_bash":
-		return a.Name + " " + truncate(get("command"), 60)
-	case "search_files":
-		return a.Name + " " + truncate(get("pattern"), 60)
-	default:
-		return a.Name
-	}
+func (r *REPL) foremanSystem() string {
+	return fmt.Sprintf(`You are the foreman of an interactive coding session in the user's live workspace (%s; detected toolchain: %s).
+You do NOT have file or shell tools yourself. You plan and delegate; independent leaf workers do all real work.
+
+Output EXACTLY ONE JSON object per reply:
+1. To do work, dispatch one or more self-contained tasks:
+{"thought":"short plan","action":"dispatch","args":{"tasks":[{"title":"short title","description":"exact, self-contained instructions including file paths, the detected stack, and expected result"}]}}
+You will then receive each leaf's short result; dispatch more if needed, or answer.
+2. To talk to the user — answering, asking a clarifying question, or summarizing:
+{"thought":"...","action":"respond","args":{"message":"your message"}}
+
+Rules:
+- Leaf workers have a FRESH context: they do not see this conversation. Every task description must be self-contained — resolve references like "that file" into concrete paths and requirements, using the workspace and the earlier work log.
+- Prefer one focused task per leaf; do not bundle unrelated changes.
+- Use respond to ask when genuinely ambiguous; never claim work that a leaf did not report as done.
+- The earlier work log is compressed summaries only; trust the leaf results over assumptions.`,
+		r.o.sandbox.Root, tools.DetectProject(r.o.sandbox.Root))
 }
 
 // StdioREPL connects REPLIO to a terminal.
@@ -269,37 +341,20 @@ func (s *StdioREPL) Printf(format string, a ...any) {
 	fmt.Fprintf(s.out, format, a...)
 }
 
-func replSystemPrompt() string {
-	return `You are an interactive coding agent operating directly inside the user's workspace. ` +
-		`Do real work with the tools below; never claim changes you did not make.
+const replHelp = `Architecture: a foreman (this conversation) dispatches independent leaf
+workers; each leaf runs in its own fresh context and only its summary
+comes back. Earlier turns are kept as compressed summaries, not raw chat.
 
-To act, output EXACTLY ONE JSON object and nothing else:
-{"thought":"short reasoning","action":"<tool>","args":{ ... }}
-
-Tools:
-` + tools.Descriptions() + `
-
-To talk to the user — answering, asking a clarifying question, or summarizing finished work — output:
-{"thought":"...","action":"respond","args":{"message":"your message"}}
-
-Rules:
-- Only one JSON object per response.
-- Use the tools to inspect and change the workspace, then call respond when done.
-- Keep replies concise and concrete (what changed, how to verify).
-- If a request is ambiguous or you lack information, call respond and ask rather than guessing.
-- Do not use "finish"; in this mode you end a turn with "respond".`
-}
-
-const replHelp = `Commands:
+Commands:
   /help    show this help
-  /clear   reset the conversation (keeps your files)
-  /status  model, workspace, message count and token usage
+  /clear   reset the earlier-turn work log (keeps your files)
+  /status  model, workspace, leaf runs, token usage, work log
   /exit    quit (also /quit, or Ctrl-D)
 
-Anything else is sent to the agent, which works in this workspace with:
-  list_dir, read_file, write_file, replace_lines, run_bash, search_files
-The agent calls tools to do the work and then replies; ask it to clarify,
-iterate, or add more on the next line — the conversation is retained.
+Anything else is sent to the foreman, which dispatches leaves that work in
+this workspace with: list_dir, read_file, write_file, replace_lines,
+run_bash, search_files. Describe concrete, self-contained requests; ask
+follow-ups on the next line and the foreman will use the work log.
 Note: a command's background processes are stopped when the command returns,
 so run long-lived servers in a separate terminal.
 `
