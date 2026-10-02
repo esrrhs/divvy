@@ -8,10 +8,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/esrrhs/go_llm_engine/pkg/engine"
-	"github.com/esrrhs/go_llm_engine/pkg/llm"
-	"github.com/esrrhs/go_llm_engine/pkg/models"
-	"github.com/esrrhs/go_llm_engine/pkg/tools"
+	"github.com/esrrhs/divvy/pkg/engine"
+	"github.com/esrrhs/divvy/pkg/llm"
+	"github.com/esrrhs/divvy/pkg/models"
+	"github.com/esrrhs/divvy/pkg/tools"
 )
 
 // REPLIO is the REPL's input/output boundary. Abstracting it keeps the REPL
@@ -62,7 +62,7 @@ func (r *REPL) Run(ctx context.Context, term REPLIO) (runErr error) {
 	defer func() { r.o.recordSessionEnd("interactive", runStart, runErr) }()
 	defer r.o.Close()
 
-	term.Printf("go_llm_engine interactive — model %s, workspace %s\n", r.o.cfg.Model, r.o.sandbox.Root)
+	term.Printf("divvy interactive — model %s, workspace %s\n", r.o.cfg.Model, r.o.sandbox.Root)
 	term.Printf("foreman + independent leaf workers; type /help for commands\n")
 
 	if strings.TrimSpace(r.o.cfg.Goal) != "" {

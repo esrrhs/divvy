@@ -1,4 +1,4 @@
-# 用本地 Ollama 调试 go_llm_engine
+# 用本地 Ollama 调试 divvy
 
 本文记录在本机用 Ollama + Gemma 调试引擎的完整配置，以及本地弱模型特有的调参项。
 
@@ -21,20 +21,20 @@ curl -s http://127.0.0.1:11434/v1/chat/completions \
 ## 运行引擎
 
 ```bash
-go build -o go_llm_engine ./cmd/engine
+go build -o divvy ./cmd/divvy
 
 export OPENAI_BASE_URL=http://127.0.0.1:11434/v1
 export OPENAI_MODEL=gemma4:12b
 # 本机地址无需 API key
 
-./go_llm_engine -workdir ./ws "创建文件 hello.txt，内容为：hello"
+./divvy -workdir ./ws "创建文件 hello.txt，内容为：hello"
 ```
 
 全链路（隔离执行 + 每叶子一个 git 提交）：
 
 ```bash
 mkdir -p ws && cd ws && git init -q && git config user.email you@x.com && git config user.name You && go mod init demo && cd ..
-./go_llm_engine -workdir ./ws -git-commit -max-steps 12 -timeout 10m \
+./divvy -workdir ./ws -git-commit -max-steps 12 -timeout 10m \
   "为现有模块 demo 添加 Add(a, b int) int，写在 add.go，并在 add_test.go 带单元测试"
 git -C ws log --oneline   # 查看每叶子的审计提交
 ```
@@ -65,5 +65,5 @@ brew services restart ollama && ollama pull gemma4:12b   # 断点续传
 
 - `-v` 打印模型原文与工具输出，配合 `-no-stream` 更容易看完整响应。
 - `-plan -strict` 先检查拆解质量再执行；弱模型拆解产出的告警大多值得认真对待。
-- 会话保存在工作区的 `.go_llm_engine/`，`-status` 看任务树，`-resume` 续跑（含 Ctrl+C 中断后）。
+- 会话保存在工作区的 `.divvy/`，`-status` 看任务树，`-resume` 续跑（含 Ctrl+C 中断后）。
 - `git -C ws log` 配合 `-git-commit` 可精确定位每个叶子改了什么。

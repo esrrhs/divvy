@@ -1,4 +1,4 @@
-module github.com/esrrhs/go_llm_engine
+module github.com/esrrhs/divvy
 
 go 1.27.1
 

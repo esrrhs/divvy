@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/esrrhs/go_llm_engine/pkg/models"
+	"github.com/esrrhs/divvy/pkg/models"
 )
 
 // verifyRootAcceptance runs the root node's goal-level DoD against the real

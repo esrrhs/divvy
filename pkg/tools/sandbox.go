@@ -22,15 +22,15 @@ const (
 )
 
 var skipDirNames = map[string]bool{
-	".git":           true,
-	".go_llm_engine": true,
-	"node_modules":   true,
-	"vendor":         true,
-	"__pycache__":    true,
-	".idea":          true,
-	".vscode":        true,
-	"dist":           true,
-	"coverage":       true,
+	".git":         true,
+	".divvy":       true,
+	"node_modules": true,
+	"vendor":       true,
+	"__pycache__":  true,
+	".idea":        true,
+	".vscode":      true,
+	"dist":         true,
+	"coverage":     true,
 }
 
 // Sandbox confines file and command operations to a workspace directory.

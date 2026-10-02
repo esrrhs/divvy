@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/esrrhs/go_llm_engine/pkg/cost"
-	"github.com/esrrhs/go_llm_engine/pkg/models"
+	"github.com/esrrhs/divvy/pkg/cost"
+	"github.com/esrrhs/divvy/pkg/models"
 )
 
 // TaskTree coordinates the hierarchical structure of task nodes.

@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/esrrhs/go_llm_engine/pkg/tools"
+	"github.com/esrrhs/divvy/pkg/tools"
 )
 
 // planWarnings reviews the planned tree for weak contracts and DoD so that

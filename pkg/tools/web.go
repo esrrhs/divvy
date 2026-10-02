@@ -140,7 +140,7 @@ func (w *WebClient) request(ctx context.Context, method, rawURL string, headers 
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	req.Header.Set("User-Agent", "go_llm_engine/1.0 (+web)")
+	req.Header.Set("User-Agent", "divvy/1.0 (+web)")
 	resp, err := w.client.Do(req)
 	if err != nil {
 		return "", err
@@ -182,7 +182,7 @@ func (w *WebClient) get(ctx context.Context, endpoint string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "go_llm_engine/1.0 (+web search)")
+	req.Header.Set("User-Agent", "divvy/1.0 (+web search)")
 	resp, err := w.client.Do(req)
 	if err != nil {
 		return nil, err

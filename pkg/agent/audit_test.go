@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/esrrhs/go_llm_engine/pkg/llm"
+	"github.com/esrrhs/divvy/pkg/llm"
 )
 
 func initGitRepo(t *testing.T, dir string) {

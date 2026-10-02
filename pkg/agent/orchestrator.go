@@ -10,11 +10,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/esrrhs/go_llm_engine/pkg/cost"
-	"github.com/esrrhs/go_llm_engine/pkg/engine"
-	"github.com/esrrhs/go_llm_engine/pkg/llm"
-	"github.com/esrrhs/go_llm_engine/pkg/models"
-	"github.com/esrrhs/go_llm_engine/pkg/tools"
+	"github.com/esrrhs/divvy/pkg/cost"
+	"github.com/esrrhs/divvy/pkg/engine"
+	"github.com/esrrhs/divvy/pkg/llm"
+	"github.com/esrrhs/divvy/pkg/models"
+	"github.com/esrrhs/divvy/pkg/tools"
 )
 
 // Orchestrator is the top-level decompose → execute → verify loop.
@@ -244,7 +244,7 @@ func (o *Orchestrator) Run(ctx context.Context) (runErr error) {
 	defer func() { o.recordSessionEnd("run", runStart, runErr) }()
 
 	ctx = o.startBudget(ctx)
-	o.log.Banner("go_llm_engine")
+	o.log.Banner("divvy")
 	o.log.Infof("session %s", o.tree.ID)
 	o.log.Infof("model   %s", o.cfg.Model)
 	o.log.Infof("workdir %s", o.sandbox.Root)
@@ -419,7 +419,7 @@ func (o *Orchestrator) RunPlan(ctx context.Context) (runErr error) {
 	defer func() { o.recordSessionEnd("plan", runStart, runErr) }()
 
 	ctx = o.startBudget(ctx)
-	o.log.Banner("go_llm_engine (plan)")
+	o.log.Banner("divvy (plan)")
 	o.log.Infof("session %s", o.tree.ID)
 	o.log.Infof("model   %s", o.cfg.Model)
 	o.log.Infof("workdir %s", o.sandbox.Root)

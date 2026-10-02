@@ -4,7 +4,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/esrrhs/go_llm_engine/pkg/models"
+	"github.com/esrrhs/divvy/pkg/models"
 )
 
 func TestStorage_ListSessions(t *testing.T) {

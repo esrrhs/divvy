@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/esrrhs/go_llm_engine/pkg/models"
+	"github.com/esrrhs/divvy/pkg/models"
 )
 
 // StateChangeHook is invoked after a node's state actually changes.

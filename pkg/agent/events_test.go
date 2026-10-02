@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/esrrhs/go_llm_engine/pkg/engine"
-	"github.com/esrrhs/go_llm_engine/pkg/llm"
+	"github.com/esrrhs/divvy/pkg/engine"
+	"github.com/esrrhs/divvy/pkg/llm"
 )
 
 type traceEvent map[string]any

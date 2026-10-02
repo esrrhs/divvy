@@ -6,8 +6,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/esrrhs/go_llm_engine/pkg/cost"
-	"github.com/esrrhs/go_llm_engine/pkg/models"
+	"github.com/esrrhs/divvy/pkg/cost"
+	"github.com/esrrhs/divvy/pkg/models"
 )
 
 // loadPricing builds the effective price table: built-in prices overlaid with

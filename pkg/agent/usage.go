@@ -4,7 +4,7 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/esrrhs/go_llm_engine/pkg/llm"
+	"github.com/esrrhs/divvy/pkg/llm"
 )
 
 // UsageTracker accumulates LLM token usage per call kind ("decompose", "worker", ...).

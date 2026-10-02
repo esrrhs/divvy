@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/esrrhs/go_llm_engine/pkg/models"
+	"github.com/esrrhs/divvy/pkg/models"
 )
 
 // GuidedIO is the input/output boundary for the human-in-the-loop flow.
@@ -85,7 +85,7 @@ func (g *Guider) Run(ctx context.Context) (runErr error) {
 	// without this they silently did nothing in guided runs.
 	ctx = g.o.startBudget(ctx)
 
-	g.o.log.Banner("go_llm_engine (guided)")
+	g.o.log.Banner("divvy (guided)")
 	g.io.Printf("session %s\nmodel   %s\nworkdir %s\ngoal    %s\n",
 		g.o.tree.ID, g.o.cfg.Model, g.o.sandbox.Root, g.o.cfg.Goal)
 

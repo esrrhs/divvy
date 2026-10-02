@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/esrrhs/go_llm_engine/pkg/llm"
-	"github.com/esrrhs/go_llm_engine/pkg/models"
+	"github.com/esrrhs/divvy/pkg/llm"
+	"github.com/esrrhs/divvy/pkg/models"
 )
 
 const failingAlphaPlan = `{

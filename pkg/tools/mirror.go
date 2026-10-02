@@ -24,7 +24,7 @@ type Mirror struct {
 // records which files existed at snapshot time. Skips the usual ignored
 // directories (.git, node_modules, ...) and non-regular files (symlinks).
 func NewMirror(src string) (*Mirror, error) {
-	dir, err := os.MkdirTemp("", "go_llm_engine_mirror-")
+	dir, err := os.MkdirTemp("", "divvy_mirror-")
 	if err != nil {
 		return nil, fmt.Errorf("create mirror dir: %w", err)
 	}
@@ -179,7 +179,7 @@ func HasGoMod(root string) bool {
 
 // TrimPath renders a path for prompts, abbreviating temp mirrors.
 func TrimPath(p string) string {
-	if i := strings.Index(p, "go_llm_engine_mirror-"); i > 0 {
+	if i := strings.Index(p, "divvy_mirror-"); i > 0 {
 		return p[:i] + "(isolated workspace)"
 	}
 	return p

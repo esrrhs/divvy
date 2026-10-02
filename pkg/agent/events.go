@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/esrrhs/go_llm_engine/pkg/llm"
+	"github.com/esrrhs/divvy/pkg/llm"
 )
 
 // EventRecorder persists one JSON object per line (JSONL) into the session's

@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/esrrhs/go_llm_engine/pkg/models"
-	"github.com/esrrhs/go_llm_engine/pkg/tools"
+	"github.com/esrrhs/divvy/pkg/models"
+	"github.com/esrrhs/divvy/pkg/tools"
 )
 
 func TestVerifyExpectedOutputAcrossCommands(t *testing.T) {

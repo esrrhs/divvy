@@ -5,7 +5,7 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/esrrhs/go_llm_engine/pkg/tools"
+	"github.com/esrrhs/divvy/pkg/tools"
 )
 
 func sanitizeID(title string) string {

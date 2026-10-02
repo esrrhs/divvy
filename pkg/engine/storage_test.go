@@ -5,11 +5,11 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/esrrhs/go_llm_engine/pkg/models"
+	"github.com/esrrhs/divvy/pkg/models"
 )
 
 func TestStorage_SaveAndLoad(t *testing.T) {
-	tempDir, err := os.MkdirTemp("", "go_llm_engine_test_*")
+	tempDir, err := os.MkdirTemp("", "divvy_test_*")
 	if err != nil {
 		t.Fatalf("failed to create temp dir: %v", err)
 	}

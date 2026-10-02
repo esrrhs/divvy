@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/esrrhs/go_llm_engine/pkg/llm"
+	"github.com/esrrhs/divvy/pkg/llm"
 )
 
 // scriptedClient returns queued content responses; it records the last

@@ -12,9 +12,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/esrrhs/go_llm_engine/pkg/agent"
-	"github.com/esrrhs/go_llm_engine/pkg/engine"
-	"github.com/esrrhs/go_llm_engine/pkg/llm"
+	"github.com/esrrhs/divvy/pkg/agent"
+	"github.com/esrrhs/divvy/pkg/engine"
+	"github.com/esrrhs/divvy/pkg/llm"
 )
 
 func main() {
@@ -27,7 +27,7 @@ func main() {
 func run(args []string) error {
 	cfg := agent.DefaultConfig()
 
-	fs := flag.NewFlagSet("go_llm_engine", flag.ContinueOnError)
+	fs := flag.NewFlagSet("divvy", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, usageText)
@@ -105,7 +105,7 @@ func run(args []string) error {
 
 	// Interactive sessions don't persist a task tree; unless the user set
 	// -datadir explicitly, keep its storage in a temp dir instead of
-	// creating .go_llm_engine inside the live workspace.
+	// creating .divvy inside the live workspace.
 	if *interactive {
 		explicitData := false
 		fs.Visit(func(f *flag.Flag) {
@@ -114,7 +114,7 @@ func run(args []string) error {
 			}
 		})
 		if !explicitData {
-			d, merr := os.MkdirTemp("", "go_llm_engine_repl_")
+			d, merr := os.MkdirTemp("", "divvy_repl_")
 			if merr != nil {
 				return merr
 			}
@@ -188,12 +188,12 @@ func run(args []string) error {
 
 		gErr := agent.NewGuider(o, agent.NewStdioGuided(os.Stdin, os.Stdout)).Run(ctx)
 		if gErr == agent.ErrPaused {
-			log.Infof("paused. resume the guided flow with:\n  go_llm_engine -guided -resume -session %s -workdir %s",
+			log.Infof("paused. resume the guided flow with:\n  divvy -guided -resume -session %s -workdir %s",
 				o.SessionID(), cfg.WorkDir)
 			return nil
 		}
 		if gErr == context.Canceled || gErr == context.DeadlineExceeded {
-			log.Warnf("interrupted. resume the guided flow with:\n  go_llm_engine -guided -resume -session %s -workdir %s",
+			log.Warnf("interrupted. resume the guided flow with:\n  divvy -guided -resume -session %s -workdir %s",
 				o.SessionID(), cfg.WorkDir)
 			return nil
 		}
@@ -278,7 +278,7 @@ func run(args []string) error {
 		err = o.Run(ctx)
 	}
 	if err == context.Canceled || err == context.DeadlineExceeded {
-		log.Warnf("interrupted after %s. resume with:\n  go_llm_engine -resume -session %s -workdir %s",
+		log.Warnf("interrupted after %s. resume with:\n  divvy -resume -session %s -workdir %s",
 			time.Since(start).Truncate(time.Second), o.SessionID(), cfg.WorkDir)
 		return err
 	}
@@ -324,38 +324,38 @@ func printSessionArtifact(cfg agent.Config, events bool) error {
 	return err
 }
 
-const usageText = `go_llm_engine — divide-and-conquer coding agent for small/cheap models
+const usageText = `divvy — divide-and-conquer coding agent for small/cheap models
 
 Usage:
-  go_llm_engine [flags] <goal>
-  go_llm_engine -plan [flags] <goal>
-  go_llm_engine -interactive [flags] [first message]
-  go_llm_engine -guided [flags] <goal>
-  go_llm_engine -resume [-session ID]
-  go_llm_engine -status [-session ID]
-  go_llm_engine -log [-session ID]     # 查看运行日志（时间戳文本）
-  go_llm_engine -events [-session ID]  # 查看结构化事件流（JSONL，便于 jq/grep）
+  divvy [flags] <goal>
+  divvy -plan [flags] <goal>
+  divvy -interactive [flags] [first message]
+  divvy -guided [flags] <goal>
+  divvy -resume [-session ID]
+  divvy -status [-session ID]
+  divvy -log [-session ID]     # 查看运行日志（时间戳文本）
+  divvy -events [-session ID]  # 查看结构化事件流（JSONL，便于 jq/grep）
 
 Examples:
   export OPENAI_API_KEY=sk-...
   export OPENAI_BASE_URL=http://127.0.0.1:11434/v1
   export OPENAI_MODEL=qwen2.5-coder:14b
 
-  go_llm_engine -workdir ./ws "用 Go 写一个 /health 返回 ok 的 HTTP 服务，并带单测"
+  divvy -workdir ./ws "用 Go 写一个 /health 返回 ok 的 HTTP 服务，并带单测"
 
-  go_llm_engine -plan -workdir ./ws "目标"   # 只拆解，检查任务树
-  go_llm_engine -plan -strict -workdir ./ws "目标"   # 拆解 + 严格检查（CI 友好）
-  go_llm_engine -interactive -workdir .      # 交互式多轮开发（/help、/exit）
-  go_llm_engine -resume -workdir ./ws        # 再执行
+  divvy -plan -workdir ./ws "目标"   # 只拆解，检查任务树
+  divvy -plan -strict -workdir ./ws "目标"   # 拆解 + 严格检查（CI 友好）
+  divvy -interactive -workdir .      # 交互式多轮开发（/help、/exit）
+  divvy -resume -workdir ./ws        # 再执行
 
-  go_llm_engine -max-cost 1 -budget-tokens 200000 -workdir ./ws "目标"
-  go_llm_engine -parallel 4 -workdir ./ws "拆成多个独立模块的目标"
-  go_llm_engine -git-commit -workdir ./ws "每个叶子一个提交，便于审计回滚"
-  go_llm_engine -isolate -workdir ./ws "叶子失败不污染工作区"
-  go_llm_engine -resume
-  go_llm_engine -status
-  go_llm_engine -log                      # 出问题时回溯最近一次运行
-  go_llm_engine -events | jq 'select(.kind=="verify" and .ok==false)'
+  divvy -max-cost 1 -budget-tokens 200000 -workdir ./ws "目标"
+  divvy -parallel 4 -workdir ./ws "拆成多个独立模块的目标"
+  divvy -git-commit -workdir ./ws "每个叶子一个提交，便于审计回滚"
+  divvy -isolate -workdir ./ws "叶子失败不污染工作区"
+  divvy -resume
+  divvy -status
+  divvy -log                      # 出问题时回溯最近一次运行
+  divvy -events | jq 'select(.kind=="verify" and .ok==false)'
 
 Environment:
   OPENAI_API_KEY / LLM_API_KEY

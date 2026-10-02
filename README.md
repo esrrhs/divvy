@@ -1,4 +1,4 @@
-# go_llm_engine
+# divvy
 
 面向弱模型（小参数、低算力、廉价模型）的自动化编程 Agent。  
 核心策略：**愚公移山，分而治之** —— 把大目标拆成带契约和验收命令的任务树，每个叶子在隔离上下文里执行，靠编译/测试而不是长会话记忆交付结果。
@@ -8,9 +8,9 @@
 ## 快速开始
 
 ```bash
-go install github.com/esrrhs/go_llm_engine/cmd/engine@latest
+go install github.com/esrrhs/divvy/cmd/divvy@latest
 # 或在仓库内：
-go build -o go_llm_engine ./cmd/engine
+go build -o divvy ./cmd/divvy
 ```
 
 任意 **OpenAI 兼容** 接口都可以，包括 OpenAI、vLLM、Ollama、本地网关。本地 Ollama 实战配置见 [docs/qwen3.8-local.md](docs/qwen3.8-local.md)、[docs/debug-local-ollama.md](docs/debug-local-ollama.md)：
@@ -20,14 +20,14 @@ export OPENAI_API_KEY=sk-...
 export OPENAI_BASE_URL=http://127.0.0.1:11434/v1   # 本地模型带 /v1
 export OPENAI_MODEL=qwen2.5-coder:14b
 
-./go_llm_engine -workdir ./ws "用 Go 写一个 /health 返回 ok 的 HTTP 服务，并带单测"
+./divvy -workdir ./ws "用 Go 写一个 /health 返回 ok 的 HTTP 服务，并带单测"
 ```
 
 先只拆解不执行，人工检查任务树后再跑：
 
 ```bash
-./go_llm_engine -plan -workdir ./ws "目标"   # 生成任务树后退出
-./go_llm_engine -resume -workdir ./ws        # 执行已规划的任务
+./divvy -plan -workdir ./ws "目标"   # 生成任务树后退出
+./divvy -resume -workdir ./ws        # 执行已规划的任务
 ```
 
 常用参数：
@@ -35,7 +35,7 @@ export OPENAI_MODEL=qwen2.5-coder:14b
 | 参数 | 含义 |
 |---|---|
 | `-workdir` | 代码落地目录（工具只能读写这里） |
-| `-resume` | 从上次会话继续（默认读 `.go_llm_engine/LATEST`） |
+| `-resume` | 从上次会话继续（默认读 `.divvy/LATEST`） |
 | `-session` | 指定会话 ID |
 | `-status` | 只打印任务树，不执行 |
 | `-plan` | 只拆解出任务树并保存，不执行（配合 `-resume` 使用） |
@@ -56,7 +56,7 @@ export OPENAI_MODEL=qwen2.5-coder:14b
 中断（Ctrl+C）会保存任务树，之后：
 
 ```bash
-./go_llm_engine -resume -workdir ./ws
+./divvy -resume -workdir ./ws
 ```
 
 ---
@@ -117,7 +117,7 @@ export OPENAI_MODEL=qwen2.5-coder:14b
 - `web_fetch`：`{"url":"https://..."}` → 抓取单个页面，**HTML 自动转成纯文本**（剥离 script/style），文本/JSON/XML 原样返回。
 
 ```bash
-./go_llm_engine -web -workdir ./ws "查一下 X 的最新 API，写一个调用示例"
+./divvy -web -workdir ./ws "查一下 X 的最新 API，写一个调用示例"
 ```
 
 搜索后端可通过 `-search-url` 配置（模板必须含 `{query}`）：
@@ -171,8 +171,8 @@ export OPENAI_MODEL=qwen2.5-coder:14b
 - 斜杠命令：`/help`、`/clear`（清空工作日志、不动文件）、`/status`（调用次数、foreman/叶子分类 token、**总会话 token 与估算美元成本**、日志条数；无价模型会提示用 `-pricing` 配置）、`/exit`（或 Ctrl-D）。
 
 ```bash
-go build -o go_llm_engine ./cmd/engine
-./go_llm_engine -interactive \
+go build -o divvy ./cmd/divvy
+./divvy -interactive \
   -base-url http://127.0.0.1:11434/v1 -model qwen3.8:27b -workdir .
 ```
 
@@ -199,7 +199,7 @@ go build -o go_llm_engine ./cmd/engine
 - `/plan`：随时重新打印当前任务树，查看还剩什么，不影响执行。
 
 ```bash
-./go_llm_engine -guided -isolate -git-commit \
+./divvy -guided -isolate -git-commit \
   -base-url http://127.0.0.1:11434/v1 -model qwen3.8:27b -workdir ./ws "你的目标"
 ```
 
@@ -240,7 +240,7 @@ go build -o go_llm_engine ./cmd/engine
 | `pkg/cost` | 模型价目表、token→美元成本估算 |
 | `pkg/tools` | 工作区沙箱工具 |
 | `pkg/agent` | Decomposer、Worker、Verifier、Orchestrator、预算护栏 |
-| `cmd/engine` | CLI |
+| `cmd/divvy` | CLI |
 
 状态：`PENDING` → `DECOMPOSING` / `RUNNING` → `VERIFYING` → `COMPLETED` / `FAILED`。
 

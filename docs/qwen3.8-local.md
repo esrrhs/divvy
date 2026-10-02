@@ -1,4 +1,4 @@
-# 本机 Ollama 运行 Qwen3.8-27B 并接入 go_llm_engine
+# 本机 Ollama 运行 Qwen3.8-27B 并接入 divvy
 
 本文记录在 macOS 上用 Ollama 运行 `qwen3.8:27b` 的准确标识、拉取踩坑，以及引擎侧的适配参数（思考控制、原生工具、验收语义）。
 
@@ -40,10 +40,10 @@ until ollama pull qwen3.8:27b; do echo "resuming..."; sleep 3; done
 ## 跑通引擎
 
 ```bash
-go build -o go_llm_engine ./cmd/engine
+go build -o divvy ./cmd/divvy
 mkdir -p ws && cd ws && git init -q && git config user.email you@x.com && git config user.name You && go mod init demo && cd ..
 
-./go_llm_engine \
+./divvy \
   -base-url http://127.0.0.1:11434/v1 \
   -model qwen3.8:27b \
   -workdir ./ws -git-commit -isolate \

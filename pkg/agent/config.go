@@ -65,7 +65,7 @@ type Config struct {
 func DefaultConfig() Config {
 	return Config{
 		WorkDir:          ".",
-		DataDir:          ".go_llm_engine",
+		DataDir:          ".divvy",
 		BaseURL:          firstEnv("OPENAI_BASE_URL", "LLM_BASE_URL", "https://api.openai.com/v1"),
 		APIKey:           firstEnv("OPENAI_API_KEY", "LLM_API_KEY", ""),
 		Model:            firstEnv("OPENAI_MODEL", "LLM_MODEL", "gpt-4o-mini"),

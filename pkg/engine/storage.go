@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/esrrhs/go_llm_engine/pkg/models"
+	"github.com/esrrhs/divvy/pkg/models"
 )
 
 // Storage handles persisting and reloading TaskTree states.
@@ -19,7 +19,7 @@ type Storage struct {
 // NewStorage initializes a storage instance with a target base directory.
 func NewStorage(baseDir string) (*Storage, error) {
 	if baseDir == "" {
-		baseDir = ".go_llm_engine"
+		baseDir = ".divvy"
 	}
 	if err := os.MkdirAll(baseDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create storage directory %s: %w", baseDir, err)

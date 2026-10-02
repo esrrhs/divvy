@@ -2,11 +2,10 @@
 bin/
 *.exe
 *.test
-/engine
-/go_llm_engine
+/divvy
 
 # Local session storage
-.go_llm_engine/
+.divvy/
 
 # Local workspaces
 ws/
