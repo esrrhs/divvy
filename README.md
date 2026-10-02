@@ -1,5 +1,7 @@
 # divvy
 
+*An automated coding agent for small, cheap LLMs: split big goals into contract-driven task trees, execute each leaf in an isolated context, and verify with real builds and tests.*
+
 面向弱模型（小参数、低算力、廉价模型）的自动化编程 Agent。  
 核心策略：**愚公移山，分而治之** —— 把大目标拆成带契约和验收命令的任务树，每个叶子在隔离上下文里执行，靠编译/测试而不是长会话记忆交付结果。
 
