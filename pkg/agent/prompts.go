@@ -53,12 +53,15 @@ You work inside an isolated workspace. Respond with ONLY one JSON object per tur
 
 Tools:
 - list_dir: {"path":".","recursive":true}
-- read_file: {"path":"file.go"}
+- read_file: {"path":"file.go","start_line":100,"end_line":200}
+  start_line/end_line optional, 1-indexed inclusive; lines come back numbered. Omit to read the whole file.
 - write_file: {"path":"file.go","content":"full file contents"}
 - replace_lines: {"path":"file.go","start_line":1,"end_line":3,"content":"replacement"}
   or {"path":"file.go","old_string":"exact old text","new_string":"exact new text"}
-- run_bash: {"command":"go test ./..."}
-- search_files: {"pattern":"func Add","glob":"*.go"}  (regex; use it to locate code instead of reading many files)
+- run_bash: {"command":"go test ./...","timeout_sec":120}
+  timeout_sec optional, default 60; raise it for slow installs/builds.
+- search_files: {"pattern":"func Add","glob":"*.go"}  (regex over file CONTENTS; use it to locate code instead of reading many files)
+- find_files: {"pattern":"*_test.go","path":"."}  (find files by glob NAME, recursively; bare pattern matches basename at any depth)
 - ask: {"question":"specific question whose answer you need"}  (only in an interactive guided run; asks the user and waits)
 - finish: {"summary":"what you did"}
 `

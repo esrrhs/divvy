@@ -106,3 +106,77 @@ func TestSearchFilesCall(t *testing.T) {
 		t.Fatal("expected missing-pattern error")
 	}
 }
+
+func TestFindFiles(t *testing.T) {
+	dir := t.TempDir()
+	sb, err := NewSandbox(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{
+		"pkg/add.go", "pkg/add_test.go", "pkg/sub/helper_test.go",
+		"cmd/main.go", "notes.txt", "node_modules/dep/index.js",
+	} {
+		if err := sb.WriteFile(p, "x"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Bare basename glob matches at every directory depth.
+	out, err := sb.FindFiles("*_test.go", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "pkg/add_test.go") || !strings.Contains(out, "pkg/sub/helper_test.go") {
+		t.Fatalf("basename glob failed:\n%s", out)
+	}
+	if strings.Contains(out, "pkg/add.go") {
+		t.Fatalf("non-test file leaked:\n%s", out)
+	}
+
+	// Basename *.go finds all Go files but never junk directories.
+	out, _ = sb.FindFiles("*.go", "")
+	if !strings.Contains(out, "cmd/main.go") || strings.Contains(out, "node_modules") {
+		t.Fatalf("*.go matching wrong:\n%s", out)
+	}
+
+	// Slash-bearing glob matches the relative path only at that depth.
+	out, _ = sb.FindFiles("pkg/*.go", "")
+	if !strings.Contains(out, "pkg/add.go") || strings.Contains(out, "pkg/sub/helper_test.go") {
+		t.Fatalf("path glob failed:\n%s", out)
+	}
+
+	// Search rooted in a subdirectory reports workspace-relative paths.
+	out, _ = sb.FindFiles("*.go", "pkg/sub")
+	if !strings.Contains(out, "pkg/sub/helper_test.go") || strings.Contains(out, "add.go\n") {
+		t.Fatalf("rooted find failed:\n%s", out)
+	}
+
+	// No match, empty pattern, invalid glob.
+	if out, _ := sb.FindFiles("*.zzz", ""); !strings.Contains(out, "no files matching") {
+		t.Fatalf("expected no-match message:\n%s", out)
+	}
+	if _, err := sb.FindFiles("  ", ""); err == nil {
+		t.Fatal("expected empty-pattern error")
+	}
+	if _, err := sb.FindFiles("[bad", ""); err == nil {
+		t.Fatal("expected invalid-glob error")
+	}
+}
+
+func TestFindFilesCall(t *testing.T) {
+	sb, _ := NewSandbox(t.TempDir())
+	if err := sb.WriteFile("a_test.go", "x"); err != nil {
+		t.Fatal(err)
+	}
+	out, err := sb.Call(context.Background(), ToolFindFiles, map[string]any{"pattern": "*_test.go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "a_test.go") {
+		t.Fatalf("call result:\n%s", out)
+	}
+	if _, err := sb.Call(context.Background(), ToolFindFiles, map[string]any{}); err == nil {
+		t.Fatal("expected missing-pattern error")
+	}
+}

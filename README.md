@@ -66,15 +66,16 @@ export OPENAI_MODEL=qwen2.5-coder:14b
 ```
 根目标
   └─ Decomposer 输出 JSON（原子？或 2~6 个子任务 + 契约 + 验收命令）
-        └─ 叶子 Worker：干净上下文 + 6 个工具
-              list_dir / read_file / write_file / replace_lines / run_bash / search_files
+        └─ 叶子 Worker：干净上下文 + 7 个工具
+              list_dir / read_file / write_file / replace_lines / run_bash / search_files / find_files
               └─ Verifier 跑 DoD 命令（如 go test ./...）
                     ├─ 通过 → 向上冒泡 COMPLETED
                     └─ 失败 → 新的隔离上下文重试（带上错误，指数退避，上限 30s，默认无限次）
 ```
 
 叶子执行**不携带**其它叶子的对话历史，只注入：当前任务、契约、父节点/依赖摘要、少量相关文件、验收命令。
-`search_files` 用正则搜索文件内容并返回紧凑的 `相对路径:行号:匹配行`：修改现有代码时，弱模型用它一次定位符号，不必逐个读整个文件，省步骤也省上下文（自动跳过 `.git` 等目录，可用 `glob` 过滤，默认忽略大小写）。
+`search_files` 用正则搜索文件内容并返回紧凑的 `相对路径:行号:匹配行`：修改现有代码时，弱模型用它一次定位符号，不必逐个读整个文件，省步骤也省上下文（自动跳过 `.git` 等目录，可用 `glob` 过滤，默认忽略大小写）。`find_files` 则按文件名 glob 查找（`*_test.go` 裸模式按 basename 递归匹配任意深度，`pkg/*.go` 按相对路径匹配），返回路径列表。
+`read_file` 支持可选的 `start_line`/`end_line`（1-indexed、含端点，返回带行号的片段）：配合 `search_files` 的行号只读目标区段，大文件也能直接跳到 64KB 整读截断点之后，无需在 shell 里拼 `sed`。`run_bash` 支持 `timeout_sec`（默认 60s），跑 `npm install`、`cargo build` 这类慢命令时显式放大超时。
 没有依赖关系的就绪叶子可以并发执行（`-parallel N`，默认 `1`）；每次 LLM 调用的 token 用量按节点记入任务树并随会话持久化，运行结束打印本次与会话累计（resume 后自动累加），树状进度与 `-status` 里也会显示每个节点的消耗。
 
 开启隔离（`-isolate`，`-parallel >1` 时自动生效）后，叶子在主工作区的**临时镜像副本**里写代码、跑验收命令：

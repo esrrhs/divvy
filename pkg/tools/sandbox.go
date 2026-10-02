@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -138,6 +139,59 @@ func (s *Sandbox) ReadFile(path string) (string, error) {
 	out := string(data)
 	if truncated {
 		out += fmt.Sprintf("\n\n[truncated to %d bytes]", max)
+	}
+	return out, nil
+}
+
+// ReadFileLines reads an inclusive 1-indexed line range of a text file.
+// Each returned line is prefixed with its line number ("123: ...") so the
+// model can feed exact line numbers back into replace_lines. A zero end
+// reads from start to EOF. Output is capped at MaxRead bytes.
+func (s *Sandbox) ReadFileLines(path string, start, end int) (string, error) {
+	if start < 1 {
+		return "", fmt.Errorf("start_line must be >= 1")
+	}
+	if end != 0 && end < start {
+		return "", fmt.Errorf("end_line %d is before start_line %d", end, start)
+	}
+	abs, err := s.Resolve(path)
+	if err != nil {
+		return "", err
+	}
+	data, err := os.ReadFile(abs)
+	if err != nil {
+		return "", err
+	}
+	if !utf8.Valid(data) {
+		return "", fmt.Errorf("%s is not valid UTF-8 text", path)
+	}
+	lines := strings.Split(string(data), "\n")
+	if start > len(lines) {
+		return "", fmt.Errorf("start_line %d beyond file (%d lines)", start, len(lines))
+	}
+	if end == 0 || end > len(lines) {
+		end = len(lines)
+	}
+	max := s.MaxRead
+	if max <= 0 {
+		max = defaultMaxReadBytes
+	}
+	width := len(strconv.Itoa(end))
+	var b strings.Builder
+	written := 0
+	truncated := false
+	for no := start; no <= end; no++ {
+		entry := fmt.Sprintf("%*d: %s\n", width, no, lines[no-1])
+		written += len(entry)
+		if written > max {
+			truncated = true
+			break
+		}
+		b.WriteString(entry)
+	}
+	out := b.String()
+	if truncated {
+		out += fmt.Sprintf("[truncated to %d bytes; narrow the line range]\n", max)
 	}
 	return out, nil
 }

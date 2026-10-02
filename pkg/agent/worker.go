@@ -205,6 +205,10 @@ func previewArgs(act taggedAction) string {
 		p, _ := stringFromArgs(act.Args, "pattern")
 		gl, _ := stringFromArgs(act.Args, "glob")
 		return truncate(p+" ["+gl+"]", 80)
+	case tools.ToolFindFiles:
+		p, _ := stringFromArgs(act.Args, "pattern")
+		dir, _ := stringFromArgs(act.Args, "path")
+		return truncate(p+" ["+dir+"]", 80)
 	case tools.ToolFinish:
 		s, _ := stringFromArgs(act.Args, "summary")
 		return truncate(s, 80)

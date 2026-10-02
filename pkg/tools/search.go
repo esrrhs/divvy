@@ -131,3 +131,77 @@ func clipLine(s string) string {
 	}
 	return strings.TrimSpace(s)
 }
+
+const defaultMaxFoundFiles = 200
+
+// FindFiles locates files by glob name pattern (not content) and returns one
+// workspace-relative slash path per line. A bare pattern such as "*_test.go"
+// matches by basename at every depth; a slash-bearing pattern like
+// "pkg/*.go" matches the relative path. Common junk directories (.git,
+// node_modules, ...) are skipped. rootDir is workspace-relative ("." by
+// default).
+func (s *Sandbox) FindFiles(pattern, rootDir string) (string, error) {
+	pattern = strings.TrimSpace(pattern)
+	if pattern == "" {
+		return "", fmt.Errorf("find_files needs a pattern")
+	}
+	if _, err := path.Match(pattern, "x"); err != nil {
+		return "", fmt.Errorf("invalid glob %q: %w", pattern, err)
+	}
+	rootDir = strings.TrimSpace(rootDir)
+	if rootDir == "" {
+		rootDir = "."
+	}
+	absRoot, err := s.Resolve(rootDir)
+	if err != nil {
+		return "", err
+	}
+
+	var b strings.Builder
+	found := 0
+	truncated := false
+	walkErr := filepath.WalkDir(absRoot, func(p string, d fs.DirEntry, werr error) error {
+		if werr != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if p != absRoot && skipDirNames[d.Name()] {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if p == absRoot || skipDirNames[d.Name()] || !d.Type().IsRegular() {
+			return nil
+		}
+		rel, err := filepath.Rel(s.Root, p)
+		if err != nil {
+			return nil
+		}
+		relSlash := filepath.ToSlash(rel)
+		ok, _ := path.Match(pattern, path.Base(relSlash))
+		if !ok {
+			ok, _ = path.Match(pattern, relSlash)
+		}
+		if !ok {
+			return nil
+		}
+		found++
+		if found > defaultMaxFoundFiles {
+			truncated = true
+			return nil
+		}
+		fmt.Fprintf(&b, "%s\n", relSlash)
+		return nil
+	})
+	if walkErr != nil {
+		return "", walkErr
+	}
+	if found == 0 {
+		return fmt.Sprintf("(no files matching %q)", pattern), nil
+	}
+	out := b.String()
+	if truncated {
+		out += fmt.Sprintf("[more than %d files; narrow the pattern or path]\n", defaultMaxFoundFiles)
+	}
+	return out, nil
+}

@@ -19,6 +19,7 @@ const (
 	ToolReplaceLines = "replace_lines"
 	ToolRunBash      = "run_bash"
 	ToolSearchFiles  = "search_files"
+	ToolFindFiles    = "find_files"
 	ToolWebSearch    = "web_search"
 	ToolWebFetch     = "web_fetch"
 	ToolFinish       = "finish"
@@ -44,12 +45,15 @@ func Descriptions() string {
 	return strings.TrimSpace(`
 Tools (call exactly one per turn):
 - list_dir: {"path":".","recursive":true}
-- read_file: {"path":"file.go"}
+- read_file: {"path":"file.go","start_line":100,"end_line":200}
+  start_line/end_line are optional, 1-indexed and inclusive; lines come back numbered. Omit them to read the whole file.
 - write_file: {"path":"file.go","content":"...full file..."}
 - replace_lines: {"path":"file.go","start_line":1,"end_line":3,"content":"new lines"}
   alternative: {"path":"file.go","old_string":"exact old","new_string":"exact new"}
-- run_bash: {"command":"go test ./..."}
-- search_files: {"pattern":"func Add","glob":"*.go"}
+- run_bash: {"command":"go test ./...","timeout_sec":120}
+  timeout_sec optional, default 60; raise it for slow installs/builds.
+- search_files: {"pattern":"func Add","glob":"*.go"}  (regex over file CONTENTS)
+- find_files: {"pattern":"*_test.go","path":"."}  (find files by glob NAME, recursively; bare pattern matches basename at any depth)
 - finish: {"summary":"what was done"}
 `)
 }
@@ -205,8 +209,10 @@ func NativeTools() []map[string]any {
 			"path":      str("Relative directory path"),
 			"recursive": map[string]any{"type": "boolean"},
 		}, []string{"path"})),
-		fn(ToolReadFile, "Read a UTF-8 text file.", obj(map[string]any{
-			"path": str("Relative file path"),
+		fn(ToolReadFile, "Read a UTF-8 text file, optionally an inclusive 1-indexed line range; ranged output is numbered.", obj(map[string]any{
+			"path":       str("Relative file path"),
+			"start_line": map[string]any{"type": "integer", "description": "First line to read (1-indexed)"},
+			"end_line":   map[string]any{"type": "integer", "description": "Last line to read, inclusive; defaults to EOF"},
 		}, []string{"path"})),
 		fn(ToolWriteFile, "Create or overwrite a whole file.", obj(map[string]any{
 			"path":    str("Relative file path"),
@@ -222,13 +228,18 @@ func NativeTools() []map[string]any {
 			"replace_all": map[string]any{"type": "boolean"},
 		}, []string{"path"})),
 		fn(ToolRunBash, "Run a shell command in the workspace.", obj(map[string]any{
-			"command": str("Shell command"),
+			"command":     str("Shell command"),
+			"timeout_sec": map[string]any{"type": "integer", "description": "Timeout in seconds; default 60, raise for slow installs/builds"},
 		}, []string{"command"})),
 		fn(ToolSearchFiles, "Search file contents with a regular expression and report file:line matches.", obj(map[string]any{
 			"pattern":        str("Regular expression to find"),
 			"path":           str("Workspace-relative directory to search (default: workspace root)"),
 			"glob":           str("Optional glob filter, e.g. *.go or pkg/*_test.go"),
 			"case_sensitive": map[string]any{"type": "boolean"},
+		}, []string{"pattern"})),
+		fn(ToolFindFiles, "Find files by glob name pattern (not contents); a bare pattern like *_test.go matches the basename at every depth.", obj(map[string]any{
+			"pattern": str("Glob pattern, e.g. *_test.go or pkg/*.go"),
+			"path":    str("Workspace-relative directory to search (default: workspace root)"),
 		}, []string{"pattern"})),
 		fn(ToolFinish, "Mark the atomic task complete.", obj(map[string]any{
 			"summary": str("Short summary of what was done"),
@@ -286,6 +297,13 @@ func (s *Sandbox) Call(ctx context.Context, name string, args map[string]any) (s
 		path, err := requireString(args, "path")
 		if err != nil {
 			return "", err
+		}
+		if start, err := intArg(args, "start_line"); err == nil {
+			end, endErr := intArg(args, "end_line")
+			if endErr != nil {
+				end = 0 // read from start_line to EOF
+			}
+			return s.ReadFileLines(path, start, end)
 		}
 		return s.ReadFile(path)
 
@@ -354,6 +372,14 @@ func (s *Sandbox) Call(ctx context.Context, name string, args map[string]any) (s
 		glob, _ := stringArg(args, "glob")
 		caseSensitive := boolArg(args, "case_sensitive", false)
 		return s.SearchFiles(pattern, rootDir, glob, caseSensitive)
+
+	case ToolFindFiles:
+		pattern, err := requireString(args, "pattern")
+		if err != nil {
+			return "", err
+		}
+		rootDir, _ := stringArg(args, "path")
+		return s.FindFiles(pattern, rootDir)
 
 	case ToolWebSearch:
 		query, err := requireString(args, "query")
@@ -499,7 +525,7 @@ func (s *Sandbox) Call(ctx context.Context, name string, args map[string]any) (s
 		return summary, nil
 
 	default:
-		return "", fmt.Errorf("unknown tool %q; use list_dir, read_file, write_file, replace_lines, run_bash, search_files, web_search, web_fetch, finish", name)
+		return "", fmt.Errorf("unknown tool %q; use list_dir, read_file, write_file, replace_lines, run_bash, search_files, find_files, web_search, web_fetch, finish", name)
 	}
 }
 

@@ -375,8 +375,8 @@ Commands:
 
 Anything else is sent to the foreman, which dispatches leaves that work in
 this workspace with: list_dir, read_file, write_file, replace_lines,
-run_bash, search_files. Describe concrete, self-contained requests; ask
-follow-ups on the next line and the foreman will use the work log.
+run_bash, search_files, find_files. Describe concrete, self-contained
+requests; ask follow-ups on the next line and the foreman will use the work log.
 Note: a command's background processes are stopped when the command returns,
 so run long-lived servers in a separate terminal.
 `
