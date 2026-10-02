@@ -41,6 +41,10 @@ type Sandbox struct {
 	MaxWrite  int
 	MaxList   int
 	MaxOutput int
+
+	// Web, when set, enables outbound web_search/web_fetch. Nil keeps the
+	// sandbox fully offline. Shared across mirror sandboxes (read-only).
+	Web *WebClient
 }
 
 // NewSandbox creates a workspace-rooted sandbox. root is created if missing.

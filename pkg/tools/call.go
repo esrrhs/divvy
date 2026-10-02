@@ -17,6 +17,8 @@ const (
 	ToolReplaceLines = "replace_lines"
 	ToolRunBash      = "run_bash"
 	ToolSearchFiles  = "search_files"
+	ToolWebSearch    = "web_search"
+	ToolWebFetch     = "web_fetch"
 	ToolFinish       = "finish"
 )
 
@@ -32,6 +34,14 @@ Tools (call exactly one per turn):
 - run_bash: {"command":"go test ./..."}
 - search_files: {"pattern":"func Add","glob":"*.go"}
 - finish: {"summary":"what was done"}
+`)
+}
+
+// WebDescriptions returns the extra tool lines exposed when -web is on.
+func WebDescriptions() string {
+	return strings.TrimSpace(`
+- web_search: {"query":"latest docs for ...","max_results":5}  (live web search)
+- web_fetch: {"url":"https://example.com/doc"}  (download a page as plain text)
 `)
 }
 
@@ -86,6 +96,36 @@ func NativeTools() []map[string]any {
 		fn(ToolFinish, "Mark the atomic task complete.", obj(map[string]any{
 			"summary": str("Short summary of what was done"),
 		}, []string{})),
+	}
+}
+
+// NativeWebTools returns the OpenAI tool-calling definitions for the live
+// web tools, appended to NativeTools when -web is enabled.
+func NativeWebTools() []map[string]any {
+	fn := func(name, desc string, props map[string]any, req []string) map[string]any {
+		return map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":        name,
+				"description": desc,
+				"parameters": map[string]any{
+					"type":       "object",
+					"properties": props,
+					"required":   req,
+				},
+			},
+		}
+	}
+	str := func(desc string) map[string]any {
+		return map[string]any{"type": "string", "description": desc}
+	}
+	return []map[string]any{
+		fn(ToolWebSearch, "Search the live web and return numbered title/url/snippet results.",
+			map[string]any{"query": str("Search query"), "max_results": map[string]any{"type": "integer"}},
+			[]string{"query"}),
+		fn(ToolWebFetch, "Fetch a public http(s) URL and return its plain-text content.",
+			map[string]any{"url": str("Absolute http or https URL")},
+			[]string{"url"}),
 	}
 }
 
@@ -178,6 +218,30 @@ func (s *Sandbox) Call(ctx context.Context, name string, args map[string]any) (s
 		caseSensitive := boolArg(args, "case_sensitive", false)
 		return s.SearchFiles(pattern, rootDir, glob, caseSensitive)
 
+	case ToolWebSearch:
+		query, err := requireString(args, "query")
+		if err != nil {
+			return "", err
+		}
+		if s.Web == nil {
+			return "", fmt.Errorf("web tools are disabled; restart with -web to enable web_search/web_fetch")
+		}
+		max := 0
+		if n, err := intArg(args, "max_results"); err == nil {
+			max = n
+		}
+		return s.Web.Search(ctx, query, max)
+
+	case ToolWebFetch:
+		rawURL, err := requireString(args, "url")
+		if err != nil {
+			return "", err
+		}
+		if s.Web == nil {
+			return "", fmt.Errorf("web tools are disabled; restart with -web to enable web_search/web_fetch")
+		}
+		return s.Web.Fetch(ctx, rawURL)
+
 	case ToolFinish:
 		summary, _ := stringArg(args, "summary")
 		if summary == "" {
@@ -186,7 +250,7 @@ func (s *Sandbox) Call(ctx context.Context, name string, args map[string]any) (s
 		return summary, nil
 
 	default:
-		return "", fmt.Errorf("unknown tool %q; use list_dir, read_file, write_file, replace_lines, run_bash, search_files, finish", name)
+		return "", fmt.Errorf("unknown tool %q; use list_dir, read_file, write_file, replace_lines, run_bash, search_files, web_search, web_fetch, finish", name)
 	}
 }
 

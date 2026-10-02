@@ -46,6 +46,13 @@ func New(cfg Config, tree *engine.TaskTree, client llm.Client, log *Logger) (*Or
 	if err != nil {
 		return nil, err
 	}
+	if cfg.WebEnabled {
+		webClient, werr := tools.NewWebClient(cfg.SearchURL, cfg.RequestTimeout)
+		if werr != nil {
+			return nil, werr
+		}
+		sandbox.Web = webClient
+	}
 	if cfg.GitCommit && !tools.IsRepo(sandbox.Root) {
 		return nil, fmt.Errorf("-git-commit requires %s to be a git repository", sandbox.Root)
 	}
@@ -537,6 +544,8 @@ func (o *Orchestrator) executeLeaf(ctx context.Context, leaf *models.TaskNode) e
 		if err != nil {
 			return err
 		}
+		// Isolated leaves keep the same read-only web capability.
+		sb.Web = o.sandbox.Web
 		o.log.Infof("isolated %s in %s", leaf.ID, tools.TrimPath(sb.Root))
 	}
 

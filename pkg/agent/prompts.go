@@ -45,13 +45,12 @@ Rules:
 - Keep each leaf small enough that a 7B-14B coding model can finish it in a few tool calls.
 `
 
-const workerSystem = workerMarker + `
+const workerSystemBase = workerMarker + `
 
 You work inside an isolated workspace. Respond with ONLY one JSON object per turn.
 
 {"thought":"short plan","action":"tool_name","args":{...}}
 
-` + `
 Tools:
 - list_dir: {"path":".","recursive":true}
 - read_file: {"path":"file.go"}
@@ -62,15 +61,47 @@ Tools:
 - search_files: {"pattern":"func Add","glob":"*.go"}  (regex; use it to locate code instead of reading many files)
 - ask: {"question":"specific question whose answer you need"}  (only in an interactive guided run; asks the user and waits)
 - finish: {"summary":"what you did"}
+`
+
+// webToolLines are appended to the worker prompt when -web is enabled.
+const webToolLines = `
+- web_search: {"query":"...","max_results":5}  (live web: use for current docs/versions you cannot know locally)
+- web_fetch: {"url":"https://..."}  (fetch one public page as plain text)
+`
+
+const workerRulesOffline = `
 
 Rules:
 - Do exactly this one task. Do not expand scope.
 - Use ask only when a decision genuinely depends on the user (ambiguous requirement), not for things you can decide yourself.
 - To locate existing code, prefer search_files over reading whole files.
 - Prefer write_file for new files. Prefer old_string/new_string for small edits.
-- Stay inside the workspace. Do not access the network unless the task requires it.
+- Stay inside the workspace. Do not access the network.
 - After writing code, you MAY run_bash to compile or test.
 - When the task is done and likely to pass the verification commands, call finish.
 - Never wrap JSON in markdown.
 - One action per turn.
 `
+
+const workerRulesWeb = `
+
+Rules:
+- Do exactly this one task. Do not expand scope.
+- Use ask only when a decision genuinely depends on the user (ambiguous requirement), not for things you can decide yourself.
+- To locate existing code, prefer search_files over reading whole files.
+- Prefer write_file for new files. Prefer old_string/new_string for small edits.
+- Stay inside the workspace for files. Network access is limited to web_search/web_fetch for public pages the task genuinely needs; do not fetch unrelated sites.
+- After writing code, you MAY run_bash to compile or test.
+- When the task is done and likely to pass the verification commands, call finish.
+- Never wrap JSON in markdown.
+- One action per turn.
+`
+
+// workerSystemFor returns the worker system prompt, including the live web
+// tools only when web is enabled.
+func workerSystemFor(web bool) string {
+	if web {
+		return workerSystemBase + webToolLines + workerRulesWeb
+	}
+	return workerSystemBase + workerRulesOffline
+}

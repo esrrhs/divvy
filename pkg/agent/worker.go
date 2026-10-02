@@ -13,13 +13,13 @@ import (
 
 func (o *Orchestrator) runWorker(ctx context.Context, sb *tools.Sandbox, node *models.TaskNode, prevError string) (string, error) {
 	messages := []llm.Message{
-		{Role: llm.RoleSystem, Content: workerSystem},
+		{Role: llm.RoleSystem, Content: workerSystemFor(o.cfg.WebEnabled)},
 		{Role: llm.RoleUser, Content: o.projectContext(sb, node, prevError)},
 	}
 
 	var native []llm.Tool
 	if o.cfg.NativeTools {
-		native = nativeToolDefs()
+		native = nativeToolDefs(o.cfg.WebEnabled)
 	}
 
 	maxSteps := o.cfg.MaxSteps
@@ -156,8 +156,11 @@ func collectActions(resp *llm.Response) []taggedAction {
 	return []taggedAction{{Name: act.Name, Thought: act.Thought, Args: act.Args}}
 }
 
-func nativeToolDefs() []llm.Tool {
+func nativeToolDefs(web bool) []llm.Tool {
 	raw := tools.NativeTools()
+	if web {
+		raw = append(raw, tools.NativeWebTools()...)
+	}
 	out := make([]llm.Tool, 0, len(raw))
 	for _, m := range raw {
 		b, err := json.Marshal(m)

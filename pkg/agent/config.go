@@ -40,6 +40,12 @@ type Config struct {
 	Stream      bool
 	Verbose     bool
 
+	// WebEnabled enables outbound web_search/web_fetch for leaves;
+	// SearchURL is the query template (empty = built-in DuckDuckGo lite;
+	// a SearXNG instance with format=json is supported).
+	WebEnabled bool
+	SearchURL  string
+
 	GitCommit bool // commit each leaf's merged changes to the workdir git repo
 	Strict    bool // plan mode: fail on plan-check warnings
 

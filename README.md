@@ -109,6 +109,24 @@ export OPENAI_MODEL=qwen2.5-coder:14b
 - Node 用 `--if-present`：包没定义 test 脚本时退出 0，而不是 npm 的 "no test specified" 误报。
 - 没有任何标记的全新空目录仍是"通用"，建议先放入脚手架（`package.json` 等）或直接用 `-plan` 检查默认 DoD 是否合理。
 
+### 联网搜索与抓取
+
+默认完全离线；加上 `-web` 后叶子获得两个网络工具，用于查询模型自身无法获知的最新文档/版本：
+
+- `web_search`：`{"query":"...","max_results":5}` → 编号结果（标题/URL/摘要）。
+- `web_fetch`：`{"url":"https://..."}` → 抓取单个页面，**HTML 自动转成纯文本**（剥离 script/style），文本/JSON/XML 原样返回。
+
+```bash
+./go_llm_engine -web -workdir ./ws "查一下 X 的最新 API，写一个调用示例"
+```
+
+搜索后端可通过 `-search-url` 配置（模板必须含 `{query}`）：
+
+- 留空：内置 **DuckDuckGo lite**，无需 API Key（仅解析公开 HTML，可能被网络策略拦截）。
+- **SearXNG**：`-search-url 'http://host/search?q={query}&format=json'`，走 JSON，适合自建稳定检索。
+
+安全约束（web_fetch 与每一跳重定向都会执行）：只允许 http/https；目标域名解析后若指向回环/私网/链路本地/CGNAT 等非公开地址一律拒绝；只允许 80/443；重定向到内网同样拦截。因此 agent 无法借抓取访问本机或内网服务。
+
 ### 交互式 REPL（工头 + 独立叶子）
 
 `-interactive` 进入多轮交互，但它**不是**一条长会话：结构上是一个轻量"工头"对话层 + 独立上下文的叶子工人，与批处理坚持同一哲学。
@@ -231,5 +249,6 @@ go test ./...
 - [x] 阶段 13：交互式 REPL（工头对话层 + 独立上下文叶子执行、只保留多轮压缩摘要、`/help` `/clear` `/status` `/exit`）
 - [x] 阶段 14：引导式工作流（计划评审与 `/approve` 敲定、执行中 `/add` `/redo` `/pause`、agent `ask` 提问、可 resume）
 - [x] 阶段 15：多语言项目验收（自动探测 Go/Node/Rust/Python/Makefile，按栈生成叶子与根 DoD，模型显式命令优先）
+- [x] 阶段 16：联网搜索与抓取（`-web` 开启 web_search/web_fetch、HTML 转文本、可配 DuckDuckGo/SearXNG、非公开地址与端口拦截）
 
 弱模型上的 Prompt 与拆分粒度仍需按具体模型微调（`-max-depth`、`-max-steps`、`-extra`）。

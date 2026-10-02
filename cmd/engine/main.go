@@ -52,6 +52,8 @@ func run(args []string) error {
 	strict := fs.Bool("strict", false, "with -plan: exit non-zero when the plan check reports warnings")
 	gitCommit := fs.Bool("git-commit", false, "git commit each leaf's merged changes (workdir must be a git repo)")
 	native := fs.Bool("native-tools", false, "use OpenAI tool_calls instead of JSON actions")
+	web := fs.Bool("web", false, "enable outbound web_search/web_fetch for leaves (offline by default)")
+	searchURL := fs.String("search-url", "", "search endpoint template with {query} (default: DuckDuckGo lite; SearXNG: http://host/search?q={query}&format=json)")
 	noStream := fs.Bool("no-stream", false, "disable SSE streaming")
 	maxCost := fs.Float64("max-cost", cfg.MaxCost, "session cost ceiling in USD, incl. pre-resume spend (0 = unlimited)")
 	budgetTokens := fs.Int("budget-tokens", cfg.BudgetTokens, "session token ceiling, incl. pre-resume spend (0 = unlimited)")
@@ -87,6 +89,8 @@ func run(args []string) error {
 	cfg.NativeTools = *native
 	cfg.Stream = !*noStream
 	cfg.Verbose = *verbose
+	cfg.WebEnabled = *web
+	cfg.SearchURL = *searchURL
 	cfg.GitCommit = *gitCommit
 	cfg.Strict = *strict
 	cfg.MaxCost = *maxCost
