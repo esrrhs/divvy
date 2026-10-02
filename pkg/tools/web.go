@@ -106,6 +106,17 @@ func (w *WebClient) Search(ctx context.Context, query string, max int) (string, 
 // Fetch downloads a page and returns readable text: HTML is converted to
 // plain text, other text formats pass through.
 func (w *WebClient) Fetch(ctx context.Context, rawURL string) (string, error) {
+	return w.request(ctx, http.MethodGet, rawURL, nil, "", false)
+}
+
+// Do performs a structured HTTP request and returns a compact
+// "status/headers/body" report. Used by the http_request tool.
+func (w *WebClient) Do(ctx context.Context, method, rawURL string, headers map[string]string, body string) (string, error) {
+	return w.request(ctx, method, rawURL, headers, body, true)
+}
+
+// request implements both Fetch (GET, HTML→text) and Do (raw report).
+func (w *WebClient) request(ctx context.Context, method, rawURL string, headers map[string]string, body string, rawReport bool) (string, error) {
 	u, err := url.Parse(strings.TrimSpace(rawURL))
 	if err != nil {
 		return "", fmt.Errorf("invalid URL: %w", err)
@@ -113,12 +124,23 @@ func (w *WebClient) Fetch(ctx context.Context, rawURL string) (string, error) {
 	if err := w.validateURL(u); err != nil {
 		return "", err
 	}
+	method = strings.ToUpper(strings.TrimSpace(method))
+	if method == "" {
+		method = http.MethodGet
+	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	var bodyReader io.Reader
+	if body != "" {
+		bodyReader = strings.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, u.String(), bodyReader)
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("User-Agent", "go_llm_engine/1.0 (+web fetch)")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	req.Header.Set("User-Agent", "go_llm_engine/1.0 (+web)")
 	resp, err := w.client.Do(req)
 	if err != nil {
 		return "", err
@@ -129,6 +151,18 @@ func (w *WebClient) Fetch(ctx context.Context, rawURL string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+
+	if rawReport {
+		var b strings.Builder
+		fmt.Fprintf(&b, "status: %s\n", resp.Status)
+		for k := range resp.Header {
+			fmt.Fprintf(&b, "header: %s: %s\n", k, strings.Join(resp.Header.Values(k), ", "))
+		}
+		b.WriteString("body:\n")
+		b.Write(data)
+		return strings.TrimSpace(b.String()), nil
+	}
+
 	ct := strings.ToLower(resp.Header.Get("Content-Type"))
 	switch {
 	case strings.Contains(ct, "html"):

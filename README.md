@@ -127,6 +127,30 @@ export OPENAI_MODEL=qwen2.5-coder:14b
 
 安全约束（web_fetch 与每一跳重定向都会执行）：只允许 http/https；目标域名解析后若指向回环/私网/链路本地/CGNAT 等非公开地址一律拒绝；只允许 80/443；重定向到内网同样拦截。因此 agent 无法借抓取访问本机或内网服务。
 
+### 浏览器、HTTP、Git、代码理解工具
+
+除网络搜索外，工具集还包含以下能力（按开关/环境可用）：
+
+**Headless 浏览器（`-browser`，需 Chrome/Chromium）**
+
+- `browser_navigate`：加载 **JS 渲染页面**，返回标题 + 渲染后文本（补 web_fetch 拿不到 SPA 内容的缺口）；
+- `browser_click`（CSS 选择器）、`browser_type`（输入文本，可先清空）、`browser_text`（读取元素/正文渲染文本）；
+- `browser_screenshot`：整页 **PNG** 存入工作区（`{"path":"shot.png"}`）。
+- 浏览器进程懒启动、跨叶子复用同一标签页；用户中断时才关闭。这也让 Web 前端交付物具备"真实浏览器交互"级别的验收手段。
+
+**结构化 HTTP（`-web` 下）**
+
+- `http_request`：`{"url","method","headers","body"}`，返回状态码/响应头/正文；弱模型不必在 shell 里手拼 curl。
+
+**Git 只读工具（工作区为 git 仓库时）**
+
+- `git_status`、`git_diff`（可选 `staged`/`path`）、`git_log`（可选 `limit`/`path`）；均为只读，不改动仓库。
+
+**代码/数据理解（默认可用）**
+
+- `find_symbol`：按名字定位定义——**Go 走真实 AST**（func/type/var 精确到行），其它语言回退正则；
+- `json_query`：用点号/方括号路径（`items.0.name`、`items[0].name`）从大 JSON 里抽单个值，避免整文件进上下文。
+
 ### 交互式 REPL（工头 + 独立叶子）
 
 `-interactive` 进入多轮交互，但它**不是**一条长会话：结构上是一个轻量"工头"对话层 + 独立上下文的叶子工人，与批处理坚持同一哲学。
@@ -250,5 +274,6 @@ go test ./...
 - [x] 阶段 14：引导式工作流（计划评审与 `/approve` 敲定、执行中 `/add` `/redo` `/pause`、agent `ask` 提问、可 resume）
 - [x] 阶段 15：多语言项目验收（自动探测 Go/Node/Rust/Python/Makefile，按栈生成叶子与根 DoD，模型显式命令优先）
 - [x] 阶段 16：联网搜索与抓取（`-web` 开启 web_search/web_fetch、HTML 转文本、可配 DuckDuckGo/SearXNG、非公开地址与端口拦截）
+- [x] 阶段 17：扩展工具集（`-browser` headless Chrome、http_request、只读 git_status/diff/log、Go AST find_symbol、json_query）
 
 弱模型上的 Prompt 与拆分粒度仍需按具体模型微调（`-max-depth`、`-max-steps`、`-extra`）。

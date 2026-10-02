@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -20,6 +22,21 @@ const (
 	ToolWebSearch    = "web_search"
 	ToolWebFetch     = "web_fetch"
 	ToolFinish       = "finish"
+
+	ToolHTTPRequest = "http_request"
+
+	ToolGitStatus = "git_status"
+	ToolGitDiff   = "git_diff"
+	ToolGitLog    = "git_log"
+
+	ToolFindSymbol = "find_symbol"
+	ToolJSONQuery  = "json_query"
+
+	ToolBrowserNavigate   = "browser_navigate"
+	ToolBrowserClick      = "browser_click"
+	ToolBrowserType       = "browser_type"
+	ToolBrowserText       = "browser_text"
+	ToolBrowserScreenshot = "browser_screenshot"
 )
 
 // Descriptions returns a compact tool list for JSON-mode system prompts.
@@ -43,6 +60,126 @@ func WebDescriptions() string {
 - web_search: {"query":"latest docs for ...","max_results":5}  (live web search)
 - web_fetch: {"url":"https://example.com/doc"}  (download a page as plain text)
 `)
+}
+
+// HTTPDescriptions returns the structured HTTP request tool line.
+func HTTPDescriptions() string {
+	return strings.TrimSpace(`- http_request: {"url":"https://...","method":"GET","headers":{},"body":""}  (returns status/headers/body)`)
+}
+
+// CodeDescriptions returns the code/data understanding tool lines.
+func CodeDescriptions() string {
+	return strings.TrimSpace(`
+- find_symbol: {"name":"Foo","kind":"func|type|var","glob":"*.go"}  (definition locations; Go uses a real AST)
+- json_query: {"path":"file.json","query":"items.0.name"}  (extract one value via dotted/bracket path)
+`)
+}
+
+// GitDescriptions returns the read-only git tool lines.
+func GitDescriptions() string {
+	return strings.TrimSpace(`
+- git_status: {}  (short working-tree status)
+- git_diff: {"staged":false,"path":""}  (unified diff)
+- git_log: {"limit":10,"path":""}  (recent commits)
+`)
+}
+
+// BrowserDescriptions returns the headless browser tool lines.
+func BrowserDescriptions() string {
+	return strings.TrimSpace(`
+- browser_navigate: {"url":"https://..."}  (JS-rendered page → title + text)
+- browser_click: {"selector":"#id"}  (CSS selector)
+- browser_type: {"selector":"input","text":"...","clear":true}
+- browser_text: {"selector":""}  (rendered text of a selector or body)
+- browser_screenshot: {"path":"shot.png"}  (full-page PNG into the workspace)
+`)
+}
+
+// DynamicToolDescriptions assembles every optional tool line available in
+// this sandbox; used to build the worker prompt.
+func (s *Sandbox) DynamicToolDescriptions() string {
+	var b strings.Builder
+	write := func(text string) { b.WriteString("\n" + text + "\n") }
+
+	write(CodeDescriptions())
+	if IsRepo(s.Root) {
+		write(GitDescriptions())
+	}
+	if s.Web != nil {
+		write(WebDescriptions())
+		write(HTTPDescriptions())
+	}
+	if s.Browser != nil {
+		write(BrowserDescriptions())
+	}
+	return b.String()
+}
+
+// nativeDef is a compact builder for OpenAI function tool definitions.
+// props maps argument name → JSON schema type ("string"/"integer"/"boolean");
+// required lists mandatory arguments.
+func nativeDef(name, description string, props map[string]string, required []string) map[string]any {
+	propMap := make(map[string]any, len(props))
+	for p, typ := range props {
+		propMap[p] = map[string]any{"type": typ}
+	}
+	return map[string]any{
+		"type": "function",
+		"function": map[string]any{
+			"name":        name,
+			"description": description,
+			"parameters": map[string]any{
+				"type":       "object",
+				"properties": propMap,
+				"required":   required,
+			},
+		},
+	}
+}
+
+// NativeCodeTools returns find_symbol/json_query definitions.
+func NativeCodeTools() []map[string]any {
+	return []map[string]any{
+		nativeDef(ToolFindSymbol, "Locate definitions by name; Go uses the real AST.",
+			map[string]string{"name": "string", "kind": "string", "glob": "string"}, []string{"name"}),
+		nativeDef(ToolJSONQuery, "Extract one value from a JSON file by a dotted/bracket path.",
+			map[string]string{"path": "string", "query": "string"}, []string{"path"}),
+	}
+}
+
+// NativeGitTools returns read-only git definitions.
+func NativeGitTools() []map[string]any {
+	return []map[string]any{
+		nativeDef(ToolGitStatus, "Show short git status.", map[string]string{}, nil),
+		nativeDef(ToolGitDiff, "Show a unified diff.",
+			map[string]string{"staged": "boolean", "path": "string"}, nil),
+		nativeDef(ToolGitLog, "Show recent oneline commits.",
+			map[string]string{"limit": "integer", "path": "string"}, nil),
+	}
+}
+
+// NativeHTTPTool returns the structured request definition.
+func NativeHTTPTool() map[string]any {
+	return nativeDef(ToolHTTPRequest, "Perform a structured HTTP call; returns status/headers/body.",
+		map[string]string{"url": "string", "method": "string", "headers": "object", "body": "string"},
+		[]string{"url"})
+}
+
+// NativeBrowserTools returns headless Chrome definitions.
+func NativeBrowserTools() []map[string]any {
+	return []map[string]any{
+		nativeDef(ToolBrowserNavigate, "Load a JS-rendered page; returns title and text.",
+			map[string]string{"url": "string"}, []string{"url"}),
+		nativeDef(ToolBrowserClick, "Click an element by CSS selector.",
+			map[string]string{"selector": "string"}, []string{"selector"}),
+		nativeDef(ToolBrowserType, "Type text into a field.",
+			map[string]string{"selector": "string", "text": "string", "clear": "boolean"},
+			[]string{"selector"}),
+		nativeDef(ToolBrowserText, "Read rendered text of a selector or body.",
+			map[string]string{"selector": "string"}, nil),
+		nativeDef(ToolBrowserScreenshot, "Save a full-page PNG into the workspace.",
+			map[string]string{"path": "string"}, []string{"path"}),
+	}
 }
 
 // NativeTools returns OpenAI tool-calling definitions (without finish; finish is JSON-only or a tool).
@@ -242,6 +379,118 @@ func (s *Sandbox) Call(ctx context.Context, name string, args map[string]any) (s
 		}
 		return s.Web.Fetch(ctx, rawURL)
 
+	case ToolHTTPRequest:
+		if s.Web == nil {
+			return "", fmt.Errorf("http_request needs -web (network access is off by default)")
+		}
+		u, err := requireString(args, "url")
+		if err != nil {
+			return "", err
+		}
+		method, _ := stringArg(args, "method")
+		body, _ := stringArg(args, "body")
+		headers := map[string]string{}
+		if hm, ok := args["headers"].(map[string]any); ok {
+			for k, v := range hm {
+				if vs, ok := v.(string); ok {
+					headers[k] = vs
+				} else {
+					headers[k] = fmt.Sprint(v)
+				}
+			}
+		}
+		return s.Web.Do(ctx, method, u, headers, body)
+
+	case ToolGitStatus:
+		return s.GitStatus(ctx)
+	case ToolGitDiff:
+		staged := boolArg(args, "staged", false)
+		p, _ := stringArg(args, "path")
+		return s.GitDiff(ctx, staged, p)
+	case ToolGitLog:
+		limit := 0
+		if n, err := intArg(args, "limit"); err == nil {
+			limit = n
+		}
+		p, _ := stringArg(args, "path")
+		return s.GitLog(ctx, limit, p)
+
+	case ToolFindSymbol:
+		n, err := requireString(args, "name")
+		if err != nil {
+			return "", err
+		}
+		kind, _ := stringArg(args, "kind")
+		glob, _ := stringArg(args, "glob")
+		return s.FindSymbol(ctx, n, kind, glob)
+
+	case ToolJSONQuery:
+		p, err := requireString(args, "path")
+		if err != nil {
+			return "", err
+		}
+		query, _ := stringArg(args, "query")
+		return s.JSONQuery(p, query)
+
+	case ToolBrowserNavigate:
+		if s.Browser == nil {
+			return "", browserDisabledErr
+		}
+		u, err := requireString(args, "url")
+		if err != nil {
+			return "", err
+		}
+		return s.Browser.Navigate(ctx, u)
+	case ToolBrowserClick:
+		if s.Browser == nil {
+			return "", browserDisabledErr
+		}
+		sel, err := requireString(args, "selector")
+		if err != nil {
+			return "", err
+		}
+		return reportOK(s.Browser.Click(ctx, sel), "clicked "+sel)
+	case ToolBrowserType:
+		if s.Browser == nil {
+			return "", browserDisabledErr
+		}
+		sel, err := requireString(args, "selector")
+		if err != nil {
+			return "", err
+		}
+		text, _ := stringArg(args, "text")
+		clear := boolArg(args, "clear", true)
+		return reportOK(s.Browser.Type(ctx, sel, text, clear), "typed into "+sel)
+	case ToolBrowserText:
+		if s.Browser == nil {
+			return "", browserDisabledErr
+		}
+		sel, _ := stringArg(args, "selector")
+		return s.Browser.Text(ctx, sel)
+	case ToolBrowserScreenshot:
+		if s.Browser == nil {
+			return "", browserDisabledErr
+		}
+		out, err := requireString(args, "path")
+		if err != nil {
+			return "", err
+		}
+		abs, err := s.Resolve(out)
+		if err != nil {
+			return "", err
+		}
+		png, err := s.Browser.Screenshot(ctx)
+		if err != nil {
+			return "", err
+		}
+		if err := os.MkdirAll(filepath.Dir(abs), 0755); err != nil {
+			return "", err
+		}
+		if err := writeBinary(abs, png); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("saved %s (%d bytes PNG)", out, len(png)), nil
+
 	case ToolFinish:
 		summary, _ := stringArg(args, "summary")
 		if summary == "" {
@@ -278,6 +527,22 @@ func formatExec(res *ExecResult) string {
 		b.WriteString("(no output)\n")
 	}
 	return strings.TrimSpace(b.String())
+}
+
+// browserDisabledErr is the common error when browser tools are called
+// without -browser.
+var browserDisabledErr = fmt.Errorf("browser tools are disabled; restart with -browser (requires Chrome/Chromium)")
+
+// reportOK returns okText when err is nil, otherwise the error.
+func reportOK(err error, okText string) (string, error) {
+	if err != nil {
+		return "", err
+	}
+	return okText, nil
+}
+
+func writeBinary(path string, data []byte) error {
+	return os.WriteFile(path, data, 0644)
 }
 
 func requireString(args map[string]any, key string) (string, error) {

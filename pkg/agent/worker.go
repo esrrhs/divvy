@@ -13,13 +13,13 @@ import (
 
 func (o *Orchestrator) runWorker(ctx context.Context, sb *tools.Sandbox, node *models.TaskNode, prevError string) (string, error) {
 	messages := []llm.Message{
-		{Role: llm.RoleSystem, Content: workerSystemFor(o.cfg.WebEnabled)},
+		{Role: llm.RoleSystem, Content: workerSystemFor(o.cfg.WebEnabled, sb.DynamicToolDescriptions())},
 		{Role: llm.RoleUser, Content: o.projectContext(sb, node, prevError)},
 	}
 
 	var native []llm.Tool
 	if o.cfg.NativeTools {
-		native = nativeToolDefs(o.cfg.WebEnabled)
+		native = nativeToolDefs(sb)
 	}
 
 	maxSteps := o.cfg.MaxSteps
@@ -156,10 +156,18 @@ func collectActions(resp *llm.Response) []taggedAction {
 	return []taggedAction{{Name: act.Name, Thought: act.Thought, Args: act.Args}}
 }
 
-func nativeToolDefs(web bool) []llm.Tool {
+func nativeToolDefs(sb *tools.Sandbox) []llm.Tool {
 	raw := tools.NativeTools()
-	if web {
+	raw = append(raw, tools.NativeCodeTools()...)
+	if tools.IsRepo(sb.Root) {
+		raw = append(raw, tools.NativeGitTools()...)
+	}
+	if sb.Web != nil {
 		raw = append(raw, tools.NativeWebTools()...)
+		raw = append(raw, tools.NativeHTTPTool())
+	}
+	if sb.Browser != nil {
+		raw = append(raw, tools.NativeBrowserTools()...)
 	}
 	out := make([]llm.Tool, 0, len(raw))
 	for _, m := range raw {

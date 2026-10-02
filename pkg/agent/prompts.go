@@ -63,11 +63,10 @@ Tools:
 - finish: {"summary":"what you did"}
 `
 
-// webToolLines are appended to the worker prompt when -web is enabled.
-const webToolLines = `
-- web_search: {"query":"...","max_results":5}  (live web: use for current docs/versions you cannot know locally)
-- web_fetch: {"url":"https://..."}  (fetch one public page as plain text)
-`
+// Tool description lines for optional capabilities are sourced from the
+// tools package (WebDescriptions/HTTPDescriptions/CodeDescriptions/
+// GitDescriptions/BrowserDescriptions) and assembled by
+// Sandbox.DynamicToolDescriptions.
 
 const workerRulesOffline = `
 
@@ -97,11 +96,11 @@ Rules:
 - One action per turn.
 `
 
-// workerSystemFor returns the worker system prompt, including the live web
-// tools only when web is enabled.
-func workerSystemFor(web bool) string {
+// workerSystemFor returns the worker system prompt. Dynamic tool lines are
+// assembled by the caller from the live sandbox (web/git/browser capabilities).
+func workerSystemFor(web bool, dynamicTools string) string {
 	if web {
-		return workerSystemBase + webToolLines + workerRulesWeb
+		return workerSystemBase + dynamicTools + workerRulesWeb
 	}
-	return workerSystemBase + workerRulesOffline
+	return workerSystemBase + dynamicTools + workerRulesOffline
 }

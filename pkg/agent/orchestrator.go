@@ -53,6 +53,13 @@ func New(cfg Config, tree *engine.TaskTree, client llm.Client, log *Logger) (*Or
 		}
 		sandbox.Web = webClient
 	}
+	if cfg.BrowserEnabled {
+		browserClient, berr := tools.NewBrowserClient()
+		if berr != nil {
+			return nil, berr
+		}
+		sandbox.Browser = browserClient
+	}
 	if cfg.GitCommit && !tools.IsRepo(sandbox.Root) {
 		return nil, fmt.Errorf("-git-commit requires %s to be a git repository", sandbox.Root)
 	}
@@ -544,8 +551,9 @@ func (o *Orchestrator) executeLeaf(ctx context.Context, leaf *models.TaskNode) e
 		if err != nil {
 			return err
 		}
-		// Isolated leaves keep the same read-only web capability.
+		// Isolated leaves keep the same read-only capabilities.
 		sb.Web = o.sandbox.Web
+		sb.Browser = o.sandbox.Browser
 		o.log.Infof("isolated %s in %s", leaf.ID, tools.TrimPath(sb.Root))
 	}
 

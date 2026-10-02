@@ -46,6 +46,9 @@ type Config struct {
 	WebEnabled bool
 	SearchURL  string
 
+	// BrowserEnabled enables headless Chrome tools for leaves.
+	BrowserEnabled bool
+
 	GitCommit bool // commit each leaf's merged changes to the workdir git repo
 	Strict    bool // plan mode: fail on plan-check warnings
 

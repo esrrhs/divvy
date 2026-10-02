@@ -45,6 +45,9 @@ type Sandbox struct {
 	// Web, when set, enables outbound web_search/web_fetch. Nil keeps the
 	// sandbox fully offline. Shared across mirror sandboxes (read-only).
 	Web *WebClient
+
+	// Browser, when set, enables headless Chrome tools. Nil disables them.
+	Browser *BrowserClient
 }
 
 // NewSandbox creates a workspace-rooted sandbox. root is created if missing.
