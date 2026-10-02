@@ -232,11 +232,13 @@ func (g *Guider) runLeafInteractive(ctx context.Context, leaf *models.TaskNode) 
 
 		case line, ok := <-g.io.Lines():
 			if !ok {
+				g.unblockAsker("input closed")
 				cancel()
 				<-doneCh
 				return errStdinClosed
 			}
 			if isPause(line) {
+				g.unblockAsker("execution paused by user")
 				cancel()
 				<-doneCh
 				_ = g.o.checkpoint()
@@ -256,22 +258,46 @@ func (g *Guider) runLeafInteractive(ctx context.Context, leaf *models.TaskNode) 
 			select {
 			case ans, ok := <-g.io.Lines():
 				if !ok {
+					g.unblockAsker("input closed")
 					cancel()
 					<-doneCh
 					return errStdinClosed
 				}
 				g.answerCh <- ans
+				if isPause(ans) {
+					// The user paused instead of answering: the answer text was
+					// still delivered so the worker can unwind, then the run
+					// stops and saves.
+					cancel()
+					<-doneCh
+					_ = g.o.checkpoint()
+					g.io.Printf("paused and saved.\n")
+					return ErrPaused
+				}
 			case <-ctx.Done():
+				g.unblockAsker("run interrupted")
 				cancel()
 				<-doneCh
 				return ctx.Err()
 			}
 
 		case <-ctx.Done():
+			g.unblockAsker("run interrupted")
 			cancel()
 			<-doneCh
 			return ctx.Err()
 		}
+	}
+}
+
+// unblockAsker wakes a worker that may be blocked in askHook waiting for an
+// answer, so a canceled leaf can observe its context and exit instead of
+// deadlocking the controller on <-doneCh. It is a no-op when no question is
+// pending.
+func (g *Guider) unblockAsker(reason string) {
+	select {
+	case g.answerCh <- reason + "; do not call ask again, finish with what you have":
+	default:
 	}
 }
 
