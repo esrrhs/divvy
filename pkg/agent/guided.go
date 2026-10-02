@@ -76,6 +76,10 @@ func NewGuider(o *Orchestrator, io GuidedIO) *Guider {
 
 // Run executes the full guided lifecycle.
 func (g *Guider) Run(ctx context.Context) error {
+	// Budget guardrails (-max-cost / -budget-tokens) must apply here too;
+	// without this they silently did nothing in guided runs.
+	ctx = g.o.startBudget(ctx)
+
 	g.o.log.Banner("go_llm_engine (guided)")
 	g.io.Printf("session %s\nmodel   %s\nworkdir %s\ngoal    %s\n",
 		g.o.tree.ID, g.o.cfg.Model, g.o.sandbox.Root, g.o.cfg.Goal)
@@ -95,6 +99,9 @@ func (g *Guider) Run(ctx context.Context) error {
 
 		// ② REVIEW
 		if err := g.review(ctx); err != nil {
+			if err == errStdinClosed {
+				return nil
+			}
 			return err
 		}
 	}
@@ -105,7 +112,13 @@ func (g *Guider) Run(ctx context.Context) error {
 		return <-g.answerCh
 	}
 	g.io.Printf("plan approved — executing\n")
-	return g.execute(ctx)
+	if err := g.execute(ctx); err != nil {
+		if err == errStdinClosed {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 // review shows the plan and waits for approval or adjustments.
@@ -115,7 +128,11 @@ func (g *Guider) review(ctx context.Context) error {
 		select {
 		case line, ok := <-g.io.Lines():
 			if !ok {
-				return nil
+				// EOF means the user went away; it must NOT approve the plan.
+				// Save it unexecuted so nothing starts unattended.
+				_ = g.o.checkpoint()
+				g.io.Printf("input closed — plan saved (not executed); review again with -guided -resume\n")
+				return errStdinClosed
 			}
 			switch {
 			case isApprove(line):
@@ -177,7 +194,9 @@ func (g *Guider) execute(ctx context.Context) error {
 			select {
 			case line, ok := <-g.io.Lines():
 				if !ok {
-					return nil
+					_ = g.o.checkpoint()
+					g.io.Printf("input closed — progress saved; continue with -guided -resume\n")
+					return errStdinClosed
 				}
 				if err := g.handleExecLine(ctx, line); err != nil {
 					if err == ErrPaused {
@@ -197,7 +216,8 @@ func (g *Guider) execute(ctx context.Context) error {
 			}
 			if err == errStdinClosed {
 				_ = g.o.checkpoint()
-				return nil
+				g.io.Printf("input closed — progress saved; continue with -guided -resume\n")
+				return errStdinClosed
 			}
 			if ctx.Err() != nil {
 				return ctx.Err()

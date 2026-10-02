@@ -159,6 +159,11 @@ func run(args []string) error {
 				o.SessionID(), cfg.WorkDir)
 			return nil
 		}
+		if gErr == context.Canceled || gErr == context.DeadlineExceeded {
+			log.Warnf("interrupted. resume the guided flow with:\n  go_llm_engine -guided -resume -session %s -workdir %s",
+				o.SessionID(), cfg.WorkDir)
+			return nil
+		}
 		return gErr
 	}
 
