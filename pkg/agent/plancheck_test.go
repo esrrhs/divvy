@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -155,5 +157,57 @@ func TestOrchestrator_UsageAccumulatesAcrossResume(t *testing.T) {
 	}
 	if n, ok := o3.tree.CloneNode("alpha"); !ok || n.State != models.TaskStateCompleted {
 		t.Fatalf("alpha state after reload: ok=%v node=%+v", ok, n)
+	}
+}
+
+func TestTreeHasEntryPoint_ByProject(t *testing.T) {
+	cases := []struct {
+		name   string
+		marker string
+		output string
+	}{
+		{"go", "go.mod", "main.go"},
+		{"node", "package.json", "server.js"},
+		{"python", "requirements.txt", "app.py"},
+		{"rust", "Cargo.toml", "src/main.rs"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			g, _ := newGuiderWithStub(t)
+			if err := os.WriteFile(filepath.Join(g.o.sandbox.Root, c.marker), []byte("x"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := g.o.tree.AddChild(g.o.tree.RootID, "e", "entry", "desc", models.NodeTypeLeaf); err != nil {
+				t.Fatal(err)
+			}
+			if err := g.o.tree.UpdateNode("e", func(n *models.TaskNode) error {
+				n.Contract.Outputs = []string{c.output}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if !g.o.treeHasEntryPoint() {
+				t.Fatalf("%s entry %q should be recognized", c.name, c.output)
+			}
+		})
+	}
+
+	// A Go project whose only leaf produces a Node-style name is not an
+	// entry point and must still warn.
+	g, _ := newGuiderWithStub(t)
+	if err := os.WriteFile(filepath.Join(g.o.sandbox.Root, "go.mod"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.o.tree.AddChild(g.o.tree.RootID, "e", "entry", "desc", models.NodeTypeLeaf); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.o.tree.UpdateNode("e", func(n *models.TaskNode) error {
+		n.Contract.Outputs = []string{"server.js"}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if g.o.treeHasEntryPoint() {
+		t.Fatal("server.js must not count as a Go entry point")
 	}
 }

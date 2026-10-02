@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 	"unicode"
+
+	"github.com/esrrhs/go_llm_engine/pkg/tools"
 )
 
 func sanitizeID(title string) string {
@@ -72,15 +74,33 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'"'"'`) + "'"
 }
 
-func defaultDoDCommands(outputs []string, hasGoMod bool) []string {
-	cmds := make([]string, 0, len(outputs)+1)
+// pythonCheckCmd byte-compiles every Python file and, unlike compileall's
+// always-zero exit, fails (via py_compile) on syntax errors. It is a no-op
+// when no .py files exist. __pycache__/.git are excluded.
+const pythonCheckCmd = `files=$(find . -name "*.py" -not -path "*/__pycache__/*" -not -path "./.git/*"); test -z "$files" || python3 -m py_compile $files`
+
+func defaultDoDCommands(outputs []string, proj tools.ProjectType) []string {
+	cmds := make([]string, 0, len(outputs)+2)
 	for _, out := range outputs {
 		if looksLikePath(out) {
 			cmds = append(cmds, "test -f "+shellQuote(out))
 		}
 	}
-	if hasGoMod {
+	// Language-level checks. These defaults are deliberately conservative:
+	// they must be present in a normal toolchain and succeed on valid code.
+	// The model's own DoD commands always take precedence over these.
+	switch proj {
+	case tools.ProjectGo:
 		cmds = append(cmds, "go test ./...")
+	case tools.ProjectNode:
+		// --if-present: exit 0 when the package defines no test script,
+		// rather than failing with npm's "no test specified" error.
+		cmds = append(cmds, "npm test --if-present")
+	case tools.ProjectRust:
+		cmds = append(cmds, "cargo test")
+	case tools.ProjectPython:
+		// Syntax check with real non-zero exit on broken code.
+		cmds = append(cmds, pythonCheckCmd)
 	}
 	if len(cmds) == 0 {
 		cmds = []string{"ls"}

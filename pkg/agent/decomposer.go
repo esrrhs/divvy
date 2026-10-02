@@ -3,13 +3,12 @@ package agent
 import (
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/esrrhs/go_llm_engine/pkg/engine"
 	"github.com/esrrhs/go_llm_engine/pkg/llm"
 	"github.com/esrrhs/go_llm_engine/pkg/models"
+	"github.com/esrrhs/go_llm_engine/pkg/tools"
 )
 
 type decomposeResult struct {
@@ -96,6 +95,9 @@ func (o *Orchestrator) decompose(ctx context.Context, node *models.TaskNode) err
 func (o *Orchestrator) decomposeUserPrompt(node *models.TaskNode) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Workspace: %s\n", o.sandbox.Root)
+	if p := o.projectType(); p != tools.ProjectGeneric {
+		fmt.Fprintf(&b, "Detected toolchain: %s — write DoD verification commands for THIS stack (not Go).\n", p)
+	}
 	fmt.Fprintf(&b, "Max subtasks: %d\nMax remaining depth: %d\n\n", o.cfg.MaxSubtasks, o.cfg.MaxDepth-node.Depth)
 	fmt.Fprintf(&b, "Task ID: %s\nTitle: %s\nDescription:\n%s\n\n", node.ID, node.Title, node.Description)
 	b.WriteString("Existing contract:\n")
@@ -135,7 +137,7 @@ func (o *Orchestrator) applyDecompose(node *models.TaskNode, parsed decomposeRes
 	// completes. Persist it on the compound node; give it sane defaults when
 	// the model omitted commands.
 	goalDoD := parsed.DoD
-	ensureGoalDoD(&goalDoD, o.hasGoMod())
+	ensureGoalDoD(&goalDoD, o.projectType())
 	if err := o.tree.UpdateNode(node.ID, func(n *models.TaskNode) error {
 		n.DoD = goalDoD
 		return nil
@@ -160,7 +162,7 @@ func (o *Orchestrator) applyDecompose(node *models.TaskNode, parsed decomposeRes
 		}
 		dod := ch.DoD
 		if nodeType == models.NodeTypeLeaf {
-			ensureDoD(&dod, ch.Contract.Outputs, o.hasGoMod())
+			ensureDoD(&dod, ch.Contract.Outputs, o.projectType())
 		}
 		err = o.tree.UpdateNode(created.ID, func(n *models.TaskNode) error {
 			n.Contract = ch.Contract
@@ -187,7 +189,7 @@ func (o *Orchestrator) applyDecompose(node *models.TaskNode, parsed decomposeRes
 }
 
 func (o *Orchestrator) convertToLeaf(id string, contract models.ContractSpec, dod models.DoD) error {
-	ensureDoD(&dod, contract.Outputs, o.hasGoMod())
+	ensureDoD(&dod, contract.Outputs, o.projectType())
 	if err := o.tree.ConvertToLeaf(id, contract, dod); err != nil {
 		return err
 	}
@@ -200,9 +202,10 @@ func (o *Orchestrator) forceLeaf(node *models.TaskNode) error {
 	return o.convertToLeaf(node.ID, node.Contract, node.DoD)
 }
 
-func (o *Orchestrator) hasGoMod() bool {
-	_, err := os.Stat(filepath.Join(o.sandbox.Root, "go.mod"))
-	return err == nil
+// projectType identifies the workspace toolchain so defaults are generated
+// in the right language.
+func (o *Orchestrator) projectType() tools.ProjectType {
+	return tools.DetectProject(o.sandbox.Root)
 }
 
 func normalizeChildren(raw []decomposeChild, tree *engine.TaskTree, parent *models.TaskNode) ([]decomposeChild, error) {
@@ -275,27 +278,36 @@ func normalizeChildren(raw []decomposeChild, tree *engine.TaskTree, parent *mode
 	return out, nil
 }
 
-func ensureDoD(dod *models.DoD, outputs []string, hasGoMod bool) {
+func ensureDoD(dod *models.DoD, outputs []string, proj tools.ProjectType) {
 	if dod.TimeoutSec <= 0 {
 		dod.TimeoutSec = 60
 	}
 	if len(dod.Commands) == 0 {
-		dod.Commands = defaultDoDCommands(outputs, hasGoMod)
+		dod.Commands = defaultDoDCommands(outputs, proj)
 	}
 }
 
 // ensureGoalDoD fills a compound node's goal-level acceptance DoD. When the
-// model provided no commands, fall back to building the root package
-// ("go build ." fails when no entry package exists, catching a missing
-// integration leaf) plus a whole-tree build.
-func ensureGoalDoD(dod *models.DoD, hasGoMod bool) {
+// model provided no commands, fall back to a toolchain-appropriate build; for
+// Go, "go build ." fails when no entry package exists, catching a missing
+// integration leaf, and a whole-tree build backs it up.
+func ensureGoalDoD(dod *models.DoD, proj tools.ProjectType) {
 	if dod.TimeoutSec <= 0 {
 		dod.TimeoutSec = 120
 	}
 	if len(dod.Commands) == 0 {
-		if hasGoMod {
+		switch proj {
+		case tools.ProjectGo:
 			dod.Commands = []string{"go build .", "go build ./..."}
-		} else {
+		case tools.ProjectNode:
+			// The model's real goal acceptance should start the server and
+			// curl it; as a fallback at least exercise the declared tests.
+			dod.Commands = []string{"npm test --if-present"}
+		case tools.ProjectRust:
+			dod.Commands = []string{"cargo build"}
+		case tools.ProjectPython:
+			dod.Commands = []string{pythonCheckCmd}
+		default:
 			dod.Commands = []string{"ls"}
 		}
 	}

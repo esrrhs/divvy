@@ -89,6 +89,26 @@ export OPENAI_MODEL=qwen2.5-coder:14b
 - 验收失败会把错误**回路由给集成叶子**，它带着错误重新执行并修复装配，指数退避、受 `-max-retries` 约束；若计划里根本没有集成叶子（无法自愈），根直接 `FAILED`，明确提示而不是假装完成。
 - `-plan`/`-strict` 会对这类缺口告警：可运行目标却无入口叶子、无根级验收命令。
 
+### 多语言项目验收
+
+默认 DoD 命令不再只认 Go。引擎会按工作区里的标记文件**自动识别技术栈**（多标记共存时固定优先级），并为叶子和根目标生成对应的验收命令：
+
+| 技术栈 | 识别标记 | 默认叶子验收 | 默认根验收 |
+|---|---|---|---|
+| Go | `go.mod` | `go test ./...` | `go build .` + `go build ./...` |
+| Node.js | `package.json` | `npm test --if-present` | `npm test --if-present` |
+| Rust | `Cargo.toml` | `cargo test` | `cargo build` |
+| Python | `pyproject.toml` / `requirements.txt` / `setup.py` | `python3 -m py_compile` 全量语法检查 | 同左 |
+| Makefile | `Makefile` | 产出文件存在性检查 | `ls` |
+| 通用 | 无标记 | 产出文件存在性检查（无产出则 `ls`） | `ls` |
+
+要点：
+
+- 模型在 DoD 里**显式给出的命令永远优先**，默认值只在它没写命令时兜底；拆解提示中会注入"Detected toolchain: X"，弱模型据此直接产出对应栈的命令。
+- Python 默认用 `py_compile` 做语法检查（`compileall` 即使遇到语法错误也返回退出码 0，不能用于验收）；无 `.py` 文件时该命令自动跳过。
+- Node 用 `--if-present`：包没定义 test 脚本时退出 0，而不是 npm 的 "no test specified" 误报。
+- 没有任何标记的全新空目录仍是"通用"，建议先放入脚手架（`package.json` 等）或直接用 `-plan` 检查默认 DoD 是否合理。
+
 ### 交互式 REPL
 
 除批处理外，`-interactive` 进入多轮交互模式，类似一个简化的终端结对助手：
@@ -200,5 +220,6 @@ go test ./...
 - [x] 阶段 12：集成叶子与根目标验收（强制装配入口、端到端验收通过才 COMPLETED、失败回路由）
 - [x] 阶段 13：交互式 REPL（多轮对话、上下文保留、`/help` `/clear` `/status` `/exit`）
 - [x] 阶段 14：引导式工作流（计划评审与 `/approve` 敲定、执行中 `/add` `/redo` `/pause`、agent `ask` 提问、可 resume）
+- [x] 阶段 15：多语言项目验收（自动探测 Go/Node/Rust/Python/Makefile，按栈生成叶子与根 DoD，模型显式命令优先）
 
 弱模型上的 Prompt 与拆分粒度仍需按具体模型微调（`-max-depth`、`-max-steps`、`-extra`）。

@@ -3,6 +3,8 @@ package agent
 import (
 	"fmt"
 	"strings"
+
+	"github.com/esrrhs/go_llm_engine/pkg/tools"
 )
 
 // planWarnings reviews the planned tree for weak contracts and DoD so that
@@ -64,17 +66,41 @@ func goalIsRunnable(goal string) bool {
 }
 
 // treeHasEntryPoint reports whether any leaf produces an executable entry
-// file (main.go or an otherwise-named main package file ending _main.go).
+// file for the detected toolchain (Go main.go, Node index/server/app/main.js,
+// Python main/app/server.py, Rust main.rs).
 func (o *Orchestrator) treeHasEntryPoint() bool {
+	entryNames := map[tools.ProjectType]map[string]bool{
+		tools.ProjectGo:     setOf("main.go"),
+		tools.ProjectNode:   setOf("index.js", "server.js", "app.js", "main.js"),
+		tools.ProjectPython: setOf("main.py", "app.py", "server.py"),
+		tools.ProjectRust:   setOf("main.rs"),
+	}
+	names := entryNames[o.projectType()]
+	if names == nil {
+		// Unknown/generic: fall back to the Go-style check.
+		names = entryNames[tools.ProjectGo]
+	}
 	for _, leaf := range o.tree.Leaves() {
 		for _, out := range leaf.Contract.Outputs {
 			p := strings.ToLower(strings.TrimSpace(out))
-			if p == "main.go" || strings.HasSuffix(p, "/main.go") {
+			base := p
+			if i := strings.LastIndex(p, "/"); i >= 0 {
+				base = p[i+1:]
+			}
+			if names[base] {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+func setOf(items ...string) map[string]bool {
+	m := make(map[string]bool, len(items))
+	for _, s := range items {
+		m[s] = true
+	}
+	return m
 }
 
 // placeholderDoD reports whether every command is the do-nothing default.

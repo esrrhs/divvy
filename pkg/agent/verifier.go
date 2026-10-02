@@ -21,7 +21,7 @@ type VerifyResult struct {
 func (o *Orchestrator) verify(ctx context.Context, sb *tools.Sandbox, node *models.TaskNode) VerifyResult {
 	cmds := node.DoD.Commands
 	if len(cmds) == 0 {
-		ensureDoD(&node.DoD, node.Contract.Outputs, tools.HasGoMod(sb.Root))
+		ensureDoD(&node.DoD, node.Contract.Outputs, tools.DetectProject(sb.Root))
 		cmds = node.DoD.Commands
 	}
 	timeout := time.Duration(node.DoD.TimeoutSec) * time.Second
