@@ -25,6 +25,9 @@ const (
 	replMaxSummaries = 8
 	// replMaxDispatch bounds how many dispatch rounds one user turn may take.
 	replMaxDispatch = 10
+
+	// usageKindForeman is the usage-tracker kind for outer foreman calls.
+	usageKindForeman = "foreman"
 )
 
 // REPL is the interactive session built as a foreman plus independent leaf
@@ -36,12 +39,7 @@ const (
 type REPL struct {
 	o         *Orchestrator
 	summaries []string
-
-	// Token usage of the outer (foreman) calls; worker usage is tracked on
-	// the orchestrator's usage tracker.
-	prompt   int
-	complete int
-	leaves   int
+	leaves    int
 }
 
 // NewREPL builds an interactive session operating directly in cfg.WorkDir
@@ -114,10 +112,20 @@ func (r *REPL) slash(ctx context.Context, cmd string, term REPLIO) bool {
 	case "/help":
 		term.Printf(replHelp)
 	case "/status":
-		wp, wc := r.o.usage.Total()
-		term.Printf("model:      %s\nworkspace:  %s\nleaf runs:  %d\nforeman:    %d prompt + %d completion tokens\nleaf work:  %d prompt + %d completion tokens\nwork log:   %d compressed turn(s) kept (max %d)\n",
-			r.o.cfg.Model, r.o.sandbox.Root, r.leaves,
-			r.prompt, r.complete, wp, wc, len(r.summaries), replMaxSummaries)
+		total, calls := r.o.usage.Total()
+		term.Printf("model:      %s\nworkspace:  %s\ncalls:      %d    leaf runs: %d    work log: %d turn(s) (max %d)\n",
+			r.o.cfg.Model, r.o.sandbox.Root, calls, r.leaves, len(r.summaries), replMaxSummaries)
+		keys, kinds := r.o.usage.SortedKinds()
+		for _, k := range keys {
+			term.Printf("  %-9s %s\n", k+":", r.o.formatKindUsage(kinds[k]))
+		}
+		term.Printf("total:      %d prompt + %d completion = %d tokens",
+			total.PromptTokens, total.CompletionTokens, total.TotalTokens)
+		if c, ok := r.o.costLabel(total); ok {
+			term.Printf(", est. %s\n", c)
+		} else {
+			term.Printf("\ncost:       no price for this model — pass -pricing '{\"%s\":{\"input\":..,\"output\":..}}'\n", r.o.cfg.Model)
+		}
 	default:
 		term.Printf("unknown command %q — try /help\n", cmd)
 	}
@@ -243,8 +251,9 @@ func (r *REPL) outerChat(ctx context.Context, conv []llm.Message) (string, error
 	if err != nil {
 		return "", fmt.Errorf("foreman request failed: %w", err)
 	}
-	r.prompt += resp.Usage.PromptTokens
-	r.complete += resp.Usage.CompletionTokens
+	// Foreman calls go through the same tracker as leaf workers, so every
+	// call in the session is visible and priced in one place.
+	r.o.usage.Add(usageKindForeman, resp.Usage)
 	return resp.Content, nil
 }
 

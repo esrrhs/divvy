@@ -468,32 +468,56 @@ func (o *Orchestrator) logUsage() {
 	if calls == 0 && saved.Calls == 0 {
 		return
 	}
-	price, priced := o.pricing.PriceFor(o.cfg.Model)
 	if calls > 0 {
-		line := fmt.Sprintf("llm usage (this run): %d calls, prompt %d + completion %d = %d tokens",
-			calls, u.PromptTokens, u.CompletionTokens, u.TotalTokens)
-		if priced {
-			line += ", est. cost " + cost.FormatUSD(price.Cost(u.PromptTokens, u.CompletionTokens))
-		}
-		o.log.Infof("%s", line)
+		o.log.Infof("llm usage (this run): %d calls, %s", calls, o.usageText(u))
 	}
 	if saved.Calls > 0 {
-		line := fmt.Sprintf("llm usage (session total): %d calls, prompt %d + completion %d = %d tokens",
-			saved.Calls, saved.PromptTokens, saved.CompletionTokens, saved.TotalTokens)
-		if priced {
-			line += ", est. cost " + cost.FormatUSD(price.Cost(saved.PromptTokens, saved.CompletionTokens))
+		su := llm.Usage{
+			PromptTokens:     saved.PromptTokens,
+			CompletionTokens: saved.CompletionTokens,
+			TotalTokens:      saved.TotalTokens,
 		}
-		o.log.Infof("%s", line)
+		o.log.Infof("llm usage (session total): %d calls, %s", saved.Calls, o.usageText(su))
 	}
 	if !o.cfg.Verbose {
 		return
 	}
 	keys, kinds := o.usage.SortedKinds()
 	for _, k := range keys {
-		v := kinds[k]
-		o.log.Debugf("  %s: %d prompt + %d completion = %d tokens",
-			k, v.PromptTokens, v.CompletionTokens, v.TotalTokens)
+		o.log.Debugf("  %s: %s", k, o.formatKindUsage(kinds[k]))
 	}
+}
+
+// usageText renders "prompt P + completion C = T tokens" plus estimated cost
+// when a price is known for the configured model.
+func (o *Orchestrator) usageText(u llm.Usage) string {
+	s := fmt.Sprintf("prompt %d + completion %d = %d tokens",
+		u.PromptTokens, u.CompletionTokens, u.TotalTokens)
+	if c, ok := o.costLabel(u); ok {
+		s += ", est. cost " + c
+	}
+	return s
+}
+
+// formatKindUsage renders one per-kind usage line, including estimated cost
+// when the model is priced.
+func (o *Orchestrator) formatKindUsage(u llm.Usage) string {
+	s := fmt.Sprintf("%d prompt + %d completion = %d tokens",
+		u.PromptTokens, u.CompletionTokens, u.TotalTokens)
+	if c, ok := o.costLabel(u); ok {
+		s += ", est. " + c
+	}
+	return s
+}
+
+// costLabel resolves the configured model's price and formats the USD cost
+// of u. Every usage/status view uses this so cost is reported identically.
+func (o *Orchestrator) costLabel(u llm.Usage) (string, bool) {
+	price, ok := o.pricing.PriceFor(o.cfg.Model)
+	if !ok {
+		return "", false
+	}
+	return cost.FormatUSD(price.Cost(u.PromptTokens, u.CompletionTokens)), true
 }
 
 func (o *Orchestrator) executeLeaf(ctx context.Context, leaf *models.TaskNode) error {

@@ -220,3 +220,88 @@ func TestParseForemanTasks(t *testing.T) {
 		t.Fatalf("unexpected titles: %+v", tasks)
 	}
 }
+
+func TestREPL_ForemanTrackedWithLeaf(t *testing.T) {
+	// After a dispatch turn the single tracker carries both the foreman call
+	// and the leaf worker call, under distinct kinds.
+	client := &scriptedClient{responses: []string{
+		`{"thought":"plan","action":"dispatch","args":{"tasks":[{"title":"do","description":"Do the thing"}]}}`,
+		`{"thought":"done","action":"finish","args":{"summary":"did it"}}`,
+		`{"thought":"report","action":"respond","args":{"message":"ok"}}`,
+	}}
+	repl := newTestREPL(t, client) // default model gpt-4o-mini is priced
+	repl.o.cfg.Goal = "go"
+	if err := repl.turn(context.Background(), "go", &scriptedIO{}); err != nil {
+		t.Fatal(err)
+	}
+
+	kinds := repl.o.usage.ByKind()
+	fm, hasFm := kinds[usageKindForeman]
+	_, hasWr := kinds["worker"]
+	if !hasFm || !hasWr {
+		t.Fatalf("expected foreman + worker kinds, got %+v", kinds)
+	}
+	// Two foreman calls (dispatch + respond) = 20/10; one leaf call = 10/5.
+	if fm.PromptTokens != 20 || fm.CompletionTokens != 10 {
+		t.Fatalf("unexpected foreman usage %+v", fm)
+	}
+	total, calls := repl.o.usage.Total()
+	if calls != 3 {
+		t.Fatalf("expected 3 tracked calls (2 foreman + 1 leaf), got %d", calls)
+	}
+	if total.PromptTokens != 30 || total.CompletionTokens != 15 {
+		t.Fatalf("unexpected combined usage %+v", total)
+	}
+}
+
+func TestREPL_StatusShowsCost(t *testing.T) {
+	// Priced model (gpt-4o-mini): /status prints per-kind lines and a total
+	// with an est. dollar figure.
+	client := &scriptedClient{responses: []string{
+		`{"thought":"plan","action":"dispatch","args":{"tasks":[{"title":"do","description":"Do the thing"}]}}`,
+		`{"thought":"done","action":"finish","args":{"summary":"did it"}}`,
+		`{"thought":"report","action":"respond","args":{"message":"ok"}}`,
+	}}
+	repl := newTestREPL(t, client)
+	if err := repl.turn(context.Background(), "go", &scriptedIO{}); err != nil {
+		t.Fatal(err)
+	}
+	mio := &scriptedIO{}
+	repl.slash(context.Background(), "/status", mio)
+	out := mio.out.String()
+
+	if !strings.Contains(out, "foreman:") || !strings.Contains(out, "worker:") {
+		t.Fatalf("per-kind lines missing:\n%s", out)
+	}
+	if !strings.Contains(out, "total:") || !strings.Contains(out, "est. $") {
+		t.Fatalf("total with estimated cost missing:\n%s", out)
+	}
+	// 2 foreman calls (20/10) + 1 leaf call (10/5):
+	// 30 prompt * 0.15/1M + 15 completion * 0.60/1M = $0.000013
+	if !strings.Contains(out, "$0.000013") {
+		t.Fatalf("unexpected cost figure:\n%s", out)
+	}
+}
+
+func TestREPL_StatusNoPriceHint(t *testing.T) {
+	// A model absent from the price table: /status still shows tokens, but
+	// replaces cost with the -pricing hint instead of a fake number.
+	client := &scriptedClient{responses: []string{
+		`{"thought":"answer","action":"respond","args":{"message":"hi"}}`,
+	}}
+	repl := newTestREPL(t, client)
+	repl.o.cfg.Model = "qwen3.8-local:27b"
+	if err := repl.turn(context.Background(), "hello", &scriptedIO{}); err != nil {
+		t.Fatal(err)
+	}
+	mio := &scriptedIO{}
+	repl.slash(context.Background(), "/status", mio)
+	out := mio.out.String()
+
+	if strings.Contains(out, "est. $") {
+		t.Fatal("must not invent a cost for an unpriced model")
+	}
+	if !strings.Contains(out, "no price for this model") || !strings.Contains(out, "-pricing") {
+		t.Fatalf("expected the -pricing hint:\n%s", out)
+	}
+}
