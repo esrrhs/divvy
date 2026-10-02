@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -64,6 +65,8 @@ func run(args []string) error {
 	guided := fs.Bool("guided", false, "human-in-the-loop: plan, review/approve, then execute (mid-run plan edits and questions)")
 	listSessions := fs.Bool("sessions", false, "list saved sessions and exit")
 	status := fs.Bool("status", false, "print saved tree and exit")
+	showLog := fs.Bool("log", false, "print this session's run log and exit (-session or LATEST)")
+	showEvents := fs.Bool("events", false, "print this session's JSONL event stream and exit (-session or LATEST)")
 	verbose := fs.Bool("v", false, "verbose logs (raw model snippets, tool output)")
 
 	if err := fs.Parse(args); err != nil {
@@ -178,6 +181,7 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
+		defer o.Close()
 
 		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer cancel()
@@ -194,6 +198,10 @@ func run(args []string) error {
 			return nil
 		}
 		return gErr
+	}
+
+	if *showLog || *showEvents {
+		return printSessionArtifact(cfg, *showEvents)
 	}
 
 	if *listSessions {
@@ -258,6 +266,7 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
+	defer o.Close()
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -282,6 +291,39 @@ func run(args []string) error {
 	return nil
 }
 
+// printSessionArtifact streams one session's run log (events=false) or JSONL
+// event stream (events=true) to stdout. The session is -session or LATEST.
+func printSessionArtifact(cfg agent.Config, events bool) error {
+	sessionID := cfg.SessionID
+	if sessionID == "" {
+		data, err := os.ReadFile(filepath.Join(cfg.DataDir, "LATEST"))
+		if err != nil {
+			return fmt.Errorf("no -session given and no LATEST pointer in %s", cfg.DataDir)
+		}
+		sessionID = strings.TrimSpace(string(data))
+	}
+
+	var rel, kind string
+	if events {
+		rel = filepath.Join("events", sessionID+".jsonl")
+		kind = "event stream"
+	} else {
+		rel = filepath.Join("logs", sessionID+".log")
+		kind = "run log"
+	}
+	path := filepath.Join(cfg.DataDir, rel)
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("no %s for session %s (%s does not exist); list sessions with -sessions", kind, sessionID, path)
+		}
+		return err
+	}
+	defer f.Close()
+	_, err = io.Copy(os.Stdout, f)
+	return err
+}
+
 const usageText = `go_llm_engine — divide-and-conquer coding agent for small/cheap models
 
 Usage:
@@ -291,6 +333,8 @@ Usage:
   go_llm_engine -guided [flags] <goal>
   go_llm_engine -resume [-session ID]
   go_llm_engine -status [-session ID]
+  go_llm_engine -log [-session ID]     # 查看运行日志（时间戳文本）
+  go_llm_engine -events [-session ID]  # 查看结构化事件流（JSONL，便于 jq/grep）
 
 Examples:
   export OPENAI_API_KEY=sk-...
@@ -310,6 +354,8 @@ Examples:
   go_llm_engine -isolate -workdir ./ws "叶子失败不污染工作区"
   go_llm_engine -resume
   go_llm_engine -status
+  go_llm_engine -log                      # 出问题时回溯最近一次运行
+  go_llm_engine -events | jq 'select(.kind=="verify" and .ok==false)'
 
 Environment:
   OPENAI_API_KEY / LLM_API_KEY

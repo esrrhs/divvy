@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/esrrhs/go_llm_engine/pkg/llm"
 	"github.com/esrrhs/go_llm_engine/pkg/models"
@@ -83,7 +84,13 @@ func (o *Orchestrator) runWorker(ctx context.Context, sb *tools.Sandbox, node *m
 					answer = "No interactive user is available in this run. Make a reasonable assumption and continue; do not call ask again."
 				} else {
 					o.log.Actionf("%s asks: %s", node.ID, question)
+					askStart := time.Now()
 					answer = o.askHook(question)
+					o.events.Record("ask", node.ID, map[string]any{
+						"question":    clip(question, evReasonChars),
+						"answer":      clip(answer, evReasonChars),
+						"duration_ms": time.Since(askStart).Milliseconds(),
+					})
 				}
 				messages = append(messages, llm.Message{
 					Role:    llm.RoleUser,
@@ -92,7 +99,9 @@ func (o *Orchestrator) runWorker(ctx context.Context, sb *tools.Sandbox, node *m
 				continue
 			}
 
+			callStart := time.Now()
 			out, callErr := sb.Call(ctx, act.Name, act.Args)
+			o.events.ToolCall(node.ID, act.Name, act.Args, out, callErr, callStart)
 			if callErr != nil {
 				out = "ERROR: " + callErr.Error()
 				o.log.Warnf("%s", out)

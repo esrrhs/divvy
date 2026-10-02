@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/esrrhs/go_llm_engine/pkg/models"
 )
@@ -75,7 +76,11 @@ func NewGuider(o *Orchestrator, io GuidedIO) *Guider {
 }
 
 // Run executes the full guided lifecycle.
-func (g *Guider) Run(ctx context.Context) error {
+func (g *Guider) Run(ctx context.Context) (runErr error) {
+	runStart := time.Now()
+	g.o.recordSessionStart("guided")
+	defer func() { g.o.recordSessionEnd("guided", runStart, runErr) }()
+
 	// Budget guardrails (-max-cost / -budget-tokens) must apply here too;
 	// without this they silently did nothing in guided runs.
 	ctx = g.o.startBudget(ctx)
@@ -136,13 +141,19 @@ func (g *Guider) review(ctx context.Context) error {
 			}
 			switch {
 			case isApprove(line):
+				g.o.events.Record("plan_review", "", map[string]any{"decision": "approved"})
 				return nil
 			case isAbort(line):
 				g.io.Printf("aborted; plan saved (not executed)\n")
+				g.o.events.Record("plan_review", "", map[string]any{"decision": "aborted"})
 				_ = g.o.checkpoint()
 				return fmt.Errorf("plan aborted by user")
 			default:
 				g.io.Printf("revising plan: %s\n", strings.TrimSpace(line))
+				g.o.events.Record("plan_review", "", map[string]any{
+					"decision": "adjusted",
+					"feedback": clip(strings.TrimSpace(line), evReasonChars),
+				})
 				if err := g.o.replan(ctx, line); err != nil {
 					return err
 				}
@@ -262,6 +273,7 @@ func (g *Guider) runLeafInteractive(ctx context.Context, leaf *models.TaskNode) 
 				cancel()
 				<-doneCh
 				_ = g.o.checkpoint()
+				g.o.events.Record("user_pause", "", map[string]any{"where": "leaf_running"})
 				g.io.Printf("paused and saved.\n")
 				return ErrPaused
 			}
@@ -296,6 +308,7 @@ func (g *Guider) runLeafInteractive(ctx context.Context, leaf *models.TaskNode) 
 					cancel()
 					<-doneCh
 					_ = g.o.checkpoint()
+					g.o.events.Record("user_pause", "", map[string]any{"where": "ask"})
 					g.io.Printf("paused and saved.\n")
 					return ErrPaused
 				}
@@ -333,6 +346,7 @@ func (g *Guider) handleExecLine(ctx context.Context, line string) error {
 	switch {
 	case isPause(line):
 		_ = g.o.checkpoint()
+		g.o.events.Record("user_pause", "", map[string]any{"where": "idle"})
 		return ErrPaused
 	case line == "/plan":
 		// Re-show the current tree so the user can review what remains,

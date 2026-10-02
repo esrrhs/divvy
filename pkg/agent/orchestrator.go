@@ -32,6 +32,10 @@ type Orchestrator struct {
 	cpMu    sync.Mutex
 	mergeMu sync.Mutex
 
+	// Session trace sinks: the human-readable log and the JSONL event stream.
+	logFile *os.File
+	events  *EventRecorder
+
 	// askHook, when set, lets a leaf worker ask the user a question mid-run
 	// and block on the answer. Nil in batch mode; the guided flow sets it.
 	askHook func(question string) string
@@ -75,7 +79,7 @@ func New(cfg Config, tree *engine.TaskTree, client llm.Client, log *Logger) (*Or
 	tree.Goal = cfg.Goal
 	tree.ModelName = cfg.Model
 	tree.PriceFor = pricing.PriceFor
-	return &Orchestrator{
+	o := &Orchestrator{
 		cfg:     cfg,
 		tree:    tree,
 		sched:   engine.NewScheduler(tree),
@@ -85,7 +89,64 @@ func New(cfg Config, tree *engine.TaskTree, client llm.Client, log *Logger) (*Or
 		log:     log,
 		usage:   NewUsageTracker(),
 		pricing: pricing,
-	}, nil
+	}
+	o.openSinks()
+	return o, nil
+}
+
+// openSinks wires the session log file and JSONL event stream under the data
+// directory. Sink problems degrade gracefully: a run must not fail just
+// because its trace cannot be written.
+func (o *Orchestrator) openSinks() {
+	logDir := filepath.Join(o.cfg.DataDir, "logs")
+	if err := os.MkdirAll(logDir, 0755); err == nil {
+		logPath := filepath.Join(logDir, o.tree.ID+".log")
+		if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644); err == nil {
+			o.logFile = f
+			o.log.Tee(f)
+		} else {
+			o.log.Warnf("session log not writable (%s): %v", logPath, err)
+		}
+	} else {
+		o.log.Warnf("session log directory not creatable (%s): %v", logDir, err)
+	}
+
+	evPath := filepath.Join(o.cfg.DataDir, "events", o.tree.ID+".jsonl")
+	if rec, err := NewEventRecorder(evPath); err == nil {
+		o.events = rec
+	} else {
+		o.log.Warnf("event stream not writable (%s): %v", evPath, err)
+	}
+
+	o.sched.OnStateChange = func(id string, old, new models.TaskState, msg string) {
+		f := map[string]any{"from": string(old), "to": string(new)}
+		if strings.TrimSpace(msg) != "" {
+			f["error"] = clip(msg, evReasonChars)
+		}
+		o.events.Record("state_change", id, f)
+	}
+}
+
+// LogPath and EventPath report the on-disk trace locations.
+func (o *Orchestrator) LogPath() string {
+	return filepath.Join(o.cfg.DataDir, "logs", o.tree.ID+".log")
+}
+
+func (o *Orchestrator) EventPath() string {
+	return filepath.Join(o.cfg.DataDir, "events", o.tree.ID+".jsonl")
+}
+
+// Close releases trace files and the shared browser process.
+func (o *Orchestrator) Close() {
+	if o.events != nil {
+		_ = o.events.Close()
+	}
+	if o.logFile != nil {
+		_ = o.logFile.Close()
+	}
+	if o.sandbox != nil && o.sandbox.Browser != nil {
+		o.sandbox.Browser.Close()
+	}
 }
 
 // NewFromGoal starts a fresh session.
@@ -177,7 +238,11 @@ func (o *Orchestrator) parallel() int {
 
 // Run drives the engine until the root completes, fails, or the context is
 // cancelled. Ready leaves run concurrently, bounded by cfg.Parallel.
-func (o *Orchestrator) Run(ctx context.Context) error {
+func (o *Orchestrator) Run(ctx context.Context) (runErr error) {
+	runStart := time.Now()
+	o.recordSessionStart("run")
+	defer func() { o.recordSessionEnd("run", runStart, runErr) }()
+
 	ctx = o.startBudget(ctx)
 	o.log.Banner("go_llm_engine")
 	o.log.Infof("session %s", o.tree.ID)
@@ -348,7 +413,11 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 
 // RunPlan decomposes the goal into a full tree of leaves without executing any
 // of them. The saved session can later be executed with -resume.
-func (o *Orchestrator) RunPlan(ctx context.Context) error {
+func (o *Orchestrator) RunPlan(ctx context.Context) (runErr error) {
+	runStart := time.Now()
+	o.recordSessionStart("plan")
+	defer func() { o.recordSessionEnd("plan", runStart, runErr) }()
+
 	ctx = o.startBudget(ctx)
 	o.log.Banner("go_llm_engine (plan)")
 	o.log.Infof("session %s", o.tree.ID)
@@ -453,7 +522,9 @@ func (o *Orchestrator) replan(ctx context.Context, feedback string) error {
 
 // chat wraps o.llm.Chat and records token usage under a call kind and node.
 func (o *Orchestrator) chat(ctx context.Context, kind, nodeID string, req llm.Request) (*llm.Response, error) {
+	start := time.Now()
 	resp, err := o.llm.Chat(ctx, req)
+	o.events.LLMCall(kind, nodeID, req, resp, start, err)
 	if resp == nil {
 		return resp, err
 	}
@@ -578,11 +649,7 @@ func (o *Orchestrator) executeLeaf(ctx context.Context, leaf *models.TaskNode) e
 			}
 			prevErr = err.Error()
 			o.log.Warnf("worker error: %s", prevErr)
-			_ = o.tree.UpdateNode(leaf.ID, func(n *models.TaskNode) error {
-				n.RetryCount++
-				n.ErrorMsg = prevErr
-				return nil
-			})
+			o.recordNodeError(leaf.ID, prevErr)
 			if err := o.retryOrGiveUp(ctx, leaf, attempt, prevErr); err != nil {
 				return err
 			}
@@ -606,11 +673,7 @@ func (o *Orchestrator) executeLeaf(ctx context.Context, leaf *models.TaskNode) e
 				summary, merr = o.publishLeaf(mirror, leaf, summary)
 				if merr != nil {
 					prevErr = merr.Error()
-					_ = o.tree.UpdateNode(leaf.ID, func(n *models.TaskNode) error {
-						n.RetryCount++
-						n.ErrorMsg = prevErr
-						return nil
-					})
+					o.recordNodeError(leaf.ID, prevErr)
 					o.log.Warnf("publish failed for %s (attempt %d): %v", leaf.ID, attempt, merr)
 					if err := o.retryOrGiveUp(ctx, leaf, attempt, prevErr); err != nil {
 						return err
@@ -634,11 +697,7 @@ func (o *Orchestrator) executeLeaf(ctx context.Context, leaf *models.TaskNode) e
 		}
 
 		prevErr = vr.Output
-		_ = o.tree.UpdateNode(leaf.ID, func(n *models.TaskNode) error {
-			n.RetryCount++
-			n.ErrorMsg = vr.Output
-			return nil
-		})
+		o.recordNodeError(leaf.ID, vr.Output)
 		o.log.Warnf("verification failed for %s (attempt %d)", leaf.ID, attempt)
 		if err := o.retryOrGiveUp(ctx, leaf, attempt, vr.Output); err != nil {
 			return err
@@ -709,6 +768,11 @@ func (o *Orchestrator) retryOrGiveUp(ctx context.Context, leaf *models.TaskNode,
 	_ = o.checkpoint()
 	delay := RetryDelay(attempt, o.cfg.retryMin(), o.cfg.retryMax())
 	o.log.Warnf("retry %s in %s", leaf.ID, delay)
+	o.events.Record("retry", leaf.ID, map[string]any{
+		"attempt":  attempt,
+		"delay_ms": delay.Milliseconds(),
+		"reason":   clip(errMsg, evReasonChars),
+	})
 	if err := waitBackoff(ctx, delay); err != nil {
 		_ = o.sched.UpdateNodeState(leaf.ID, models.TaskStatePending, "interrupted")
 		return err
@@ -723,6 +787,9 @@ func (o *Orchestrator) handleLeafFailure(leaf *models.TaskNode, errMsg string) e
 	}
 	if leaf.DecomposeCount >= o.cfg.MaxRedecompose || leaf.Depth >= o.cfg.MaxDepth {
 		o.log.Errorf("giving up on %s", leaf.ID)
+		o.events.Record("leaf_giveup", leaf.ID, map[string]any{
+			"reason": clip(errMsg, evReasonChars),
+		})
 		if err := o.sched.UpdateNodeState(leaf.ID, models.TaskStateFailed, errMsg); err != nil {
 			return err
 		}
@@ -733,6 +800,9 @@ func (o *Orchestrator) handleLeafFailure(leaf *models.TaskNode, errMsg string) e
 	}
 
 	o.log.Warnf("re-splitting failed leaf %s", leaf.ID)
+	o.events.Record("leaf_resplit", leaf.ID, map[string]any{
+		"reason": clip(errMsg, evReasonChars),
+	})
 	err := o.tree.UpdateNode(leaf.ID, func(n *models.TaskNode) error {
 		n.Type = models.NodeTypeCompound
 		n.State = models.TaskStatePending
@@ -760,6 +830,64 @@ func (o *Orchestrator) checkpoint() error {
 	latest := filepath.Join(o.cfg.DataDir, "LATEST")
 	_ = os.WriteFile(latest, []byte(o.tree.ID+"\n"), 0644)
 	return nil
+}
+
+// recordSessionStart emits the session banner event for every entry mode
+// (run/plan/interactive/guided).
+func (o *Orchestrator) recordSessionStart(mode string) {
+	saved := o.tree.TotalTokenUsage()
+	o.events.Record("session_start", "", map[string]any{
+		"mode":          mode,
+		"goal":          clip(o.cfg.Goal, evReasonChars),
+		"model":         o.cfg.Model,
+		"workdir":       o.sandbox.Root,
+		"parallel":      o.parallel(),
+		"isolate":       o.cfg.Isolate,
+		"native_tools":  o.cfg.NativeTools,
+		"web":           o.cfg.WebEnabled,
+		"browser":       o.cfg.BrowserEnabled,
+		"resume_calls":  saved.Calls,
+		"resume_tokens": saved.TotalTokens,
+	})
+}
+
+// recordSessionEnd closes the session event with an outcome classification.
+func (o *Orchestrator) recordSessionEnd(mode string, start time.Time, err error) {
+	outcome := "completed"
+	fields := map[string]any{
+		"mode":        mode,
+		"duration_ms": time.Since(start).Milliseconds(),
+	}
+	switch {
+	case err == nil:
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		outcome = "interrupted"
+		fields["error"] = clip(err.Error(), evReasonChars)
+	case errors.Is(err, ErrPaused):
+		outcome = "paused"
+	default:
+		outcome = "failed"
+		fields["error"] = clip(err.Error(), evReasonChars)
+	}
+	u, calls := o.usage.Total()
+	fields["outcome"] = outcome
+	fields["calls_this_run"] = calls
+	fields["tokens_this_run"] = u.TotalTokens
+	o.events.Record("session_end", "", fields)
+}
+
+// recordNodeError appends one failed attempt to the node's persistent error
+// history (alongside the retry counter and latest-error message).
+func (o *Orchestrator) recordNodeError(nodeID, msg string) {
+	_ = o.tree.UpdateNode(nodeID, func(n *models.TaskNode) error {
+		n.RetryCount++
+		n.ErrorMsg = msg
+		n.ErrorHistory = append(n.ErrorHistory, models.ErrorRecord{
+			Time:  time.Now(),
+			Error: msg,
+		})
+		return nil
+	})
 }
 
 func (o *Orchestrator) printTree() {

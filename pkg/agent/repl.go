@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/esrrhs/go_llm_engine/pkg/engine"
 	"github.com/esrrhs/go_llm_engine/pkg/llm"
@@ -55,7 +56,12 @@ func NewREPL(cfg Config, client llm.Client) (*REPL, error) {
 
 // Run drives the prompt → foreman/leaf loop until /exit, EOF, or cancellation.
 // If cfg.Goal is set it is executed as the first turn automatically.
-func (r *REPL) Run(ctx context.Context, term REPLIO) error {
+func (r *REPL) Run(ctx context.Context, term REPLIO) (runErr error) {
+	runStart := time.Now()
+	r.o.recordSessionStart("interactive")
+	defer func() { r.o.recordSessionEnd("interactive", runStart, runErr) }()
+	defer r.o.Close()
+
 	term.Printf("go_llm_engine interactive — model %s, workspace %s\n", r.o.cfg.Model, r.o.sandbox.Root)
 	term.Printf("foreman + independent leaf workers; type /help for commands\n")
 
@@ -242,12 +248,19 @@ func (r *REPL) outerChat(ctx context.Context, conv []llm.Message) (string, error
 	}
 	msgs = append(msgs, conv...)
 
+	start := time.Now()
 	resp, err := r.o.llm.Chat(ctx, llm.Request{
 		Model:       r.o.cfg.Model,
 		Messages:    msgs,
 		Temperature: r.o.cfg.Temperature,
 		MaxTokens:   r.o.cfg.MaxTokens,
 	})
+	r.o.events.LLMCall(usageKindForeman, "", llm.Request{
+		Model:       r.o.cfg.Model,
+		Messages:    msgs,
+		Temperature: r.o.cfg.Temperature,
+		MaxTokens:   r.o.cfg.MaxTokens,
+	}, resp, start, err)
 	if err != nil {
 		return "", fmt.Errorf("foreman request failed: %w", err)
 	}

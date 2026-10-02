@@ -14,6 +14,13 @@ type TokenUsage struct {
 	TotalTokens      int `json:"total_tokens,omitempty"`
 }
 
+// ErrorRecord keeps one failed attempt for post-mortem debugging. ErrorMsg
+// only holds the latest failure; ErrorHistory preserves every retry.
+type ErrorRecord struct {
+	Time  time.Time `json:"time"`
+	Error string    `json:"error"`
+}
+
 // TaskNode represents a single unit of goal/work in the decomposition tree.
 type TaskNode struct {
 	ID          string       `json:"id"`
@@ -28,12 +35,13 @@ type TaskNode struct {
 	DoD         DoD          `json:"dod"`
 
 	// Execution & retry tracking
-	RetryCount     int        `json:"retry_count"`
-	MaxRetries     int        `json:"max_retries"`
-	DecomposeCount int        `json:"decompose_count,omitempty"`
-	ErrorMsg       string     `json:"error_msg,omitempty"`
-	ResultSummary  string     `json:"result_summary,omitempty"`
-	TokenUsage     TokenUsage `json:"token_usage"`
+	RetryCount     int           `json:"retry_count"`
+	MaxRetries     int           `json:"max_retries"`
+	DecomposeCount int           `json:"decompose_count,omitempty"`
+	ErrorMsg       string        `json:"error_msg,omitempty"`
+	ErrorHistory   []ErrorRecord `json:"error_history,omitempty"`
+	ResultSummary  string        `json:"result_summary,omitempty"`
+	TokenUsage     TokenUsage    `json:"token_usage"`
 	// IntegrationVerified marks that the goal-level acceptance DoD has passed
 	// for a compound node after all children completed. A COMPLETED compound
 	// without this flag still needs end-to-end verification.

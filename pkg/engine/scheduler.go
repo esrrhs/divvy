@@ -3,14 +3,22 @@ package engine
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/esrrhs/go_llm_engine/pkg/models"
 )
 
+// StateChangeHook is invoked after a node's state actually changes.
+type StateChangeHook func(nodeID string, oldState, newState models.TaskState, errorMsg string)
+
 // Scheduler governs the lifecycle, dependency resolution, and execution sequence of the TaskTree.
 type Scheduler struct {
 	tree *TaskTree
+
+	// OnStateChange, when set, is notified outside the tree lock after every
+	// real state transition (including parent bubbles). Optional.
+	OnStateChange StateChangeHook
 }
 
 // NewScheduler creates a scheduler for the given tree.
@@ -146,12 +154,24 @@ func (s *Scheduler) UpdateNodeState(nodeID string, newState models.TaskState, er
 		return fmt.Errorf("node %s not found", nodeID)
 	}
 
+	oldState := node.State
 	node.State = newState
 	node.ErrorMsg = errorMsg
 	node.UpdatedAt = time.Now()
+	// Terminal failure preserves the error permanently (retries are recorded
+	// by the orchestrator before they re-enter PENDING).
+	if newState == models.TaskStateFailed && strings.TrimSpace(errorMsg) != "" {
+		node.ErrorHistory = append(node.ErrorHistory, models.ErrorRecord{
+			Time:  time.Now(),
+			Error: errorMsg,
+		})
+	}
 	parentID := node.ParentID
 	s.tree.mu.Unlock()
 
+	if oldState != newState && s.OnStateChange != nil {
+		s.OnStateChange(nodeID, oldState, newState, errorMsg)
+	}
 	if parentID != "" {
 		s.checkAndUpdateParent(parentID)
 	}
@@ -175,12 +195,18 @@ func (s *Scheduler) RefreshAncestors(nodeID string) {
 
 // checkAndUpdateParent walks ancestors synchronously and updates their aggregate state.
 func (s *Scheduler) checkAndUpdateParent(parentID string) {
+	type bubble struct {
+		id  string
+		old models.TaskState
+		new models.TaskState
+	}
+	var bubbles []bubble
 	for parentID != "" {
 		s.tree.mu.Lock()
 		parent, exists := s.tree.Nodes[parentID]
 		if !exists || parent.Type != models.NodeTypeCompound || len(parent.ChildrenIDs) == 0 {
 			s.tree.mu.Unlock()
-			return
+			break
 		}
 
 		allSuccess := true
@@ -203,6 +229,7 @@ func (s *Scheduler) checkAndUpdateParent(parentID string) {
 			}
 		}
 
+		old := parent.State
 		switch {
 		case allSuccess:
 			parent.State = models.TaskStateCompleted
@@ -212,9 +239,18 @@ func (s *Scheduler) checkAndUpdateParent(parentID string) {
 			parent.State = models.TaskStateRunning
 		}
 		parent.UpdatedAt = time.Now()
+		if old != parent.State {
+			bubbles = append(bubbles, bubble{id: parent.ID, old: old, new: parent.State})
+		}
 		next := parent.ParentID
 		s.tree.mu.Unlock()
 		parentID = next
+	}
+	// Notify outside the tree lock; one ancestor can re-emit as children move.
+	if s.OnStateChange != nil {
+		for _, b := range bubbles {
+			s.OnStateChange(b.id, b.old, b.new, "")
+		}
 	}
 }
 

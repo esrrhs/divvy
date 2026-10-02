@@ -32,23 +32,44 @@ func (o *Orchestrator) verify(ctx context.Context, sb *tools.Sandbox, node *mode
 	var combined strings.Builder
 	for _, cmd := range cmds {
 		o.log.Actionf("verify: %s", cmd)
+		start := time.Now()
 		res, err := sb.RunBash(ctx, cmd, timeout)
+		duration := time.Since(start).Milliseconds()
 		if err != nil {
 			msg := fmt.Sprintf("command %q failed to start: %v", cmd, err)
 			o.log.Errorf("%s", msg)
+			o.events.Record("verify", node.ID, map[string]any{
+				"command": cmd, "ok": false, "exit_code": -1,
+				"duration_ms": duration, "error": clip(err.Error(), evReasonChars),
+			})
 			return VerifyResult{OK: false, Command: cmd, Output: msg, ExitCode: -1}
 		}
 		fmt.Fprintf(&combined, "$ %s\nexit %d\n%s\n%s\n", cmd, res.ExitCode, res.Stdout, res.Stderr)
 		if res.TimedOut {
 			msg := combined.String() + "timed out\n"
 			o.log.Errorf("verify timeout: %s", cmd)
+			o.events.Record("verify", node.ID, map[string]any{
+				"command": cmd, "ok": false, "exit_code": res.ExitCode,
+				"timed_out":   true,
+				"duration_ms": duration,
+				"output_tail": tailClip(combined.String(), evVerifyTail),
+			})
 			return VerifyResult{OK: false, Command: cmd, Output: msg, ExitCode: -1}
 		}
 		if res.ExitCode != 0 {
 			o.log.Errorf("verify failed: %s (exit %d)", cmd, res.ExitCode)
+			o.events.Record("verify", node.ID, map[string]any{
+				"command": cmd, "ok": false, "exit_code": res.ExitCode,
+				"duration_ms": duration,
+				"output_tail": tailClip(combined.String(), evVerifyTail),
+			})
 			return VerifyResult{OK: false, Command: cmd, Output: combined.String(), ExitCode: res.ExitCode}
 		}
 		o.log.Okf("verify passed: %s", cmd)
+		o.events.Record("verify", node.ID, map[string]any{
+			"command": cmd, "ok": true, "exit_code": 0,
+			"duration_ms": duration,
+		})
 	}
 	// expected_output is a DoD-level assertion: it only has to appear in the
 	// combined output of all commands (a quiet build followed by a verbose
@@ -65,10 +86,19 @@ func (o *Orchestrator) verify(ctx context.Context, sb *tools.Sandbox, node *mode
 			// of failing on an unmatchable sentence.
 			if looksLikeExpectationPhrase(want, blob) {
 				o.log.Warnf("expected_output %q reads like a description, not printed text; trusting exit codes", want)
+				o.events.Record("verify", node.ID, map[string]any{
+					"ok": true, "expected_output": clip(want, 300),
+					"note": "phrase-like expectation, trusted exit codes",
+				})
 				return VerifyResult{OK: true, Output: combined.String()}
 			}
 			msg := blob + fmt.Sprintf("expected output %q not found\n", want)
 			o.log.Errorf("verify output mismatch: expected %q", want)
+			o.events.Record("verify", node.ID, map[string]any{
+				"ok": false, "command": cmds[len(cmds)-1],
+				"expected_output": clip(want, 300),
+				"output_tail":     tailClip(blob, evVerifyTail),
+			})
 			return VerifyResult{OK: false, Command: cmds[len(cmds)-1], Output: msg}
 		}
 	}
