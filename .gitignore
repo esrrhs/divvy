@@ -6,6 +6,8 @@ bin/
 
 # Local session storage
 .divvy/
+# legacy data-dir name from before the project rename
+.go_llm_engine/
 
 # Local workspaces
 ws/
