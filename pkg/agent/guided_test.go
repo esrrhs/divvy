@@ -2,7 +2,9 @@ package agent
 
 import (
 	"context"
+	"io"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -577,5 +579,84 @@ func TestGuidedRun_BudgetTokensCancels(t *testing.T) {
 	}
 	if client.calls < 1 {
 		t.Fatal("pending leaf should have been attempted")
+	}
+}
+
+// lockedWriter is a goroutine-safe io.Writer for tests: the leaf goroutine
+// (worker logs) and the controller (printTree) can write concurrently.
+type lockedWriter struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (w *lockedWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.Write(p)
+}
+
+func (w *lockedWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.String()
+}
+
+func TestHandleExecLine_PlanShowsTree(t *testing.T) {
+	// /plan re-prints the current tree without changing any state.
+	g, _ := newGuiderWithStub(t)
+	var out lockedWriter
+	g.o.log = &Logger{out: &out, err: io.Discard, color: false, verbose: false}
+
+	if _, err := g.o.tree.AddChild(g.o.tree.RootID, "1.1", "A", "desc", models.NodeTypeLeaf); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := g.handleExecLine(context.Background(), "/plan"); err != nil {
+		t.Fatalf("/plan should not error, got %v", err)
+	}
+	if !strings.Contains(out.String(), "1.1") {
+		t.Fatalf("/plan output should include the leaf id:\n%s", out.String())
+	}
+	n, _ := g.o.tree.CloneNode("1.1")
+	if n.State != models.TaskStatePending {
+		t.Fatalf("/plan must not change state, got %s", n.State)
+	}
+}
+
+func TestRunLeafInteractive_PlanDuringLeaf(t *testing.T) {
+	// /plan typed while the leaf is blocked in a model call prints
+	// immediately and is never queued; the leaf can then be paused normally.
+	g, _ := newGuiderWithStub(t)
+	var out lockedWriter
+	g.o.log = &Logger{out: &out, err: io.Discard, color: false, verbose: false}
+
+	if _, err := g.o.tree.AddChild(g.o.tree.RootID, "1.1", "long leaf", "desc", models.NodeTypeLeaf); err != nil {
+		t.Fatal(err)
+	}
+	leaf, _ := g.o.tree.CloneNode("1.1")
+
+	bc := &blockingClient{started: make(chan struct{}, 1)}
+	g.o.llm = bc
+
+	done := make(chan error, 1)
+	go func() { done <- g.runLeafInteractive(context.Background(), leaf) }()
+
+	<-bc.started
+	g.io.(*chanGuided).ch <- "/plan"
+	// Give the controller time to process /plan (it prints synchronously
+	// before re-entering the select).
+	time.Sleep(100 * time.Millisecond)
+	if !strings.Contains(out.String(), "1.1") {
+		t.Fatalf("/plan should print the tree during the leaf:\n%s", out.String())
+	}
+
+	g.io.(*chanGuided).ch <- "/pause"
+	select {
+	case err := <-done:
+		if err != ErrPaused {
+			t.Fatalf("expected ErrPaused, got %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("leaf did not pause after /plan then /pause")
 	}
 }

@@ -93,9 +93,10 @@ export OPENAI_MODEL=qwen2.5-coder:14b
 
 除批处理外，`-interactive` 进入多轮交互模式，类似一个简化的终端结对助手：
 
-- 持续对话：输入需求，模型直接用同一套工具在工作区操作，回复后回到提示符；**多轮之间保留完整上下文**，可以继续说"再加一个…"、"把那个改成…"。
+- 持续对话：输入需求，模型直接用同一套工具在工作区操作，回复后回到提示符；**多轮之间保留对话上下文**，可以继续说"再加一个…"、"把那个改成…"（超长会话自动裁剪，见下）。
 - 模型每一步工具调用会显示 `-> <tool>`，完成后给出回复；需求不明确时它会用回复向你提问，而不是盲目执行。
-- 斜杠命令：`/help`、`/clear`（清空对话、不动文件）、`/status`（模型/工作区/消息数/token 用量）、`/exit`（或 Ctrl-D）。
+- 斜杠命令：`/help`、`/clear`（清空对话、不动文件）、`/status`（模型/工作区/消息数/token 用量/裁剪情况）、`/exit`（或 Ctrl-D）。
+- 长会话会自动裁剪：保留第一条需求与最近 40 条消息，超出的中间历史丢弃（`/status` 可见），避免越聊越慢、越聊越贵。
 
 ```bash
 go build -o go_llm_engine ./cmd/engine
@@ -114,7 +115,7 @@ go build -o go_llm_engine ./cmd/engine
                      ← /approve 敲定、/abort 放弃
                 → 执行（每步显示进度）
                      ├─ agent 用 ask 向你提问，你回答后继续
-                     └─ 你可 /add 加叶子、/redo <id> 重做、/pause 暂停保存
+                     └─ 你可 /add 加叶子、/redo <id> 重做、/plan 看全貌、/pause 暂停保存
                 → 根目标端到端验收 → 完成
 ```
 
@@ -123,6 +124,7 @@ go build -o go_llm_engine ./cmd/engine
 - `/add <说明>`：把新需求作为叶子加入，根回到未完成、随后执行它；也可在"无叶子可跑"时直接输入说明。
 - `/redo <id>`：把指定节点重置为待执行。
 - `/pause`：安全停下并保存任务树，用 `-guided -resume -session <id>` 继续（已开工的会话恢复时跳过评审直接执行）。
+- `/plan`：随时重新打印当前任务树，查看还剩什么，不影响执行。
 
 ```bash
 ./go_llm_engine -guided -isolate -git-commit \

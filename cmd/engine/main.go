@@ -115,6 +115,10 @@ func run(args []string) error {
 
 	log := agent.NewLogger(cfg.Verbose)
 
+	if *interactive && *guided {
+		return fmt.Errorf("-interactive and -guided are mutually exclusive; choose one")
+	}
+
 	if *interactive {
 		if cfg.RequiresAPIKey() && cfg.APIKey == "" {
 			return fmt.Errorf("missing API key: set OPENAI_API_KEY or pass -api-key")

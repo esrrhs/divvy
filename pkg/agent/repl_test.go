@@ -194,3 +194,51 @@ func TestREPL_ToolErrorFedBack(t *testing.T) {
 		t.Fatalf("error should be fed back for a second call, got %d", client.calls)
 	}
 }
+
+func TestREPL_TrimMsgs(t *testing.T) {
+	repl := newTestREPL(t, &scriptedClient{responses: []string{`{"action":"respond","args":{"message":"x"}}`}})
+	for i := 0; i < 50; i++ {
+		repl.msgs = append(repl.msgs, llm.Message{Role: llm.RoleUser, Content: fmt.Sprintf("msg-%d", i)})
+	}
+
+	repl.trimMsgs()
+
+	if len(repl.msgs) != replMaxMsgs {
+		t.Fatalf("expected %d messages after trim, got %d", replMaxMsgs, len(repl.msgs))
+	}
+	if repl.msgs[0].Content != "msg-0" {
+		t.Fatal("the first message (original intent) must always be kept")
+	}
+	if repl.msgs[len(repl.msgs)-1].Content != "msg-49" {
+		t.Fatal("the most recent tail must be kept")
+	}
+	for _, m := range repl.msgs {
+		if m.Content == "msg-10" {
+			t.Fatal("a middle message should have been dropped")
+		}
+	}
+	if repl.trimmed != 10 {
+		t.Fatalf("expected trimmed counter 10, got %d", repl.trimmed)
+	}
+
+	// Within the window, another trim is a no-op.
+	repl.trimMsgs()
+	if repl.trimmed != 10 || len(repl.msgs) != replMaxMsgs {
+		t.Fatal("repeated trim within the window must change nothing")
+	}
+}
+
+func TestREPL_StatusShowsTrimmed(t *testing.T) {
+	repl := newTestREPL(t, &scriptedClient{responses: []string{`{"action":"respond","args":{"message":"x"}}`}})
+	for i := 0; i < 50; i++ {
+		repl.msgs = append(repl.msgs, llm.Message{Role: llm.RoleUser, Content: fmt.Sprintf("msg-%d", i)})
+	}
+	repl.trimMsgs()
+
+	mio := &scriptedIO{}
+	repl.slash(context.Background(), "/status", mio)
+	out := mio.out.String()
+	if !strings.Contains(out, "trimmed:") || !strings.Contains(out, "10") {
+		t.Fatalf("/status should report the trimmed count:\n%s", out)
+	}
+}

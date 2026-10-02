@@ -18,6 +18,10 @@ type REPLIO interface {
 	Printf(format string, a ...any)
 }
 
+// replMaxMsgs bounds the conversation carried per request. The first user
+// message is always retained (original intent), plus the most recent tail.
+const replMaxMsgs = 40
+
 // REPL is the interactive coding session. Unlike the batch orchestrator it
 // keeps a live conversation across turns; the model drives the same workspace
 // tools and returns control to the user after each reply.
@@ -29,6 +33,7 @@ type REPL struct {
 	msgs     []llm.Message
 	prompt   int
 	complete int
+	trimmed  int
 }
 
 // NewREPL builds an interactive session operating directly in cfg.WorkDir
@@ -101,12 +106,17 @@ func (r *REPL) slash(ctx context.Context, cmd string, term REPLIO) bool {
 		return true
 	case "/clear":
 		r.msgs = nil
+		r.trimmed = 0
 		term.Printf("conversation cleared (workspace untouched)\n")
 	case "/help":
 		term.Printf(replHelp)
 	case "/status":
 		term.Printf("model:      %s\nworkspace:  %s\nmessages:   %d\ntokens:     %d prompt + %d completion\n",
 			r.cfg.Model, r.sandbox.Root, len(r.msgs), r.prompt, r.complete)
+		if r.trimmed > 0 {
+			term.Printf("trimmed:    %d older message(s) dropped; window is %d (first request always kept)\n",
+				r.trimmed, replMaxMsgs)
+		}
 	default:
 		term.Printf("unknown command %q — try /help\n", cmd)
 	}
@@ -117,6 +127,10 @@ func (r *REPL) slash(ctx context.Context, cmd string, term REPLIO) bool {
 // execute tool actions, feed results back, until the model emits a "respond"
 // (its reply to the user) or the per-turn step limit is reached.
 func (r *REPL) turn(ctx context.Context, userText string, term REPLIO) error {
+	// Keep the live history bounded once this turn finishes (or aborts), so a
+	// long session does not resend every old message on every later request.
+	defer r.trimMsgs()
+
 	r.msgs = append(r.msgs, llm.Message{Role: llm.RoleUser, Content: userText})
 
 	maxSteps := r.cfg.MaxSteps
@@ -187,6 +201,21 @@ func (r *REPL) turn(ctx context.Context, userText string, term REPLIO) error {
 func (r *REPL) addUsage(u llm.Usage) {
 	r.prompt += u.PromptTokens
 	r.complete += u.CompletionTokens
+}
+
+// trimMsgs drops the middle of the conversation when it exceeds the window,
+// keeping the first user message (original intent) and the most recent tail.
+func (r *REPL) trimMsgs() {
+	if len(r.msgs) <= replMaxMsgs {
+		return
+	}
+	const head = 1
+	tail := replMaxMsgs - head
+	out := make([]llm.Message, 0, replMaxMsgs)
+	out = append(out, r.msgs[:head]...)
+	out = append(out, r.msgs[len(r.msgs)-tail:]...)
+	r.trimmed += len(r.msgs) - len(out)
+	r.msgs = out
 }
 
 func replyText(a *llm.Action) string {

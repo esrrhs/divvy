@@ -265,6 +265,11 @@ func (g *Guider) runLeafInteractive(ctx context.Context, leaf *models.TaskNode) 
 				g.io.Printf("paused and saved.\n")
 				return ErrPaused
 			}
+			if strings.TrimSpace(line) == "/plan" {
+				// View-only; print the current tree right away, do not queue.
+				g.o.printTree()
+				continue
+			}
 			// Queue plan edits and plain notes; they apply after the leaf.
 			queued = append(queued, line)
 			if isPlanEdit(line) {
@@ -329,6 +334,11 @@ func (g *Guider) handleExecLine(ctx context.Context, line string) error {
 	case isPause(line):
 		_ = g.o.checkpoint()
 		return ErrPaused
+	case line == "/plan":
+		// Re-show the current tree so the user can review what remains,
+		// without changing the execution flow.
+		g.o.printTree()
+		return nil
 	case strings.HasPrefix(line, "/redo "):
 		id := strings.TrimSpace(strings.TrimPrefix(line, "/redo"))
 		g.io.Printf("resetting %s\n", id)
@@ -337,7 +347,7 @@ func (g *Guider) handleExecLine(ctx context.Context, line string) error {
 		instruction := strings.TrimSpace(strings.TrimPrefix(line, "/add"))
 		return g.addLeaf(ctx, instruction)
 	case strings.HasPrefix(line, "/"):
-		return fmt.Errorf("unknown command %q (available: /add, /redo, /pause)", line)
+		return fmt.Errorf("unknown command %q (available: /add, /redo, /pause, /plan)", line)
 	default:
 		// Free text during a no-leaf-ready prompt: treat as a new leaf.
 		return g.addLeaf(ctx, line)
