@@ -4,21 +4,41 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
-// TestBrowserClient returns a real headless browser; skipped if no Chrome.
+// The browser tests share one Chrome process: launching Chrome is expensive
+// (and flaky on cold CI starts), so a single warm browser serves all tests.
+var (
+	sharedBrowserOnce sync.Once
+	sharedBrowser     *BrowserClient
+	sharedBrowserErr  error
+)
+
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if sharedBrowser != nil {
+		sharedBrowser.Close()
+	}
+	os.Exit(code)
+}
+
+// TestBrowserClient returns a shared real headless browser; skipped if no
+// Chrome. The browser launches lazily on the first action.
 func testBrowserClient(t *testing.T) *BrowserClient {
 	t.Helper()
-	b, err := NewBrowserClient()
-	if err != nil {
-		t.Skipf("headless chrome unavailable: %v", err)
+	sharedBrowserOnce.Do(func() {
+		sharedBrowser, sharedBrowserErr = NewBrowserClient()
+	})
+	if sharedBrowserErr != nil {
+		t.Skipf("headless chrome unavailable: %v", sharedBrowserErr)
 	}
-	t.Cleanup(b.Close)
-	return b
+	return sharedBrowser
 }
 
 func TestBrowser_NavigateJavaScript(t *testing.T) {

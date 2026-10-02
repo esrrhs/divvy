@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/chromedp/chromedp"
 )
@@ -33,6 +34,12 @@ func NewBrowserClient() (*BrowserClient, error) {
 		chromedp.Flag("headless", true),
 		chromedp.Flag("disable-gpu", true),
 		chromedp.Flag("no-sandbox", true),
+		// /dev/shm is tiny (64MB) on container/CI runners, which makes
+		// Chrome hang during startup; use a temp dir for shared memory.
+		chromedp.Flag("disable-dev-shm-usage", true),
+		// Cold starts on busy CI runners can take longer than chromedp's
+		// 20s default, surfacing as "websocket url timeout reached".
+		chromedp.WSURLReadTimeout(60*time.Second),
 	)
 	allocCtx, allocCancel := chromedp.NewExecAllocator(context.Background(), opts...)
 	return &BrowserClient{allocCancel: allocCancel, ctx: allocCtx}, nil
