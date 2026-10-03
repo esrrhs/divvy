@@ -58,6 +58,10 @@ Tools:
 - write_file: {"path":"file.go","content":"full file contents"}
 - replace_lines: {"path":"file.go","start_line":1,"end_line":3,"content":"replacement"}
   or {"path":"file.go","old_string":"exact old text","new_string":"exact new text"}
+  or {"path":"file.go","edits":[{"old_string":"a","new_string":"b"},{"old_string":"c","new_string":"d"}]}
+  (edits are atomic: if any old_string is missing or ambiguous, NOTHING changes)
+- delete_path: {"path":"old.go","recursive":false}  (recursive:true is required for directories)
+- move_path: {"from":"old.go","to":"new.go"}  (rename/move inside the workspace)
 - run_bash: {"command":"go test ./...","timeout_sec":120}
   timeout_sec optional, default 60; raise it for slow installs/builds.
 - search_files: {"pattern":"func Add","glob":"*.go"}  (regex over file CONTENTS; use it to locate code instead of reading many files)

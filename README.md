@@ -68,8 +68,8 @@ export OPENAI_MODEL=qwen2.5-coder:14b
 ```
 根目标
   └─ Decomposer 输出 JSON（原子？或 2~6 个子任务 + 契约 + 验收命令）
-        └─ 叶子 Worker：干净上下文 + 7 个工具
-              list_dir / read_file / write_file / replace_lines / run_bash / search_files / find_files
+        └─ 叶子 Worker：干净上下文 + 9 个基础工具
+              list_dir / read_file / write_file / replace_lines / delete_path / move_path / run_bash / search_files / find_files
               └─ Verifier 跑 DoD 命令（如 go test ./...）
                     ├─ 通过 → 向上冒泡 COMPLETED
                     └─ 失败 → 新的隔离上下文重试（带上错误，指数退避，上限 30s，默认无限次）
@@ -78,6 +78,8 @@ export OPENAI_MODEL=qwen2.5-coder:14b
 叶子执行**不携带**其它叶子的对话历史，只注入：当前任务、契约、父节点/依赖摘要、少量相关文件、验收命令。
 `search_files` 用正则搜索文件内容并返回紧凑的 `相对路径:行号:匹配行`：修改现有代码时，弱模型用它一次定位符号，不必逐个读整个文件，省步骤也省上下文（自动跳过 `.git` 等目录，可用 `glob` 过滤，默认忽略大小写）。`find_files` 则按文件名 glob 查找（`*_test.go` 裸模式按 basename 递归匹配任意深度，`pkg/*.go` 按相对路径匹配），返回路径列表。
 `read_file` 支持可选的 `start_line`/`end_line`（1-indexed、含端点，返回带行号的片段）：配合 `search_files` 的行号只读目标区段，大文件也能直接跳到 64KB 整读截断点之后，无需在 shell 里拼 `sed`。`run_bash` 支持 `timeout_sec`（默认 60s），跑 `npm install`、`cargo build` 这类慢命令时显式放大超时。
+`replace_lines` 除行号区间和单点 `old_string`/`new_string` 外，还接受 `edits: [{old_string,new_string}…]` **批量原子编辑**：所有锚点先在内存里逐条校验（缺失或不唯一即整体失败、文件一字节都不改），全部通过后才一次写回——同一文件改多处不必串行多轮，也不会留下半改状态，用文本锚点还能避开行号漂移。`delete_path`（删目录必须显式 `recursive:true`，工作区根目录受保护）和 `move_path`（工作区内重命名/移动，禁止移入自身子树）让删除和重命名走沙箱校验，不用再借 `run_bash` 拼 `rm`/`mv`。
+Go 工作区验收失败时，Verifier 会从输出里抽取去重、单行截断的 `file:line: message` 编译/测试诊断（含 `--- FAIL`/`panic` 状态行，最多 25 行）作为**诊断块前置**到错误全文之前；重试叶子只截取错误前缀注入上下文（4000 字符），根因因此一定在最显眼的位置，原始日志完整附在块后。
 没有依赖关系的就绪叶子可以并发执行（`-parallel N`，默认 `1`）；每次 LLM 调用的 token 用量按节点记入任务树并随会话持久化，运行结束打印本次与会话累计（resume 后自动累加），树状进度与 `-status` 里也会显示每个节点的消耗。
 
 开启隔离（`-isolate`，`-parallel >1` 时自动生效）后，叶子在主工作区的**临时镜像副本**里写代码、跑验收命令：
@@ -114,10 +116,11 @@ export OPENAI_MODEL=qwen2.5-coder:14b
 
 ### 联网搜索与抓取
 
-默认完全离线；加上 `-web` 后叶子获得两个网络工具，用于查询模型自身无法获知的最新文档/版本：
+默认完全离线；加上 `-web` 后叶子获得三个网络工具，用于查询模型自身无法获知的最新文档/版本，以及下载交付所需的文件：
 
 - `web_search`：`{"query":"...","max_results":5}` → 编号结果（标题/URL/摘要）。
 - `web_fetch`：`{"url":"https://..."}` → 抓取单个页面，**HTML 自动转成纯文本**（剥离 script/style），文本/JSON/XML 原样返回。
+- `download_file`：`{"url":"https://...","path":"assets/x.bin"}` → 把 URL 内容**按字节**存入工作区文件（web_fetch 只回文本，下载图片/压缩包/二进制用它），返回字节数与 content-type；200 以外状态码报错，**失败时自动删除半成品文件**，20MB 硬上限（超限拒绝而非静默截断）。
 
 ```bash
 ./divvy -web -workdir ./ws "查一下 X 的最新 API，写一个调用示例"
@@ -128,7 +131,7 @@ export OPENAI_MODEL=qwen2.5-coder:14b
 - 留空：内置 **DuckDuckGo lite**，无需 API Key（仅解析公开 HTML，可能被网络策略拦截）。
 - **SearXNG**：`-search-url 'http://host/search?q={query}&format=json'`，走 JSON，适合自建稳定检索。
 
-安全约束（web_fetch 与每一跳重定向都会执行）：只允许 http/https；目标域名解析后若指向回环/私网/链路本地/CGNAT 等非公开地址一律拒绝；只允许 80/443；重定向到内网同样拦截。因此 agent 无法借抓取访问本机或内网服务。
+安全约束（web_fetch、download_file 与每一跳重定向都会执行）：只允许 http/https；目标域名解析后若指向回环/私网/链路本地/CGNAT 等非公开地址一律拒绝；只允许 80/443；重定向到内网同样拦截。因此 agent 无法借抓取或下载访问本机或内网服务。
 
 ### 浏览器、HTTP、Git、代码理解工具
 
@@ -148,11 +151,13 @@ export OPENAI_MODEL=qwen2.5-coder:14b
 **Git 只读工具（工作区为 git 仓库时）**
 
 - `git_status`、`git_diff`（可选 `staged`/`path`）、`git_log`（可选 `limit`/`path`）；均为只读，不改动仓库。
+- `review_diff`（可选 `staged`）：finish 前的**确定性自检**，解析 `git diff --unified=0` 只检查新增行——未解决的冲突标记（`<<<<<<<`/`=======`/`>>>>>>>`）、误留的调试语句（`fmt.Print*`、`println`、`console.log`、`debugger`、`pdb.set_trace`、`breakpoint`）、高置信硬编码密钥（私钥头、`AKIA…`、Slack token、带引号字面量的 `token/password/secret/api_key`），以及超过 600 行的大 diff 告警；每类最多列 10 条并提示省略数。干净时返回 `review_diff: clean (...)`，未跟踪文件不在 diff 内。
 
 **代码/数据理解（默认可用）**
 
-- `find_symbol`：按名字定位定义——**Go 走真实 AST**（func/type/var 精确到行），其它语言回退正则；
+- `find_symbol`：按名字定位定义——**Go 走真实 AST**（func/type/var 精确到行），其它语言回退正则；加 `references:true` 则做**文本级引用扫描**（词边界匹配、过滤函数/类型/变量声明行，复用 `search_files` 的输出形态；不做类型分析，注释和字符串里的同名提及也会出现，别名/动态调用会漏掉），改签名前先看谁在用；
 - `json_query`：用点号/方括号路径（`items.0.name`、`items[0].name`）从大 JSON 里抽单个值，避免整文件进上下文。
+- `sqlite_query`：`{"path":"data.db","query":"SELECT ...","limit":50}` 对工作区内的 SQLite 数据库跑**只读**查询（`mode=ro` + `query_only`，只接受单条 SELECT/WITH/PRAGMA/EXPLAIN，带分号的多语句直接拒绝）；返回 `columns:` 头加每行一个 JSON 数组，NULL 正常显示、BLOB 标注字节数、单元格超 500 字符截断，默认 50 行（上限 200）。使用**纯 Go 驱动** [modernc.org/sqlite](https://pkg.go.dev/modernc.org/sqlite)，无需 cgo 或本机 sqlite3 CLI——弱模型不必再拼命令行、也不会因环境缺工具而失败。
 
 ### 交互式 REPL（工头 + 独立叶子）
 
@@ -278,5 +283,8 @@ go test ./...
 - [x] 阶段 15：多语言项目验收（自动探测 Go/Node/Rust/Python/Makefile，按栈生成叶子与根 DoD，模型显式命令优先）
 - [x] 阶段 16：联网搜索与抓取（`-web` 开启 web_search/web_fetch、HTML 转文本、可配 DuckDuckGo/SearXNG、非公开地址与端口拦截）
 - [x] 阶段 17：扩展工具集（`-browser` headless Chrome、http_request、只读 git_status/diff/log、Go AST find_symbol、json_query）
+- [x] 阶段 18：原子多点编辑与文件原语（replace_lines 的 edits 批量、delete_path、move_path）、Go 验收失败诊断块前置
+- [x] 阶段 19：引用查找（find_symbol references 文本级用法扫描）与 finish 前确定性自检 review_diff（冲突标记/调试残留/密钥/大 diff）
+- [x] 阶段 20：二进制下载 download_file（`-web` 门控、SSRF 防护复用、20MB 上限、失败清理）与只读 sqlite_query（纯 Go modernc 驱动、mode=ro/query_only、结果集压缩）
 
 弱模型上的 Prompt 与拆分粒度仍需按具体模型微调（`-max-depth`、`-max-steps`、`-extra`）。

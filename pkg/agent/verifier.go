@@ -46,7 +46,7 @@ func (o *Orchestrator) verify(ctx context.Context, sb *tools.Sandbox, node *mode
 		}
 		fmt.Fprintf(&combined, "$ %s\nexit %d\n%s\n%s\n", cmd, res.ExitCode, res.Stdout, res.Stderr)
 		if res.TimedOut {
-			msg := combined.String() + "timed out\n"
+			msg := o.withDiagnostics(sb, combined.String()+"timed out\n")
 			o.log.Errorf("verify timeout: %s", cmd)
 			o.events.Record("verify", node.ID, map[string]any{
 				"command": cmd, "ok": false, "exit_code": res.ExitCode,
@@ -63,7 +63,7 @@ func (o *Orchestrator) verify(ctx context.Context, sb *tools.Sandbox, node *mode
 				"duration_ms": duration,
 				"output_tail": tailClip(combined.String(), evVerifyTail),
 			})
-			return VerifyResult{OK: false, Command: cmd, Output: combined.String(), ExitCode: res.ExitCode}
+			return VerifyResult{OK: false, Command: cmd, Output: o.withDiagnostics(sb, combined.String()), ExitCode: res.ExitCode}
 		}
 		o.log.Okf("verify passed: %s", cmd)
 		o.events.Record("verify", node.ID, map[string]any{
@@ -148,4 +148,15 @@ func commandOutputEmpty(blob string) bool {
 		}
 	}
 	return true
+}
+
+// withDiagnostics prepends a compact compiler/test error summary (Go
+// workspaces only) to the raw verification output. Retried workers receive
+// prevError head-truncated in their prompt, so the root causes must lead;
+// without this the 24KB-capped raw log can bury the one line that matters.
+func (o *Orchestrator) withDiagnostics(sb *tools.Sandbox, raw string) string {
+	if compact := tools.CompactDiagnostics(tools.DetectProject(sb.Root), raw); compact != "" {
+		return compact + "\n" + raw
+	}
+	return raw
 }

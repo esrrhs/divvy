@@ -284,6 +284,110 @@ func (s *Sandbox) ReplaceText(path, old, new string, replaceAll bool) error {
 	return os.WriteFile(abs, []byte(out), 0644)
 }
 
+// TextEdit is one exact-string replacement in a ReplaceTexts batch.
+type TextEdit struct {
+	Old string
+	New string
+}
+
+// ReplaceTexts applies several exact-string replacements to one file
+// atomically: every edit is validated against, and applied to, an in-memory
+// copy first, and the file is rewritten only after all edits succeed. A
+// missing or ambiguous anchor in any edit therefore leaves the file
+// completely untouched, so a multi-edit call can never half-apply.
+func (s *Sandbox) ReplaceTexts(path string, edits []TextEdit, replaceAll bool) error {
+	if len(edits) == 0 {
+		return fmt.Errorf("edits must contain at least one edit")
+	}
+	abs, err := s.Resolve(path)
+	if err != nil {
+		return err
+	}
+	raw, err := os.ReadFile(abs)
+	if err != nil {
+		return err
+	}
+	text := string(raw)
+	for i, ed := range edits {
+		if ed.Old == "" {
+			return fmt.Errorf("edits[%d]: old_string must not be empty", i)
+		}
+		n := strings.Count(text, ed.Old)
+		if n == 0 {
+			return fmt.Errorf("edits[%d]: old_string not found in %s", i, path)
+		}
+		if !replaceAll && n != 1 {
+			return fmt.Errorf("edits[%d]: old_string occurs %d times in %s; make it unique or set replace_all", i, n, path)
+		}
+		if replaceAll {
+			text = strings.ReplaceAll(text, ed.Old, ed.New)
+		} else {
+			text = strings.Replace(text, ed.Old, ed.New, 1)
+		}
+	}
+	return os.WriteFile(abs, []byte(text), 0644)
+}
+
+// DeletePath removes a workspace file or directory. Directories require
+// recursive=true; the workspace root itself can never be deleted.
+func (s *Sandbox) DeletePath(path string, recursive bool) error {
+	abs, err := s.Resolve(path)
+	if err != nil {
+		return err
+	}
+	if abs == s.Root {
+		return fmt.Errorf("refusing to delete the workspace root")
+	}
+	info, err := os.Lstat(abs)
+	if err != nil {
+		return err
+	}
+	if info.IsDir() && !recursive {
+		return fmt.Errorf("%s is a directory; set recursive true to delete it", path)
+	}
+	if recursive {
+		return os.RemoveAll(abs)
+	}
+	return os.Remove(abs)
+}
+
+// MovePath renames a file or directory inside the workspace. Replacing an
+// existing destination file is allowed; an existing destination directory is
+// rejected, as is moving a directory into its own subtree.
+func (s *Sandbox) MovePath(from, to string) error {
+	src, err := s.Resolve(from)
+	if err != nil {
+		return err
+	}
+	dst, err := s.Resolve(to)
+	if err != nil {
+		return err
+	}
+	if src == s.Root {
+		return fmt.Errorf("refusing to move the workspace root")
+	}
+	if src == dst {
+		return fmt.Errorf("source and destination are the same: %s", from)
+	}
+	if _, err := os.Stat(src); err != nil {
+		return err
+	}
+	if info, err := os.Stat(dst); err == nil && info.IsDir() {
+		return fmt.Errorf("destination already exists as a directory: %s", to)
+	}
+	// Moving a directory into itself or one of its descendants would corrupt
+	// the tree; filepath.Rel(src, dst) is a plain name only when dst is
+	// inside src (siblings produce a "../" prefix).
+	if rel, err := filepath.Rel(src, dst); err == nil && rel != "." &&
+		rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return fmt.Errorf("cannot move %s into its own subtree: %s", from, to)
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+		return err
+	}
+	return os.Rename(src, dst)
+}
+
 // ListDir lists files under path.
 func (s *Sandbox) ListDir(path string, recursive bool) (string, error) {
 	abs, err := s.Resolve(path)

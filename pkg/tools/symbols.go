@@ -64,6 +64,83 @@ func (s *Sandbox) FindSymbol(ctx context.Context, name, kind, glob string) (stri
 	return strings.Join(hits, "\n"), nil
 }
 
+// FindReferences performs a zero-dependency, text-level usage scan for name:
+// every word-boundary occurrence outside obvious declaration lines (func/
+// def/fn, type/class/struct/..., var/const/let definitions). This is NOT
+// type-aware: comments and string literals mentioning the name are included
+// and aliased/dynamic call sites are missed. That trade-off is deliberate
+// (no gopls/toolchain dependency) and disclosed to the model in the tool
+// description. Output reuses the search_files "path:line: text" shape.
+func (s *Sandbox) FindReferences(name, glob string) (string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", fmt.Errorf("find_symbol needs a name")
+	}
+	out, err := s.SearchFiles(`\b`+regexp.QuoteMeta(name)+`\b`, "", glob, true)
+	if err != nil {
+		return "", err
+	}
+	if strings.HasPrefix(out, "(no matches") {
+		return out, nil
+	}
+	decls := declarationLineRegexes(name)
+	var kept []string
+	for _, line := range rangeLines(out) {
+		// SearchFiles' truncation note ("[more than N matches; ...]") is not
+		// a match line; pass it through untouched.
+		if strings.HasPrefix(line, "[") {
+			kept = append(kept, line)
+			continue
+		}
+		parts := strings.SplitN(line, ":", 3)
+		if len(parts) == 3 {
+			text := parts[2]
+			isDecl := false
+			for _, re := range decls {
+				if re.MatchString(text) {
+					isDecl = true
+					break
+				}
+			}
+			if isDecl {
+				continue
+			}
+		}
+		kept = append(kept, line)
+	}
+	if len(kept) == 0 {
+		return fmt.Sprintf("(no references for %q outside declarations)", name), nil
+	}
+	return strings.Join(kept, "\n"), nil
+}
+
+// rangeLines splits text into non-empty lines.
+func rangeLines(text string) []string {
+	raw := strings.Split(text, "\n")
+	out := raw[:0]
+	for _, l := range raw {
+		if l != "" {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// declarationLineRegexes builds the per-name patterns that identify
+// declaration lines to exclude from reference results.
+func declarationLineRegexes(name string) []*regexp.Regexp {
+	q := regexp.QuoteMeta(name)
+	return []*regexp.Regexp{
+		// Go/Python/Rust-style function or method definitions.
+		regexp.MustCompile(`\b(?:func|def|fn)\s*(?:\([^)]*\)\s*)?` + q + `\s*[(\[]`),
+		// Type/class/struct/enum/interface definitions.
+		regexp.MustCompile(`\b(?:type|class|struct|enum|interface)\s+` + q + `\b`),
+		// var/const/let definitions (var Foo int / const Foo = ...),
+		// including grouped lists (var a, Foo int).
+		regexp.MustCompile(`\b(?:var|const|let)\s+[A-Za-z0-9_,\s*]*\b` + q + `\b`),
+	}
+}
+
 // findGoSymbol parses one Go file and reports matching top-level decls,
 // labelling results with the workspace-relative path.
 func findGoSymbol(path, label, name, kind string) []string {

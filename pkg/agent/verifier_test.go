@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"os/exec"
 	"strings"
 	"testing"
 
@@ -184,5 +185,42 @@ func TestVerify_PythonProjectEndToEnd(t *testing.T) {
 	vr = o.verify(context.Background(), sb, node)
 	if vr.OK {
 		t.Fatal("syntax-broken Python must fail verification")
+	}
+}
+
+func TestVerify_GoFailurePrependsCompactDiagnostics(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go toolchain unavailable")
+	}
+	sb, err := tools.NewSandbox(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sb.WriteFile("go.mod", "module broken\n\ngo 1.21\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := sb.WriteFile("x.go", "package main\n\nfunc main() {\n\tundefinedSym = 1\n}\n"); err != nil {
+		t.Fatal(err)
+	}
+	o := &Orchestrator{log: SilentLogger()}
+	node := &models.TaskNode{
+		DoD: models.DoD{Commands: []string{"go build ./..."}, TimeoutSec: 60},
+	}
+
+	vr := o.verify(context.Background(), sb, node)
+	if vr.OK {
+		t.Fatal("broken Go code must fail verification")
+	}
+	// The compact block must LEAD the output: retried workers receive
+	// prevError head-truncated, so root causes outside the head are lost.
+	if !strings.HasPrefix(vr.Output, "[compact diagnostics:") {
+		t.Fatalf("compact diagnostics must be prepended, got:\n%s", vr.Output)
+	}
+	if !strings.Contains(vr.Output, "x.go:") || !strings.Contains(vr.Output, "undefined: undefinedSym") {
+		t.Fatalf("compiler error missing from diagnostics:\n%s", vr.Output)
+	}
+	// The raw log is still present after the separator.
+	if !strings.Contains(vr.Output, "\n---\n$ go build") {
+		t.Fatalf("raw output must follow the compact block:\n%s", vr.Output)
 	}
 }

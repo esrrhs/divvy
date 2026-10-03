@@ -231,3 +231,198 @@ func TestSandbox_CallWrite(t *testing.T) {
 		t.Fatalf("file content %q", raw)
 	}
 }
+
+func TestSandbox_ReplaceTexts(t *testing.T) {
+	sb, _ := NewSandbox(t.TempDir())
+	original := "alpha\nbeta\ngamma\n"
+	if err := sb.WriteFile("f.txt", original); err != nil {
+		t.Fatal(err)
+	}
+
+	// A batch applies several edits with one rewrite.
+	err := sb.ReplaceTexts("f.txt", []TextEdit{
+		{Old: "alpha", New: "ALPHA"},
+		{Old: "beta", New: "BETA"},
+		{Old: "gamma\n", New: "GAMMA\n"},
+	}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, filepath.Join(sb.Root, "f.txt")); got != "ALPHA\nBETA\nGAMMA\n" {
+		t.Fatalf("batch result: %q", got)
+	}
+
+	// A missing anchor in ANY edit must leave the file byte-identical.
+	before := readFile(t, filepath.Join(sb.Root, "f.txt"))
+	err = sb.ReplaceTexts("f.txt", []TextEdit{
+		{Old: "ALPHA", New: "alpha"},
+		{Old: "does-not-exist", New: "x"},
+	}, false)
+	if err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("expected not-found error, got %v", err)
+	}
+	if got := readFile(t, filepath.Join(sb.Root, "f.txt")); got != before {
+		t.Fatalf("failed batch must not touch the file:\nbefore=%q\nafter =%q", before, got)
+	}
+
+	// An ambiguous anchor without replace_all is also a no-op atomic failure;
+	// edits apply sequentially in memory, so an anchor introduced by edit 1
+	// is visible to edit 2.
+	if err := sb.WriteFile("dup.txt", "x x\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := sb.ReplaceTexts("dup.txt", []TextEdit{{Old: "x", New: "y"}}, false); err == nil ||
+		!strings.Contains(err.Error(), "occurs 2 times") {
+		t.Fatalf("expected ambiguity error, got %v", err)
+	}
+	if got := readFile(t, filepath.Join(sb.Root, "dup.txt")); got != "x x\n" {
+		t.Fatalf("ambiguous edit changed the file: %q", got)
+	}
+	if err := sb.ReplaceTexts("dup.txt", []TextEdit{{Old: "x", New: "y"}}, true); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, filepath.Join(sb.Root, "dup.txt")); got != "y y\n" {
+		t.Fatalf("replace_all result: %q", got)
+	}
+
+	// Guard rails: empty batch and empty anchor.
+	if err := sb.ReplaceTexts("f.txt", nil, false); err == nil {
+		t.Fatal("empty batch should fail")
+	}
+	if err := sb.ReplaceTexts("f.txt", []TextEdit{{Old: "", New: "z"}}, false); err == nil {
+		t.Fatal("empty old_string should fail")
+	}
+}
+
+func TestSandbox_CallReplaceLinesEdits(t *testing.T) {
+	sb, _ := NewSandbox(t.TempDir())
+	if err := sb.WriteFile("f.txt", "one two\n"); err != nil {
+		t.Fatal(err)
+	}
+	// The JSON-mode/native path delivers edits as []any of map[string]any.
+	out, err := sb.Call(context.Background(), ToolReplaceLines, map[string]any{
+		"path": "f.txt",
+		"edits": []any{
+			map[string]any{"old_string": "one", "new_string": "1"},
+			map[string]any{"old_string": "two", "new_string": "2"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "2 edit(s)") {
+		t.Fatalf("unexpected report: %s", out)
+	}
+	if got := readFile(t, filepath.Join(sb.Root, "f.txt")); got != "1 2\n" {
+		t.Fatalf("edits call result: %q", got)
+	}
+
+	// Malformed shapes produce errors instead of panics.
+	if _, err := sb.Call(context.Background(), ToolReplaceLines, map[string]any{
+		"path":  "f.txt",
+		"edits": "not-an-array",
+	}); err == nil {
+		t.Fatal("non-array edits should fail")
+	}
+	if _, err := sb.Call(context.Background(), ToolReplaceLines, map[string]any{
+		"path":  "f.txt",
+		"edits": []any{map[string]any{"new_string": "x"}},
+	}); err == nil {
+		t.Fatal("edit without old_string should fail")
+	}
+}
+
+func TestSandbox_DeletePath(t *testing.T) {
+	sb, _ := NewSandbox(t.TempDir())
+	if err := sb.WriteFile("a.txt", "x"); err != nil {
+		t.Fatal(err)
+	}
+	if err := sb.WriteFile("dir/b.txt", "y"); err != nil {
+		t.Fatal(err)
+	}
+	if err := sb.WriteFile("dir/c.txt", "z"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := sb.Call(context.Background(), ToolDeletePath, map[string]any{"path": "a.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(sb.Root, "a.txt")); !os.IsNotExist(err) {
+		t.Fatal("a.txt should be gone")
+	}
+
+	// A directory without recursive survives and returns a clear error.
+	if err := sb.DeletePath("dir", false); err == nil ||
+		!strings.Contains(err.Error(), "recursive") {
+		t.Fatalf("expected recursive-required error, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(sb.Root, "dir", "b.txt")); err != nil {
+		t.Fatalf("directory contents must survive a rejected delete: %v", err)
+	}
+
+	if _, err := sb.Call(context.Background(), ToolDeletePath, map[string]any{
+		"path": "dir", "recursive": true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(sb.Root, "dir")); !os.IsNotExist(err) {
+		t.Fatal("dir should be gone")
+	}
+
+	// The workspace root itself is protected, and escapes stay rejected.
+	if err := sb.DeletePath(".", true); err == nil {
+		t.Fatal("deleting the workspace root must fail")
+	}
+	if err := sb.DeletePath("../escape", false); err == nil {
+		t.Fatal("path escape must fail")
+	}
+}
+
+func TestSandbox_MovePath(t *testing.T) {
+	sb, _ := NewSandbox(t.TempDir())
+	if err := sb.WriteFile("old.txt", "data"); err != nil {
+		t.Fatal(err)
+	}
+	if err := sb.WriteFile("pkg/sub/a.go", "package sub\n"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Move into a not-yet-existing directory creates the parents.
+	if _, err := sb.Call(context.Background(), ToolMovePath, map[string]any{
+		"from": "old.txt", "to": "new/dir/moved.txt",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, filepath.Join(sb.Root, "new/dir/moved.txt")); got != "data" {
+		t.Fatalf("moved content: %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(sb.Root, "old.txt")); !os.IsNotExist(err) {
+		t.Fatal("source should be gone")
+	}
+
+	// Moving a directory into its own subtree is rejected.
+	if err := sb.MovePath("pkg", "pkg/inside"); err == nil {
+		t.Fatal("move-into-self must fail")
+	}
+	// Same source/destination and missing source are errors.
+	if err := sb.MovePath("new/dir/moved.txt", "new/dir/moved.txt"); err == nil {
+		t.Fatal("same src/dst must fail")
+	}
+	if err := sb.MovePath("missing.txt", "x.txt"); err == nil {
+		t.Fatal("missing source must fail")
+	}
+
+	// Replacing an existing file is allowed; an existing directory is not.
+	if err := sb.WriteFile("victim.txt", "old"); err != nil {
+		t.Fatal(err)
+	}
+	if err := sb.MovePath("new/dir/moved.txt", "victim.txt"); err != nil {
+		t.Fatalf("file overwrite should succeed: %v", err)
+	}
+	if err := sb.MovePath("victim.txt", "pkg"); err == nil {
+		t.Fatal("moving over an existing directory must fail")
+	}
+	if got := readFile(t, filepath.Join(sb.Root, "victim.txt")); got != "data" {
+		t.Fatalf("overwrite result: %q", got)
+	}
+}

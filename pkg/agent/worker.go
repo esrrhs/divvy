@@ -174,6 +174,7 @@ func nativeToolDefs(sb *tools.Sandbox) []llm.Tool {
 	if sb.Web != nil {
 		raw = append(raw, tools.NativeWebTools()...)
 		raw = append(raw, tools.NativeHTTPTool())
+		raw = append(raw, tools.NativeDownloadTool())
 	}
 	if sb.Browser != nil {
 		raw = append(raw, tools.NativeBrowserTools()...)
@@ -195,7 +196,18 @@ func nativeToolDefs(sb *tools.Sandbox) []llm.Tool {
 
 func previewArgs(act taggedAction) string {
 	switch act.Name {
-	case tools.ToolReadFile, tools.ToolWriteFile, tools.ToolReplaceLines, tools.ToolListDir:
+	case tools.ToolReadFile, tools.ToolWriteFile, tools.ToolReplaceLines, tools.ToolListDir, tools.ToolDeletePath:
+		p, _ := stringFromArgs(act.Args, "path")
+		return p
+	case tools.ToolMovePath:
+		from, _ := stringFromArgs(act.Args, "from")
+		to, _ := stringFromArgs(act.Args, "to")
+		return truncate("move "+from+" -> "+to, 80)
+	case tools.ToolDownloadFile:
+		u, _ := stringFromArgs(act.Args, "url")
+		p, _ := stringFromArgs(act.Args, "path")
+		return truncate("download "+u+" -> "+p, 80)
+	case tools.ToolSQLiteQuery, tools.ToolJSONQuery:
 		p, _ := stringFromArgs(act.Args, "path")
 		return p
 	case tools.ToolRunBash:

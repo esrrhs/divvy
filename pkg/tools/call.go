@@ -17,21 +17,26 @@ const (
 	ToolReadFile     = "read_file"
 	ToolWriteFile    = "write_file"
 	ToolReplaceLines = "replace_lines"
+	ToolDeletePath   = "delete_path"
+	ToolMovePath     = "move_path"
 	ToolRunBash      = "run_bash"
 	ToolSearchFiles  = "search_files"
 	ToolFindFiles    = "find_files"
 	ToolWebSearch    = "web_search"
 	ToolWebFetch     = "web_fetch"
+	ToolDownloadFile = "download_file"
 	ToolFinish       = "finish"
 
 	ToolHTTPRequest = "http_request"
 
-	ToolGitStatus = "git_status"
-	ToolGitDiff   = "git_diff"
-	ToolGitLog    = "git_log"
+	ToolGitStatus  = "git_status"
+	ToolGitDiff    = "git_diff"
+	ToolGitLog     = "git_log"
+	ToolReviewDiff = "review_diff"
 
-	ToolFindSymbol = "find_symbol"
-	ToolJSONQuery  = "json_query"
+	ToolFindSymbol  = "find_symbol"
+	ToolJSONQuery   = "json_query"
+	ToolSQLiteQuery = "sqlite_query"
 
 	ToolBrowserNavigate   = "browser_navigate"
 	ToolBrowserClick      = "browser_click"
@@ -50,6 +55,11 @@ Tools (call exactly one per turn):
 - write_file: {"path":"file.go","content":"...full file..."}
 - replace_lines: {"path":"file.go","start_line":1,"end_line":3,"content":"new lines"}
   alternative: {"path":"file.go","old_string":"exact old","new_string":"exact new"}
+  atomic multi-edit: {"path":"file.go","edits":[{"old_string":"a","new_string":"b"},{"old_string":"c","new_string":"d"}]}
+  (every edit must match or the whole file is left unchanged)
+- delete_path: {"path":"old.go","recursive":false}
+  (recursive:true is required to remove a directory; the workspace root is protected)
+- move_path: {"from":"old.go","to":"dir/new.go"}  (rename/move inside the workspace)
 - run_bash: {"command":"go test ./...","timeout_sec":120}
   timeout_sec optional, default 60; raise it for slow installs/builds.
 - search_files: {"pattern":"func Add","glob":"*.go"}  (regex over file CONTENTS)
@@ -63,6 +73,7 @@ func WebDescriptions() string {
 	return strings.TrimSpace(`
 - web_search: {"query":"latest docs for ...","max_results":5}  (live web search)
 - web_fetch: {"url":"https://example.com/doc"}  (download a page as plain text)
+- download_file: {"url":"https://example.com/data.bin","path":"assets/data.bin"}  (stream a URL to a workspace FILE, binary-safe; same private-address/redirect protection, 20MB cap)
 `)
 }
 
@@ -74,8 +85,11 @@ func HTTPDescriptions() string {
 // CodeDescriptions returns the code/data understanding tool lines.
 func CodeDescriptions() string {
 	return strings.TrimSpace(`
-- find_symbol: {"name":"Foo","kind":"func|type|var","glob":"*.go"}  (definition locations; Go uses a real AST)
+- find_symbol: {"name":"Foo","kind":"func|type|var","glob":"*.go","references":true}
+  (default: definition locations, Go uses a real AST; references:true = text-level usage sites, declarations excluded but comments/strings are included)
 - json_query: {"path":"file.json","query":"items.0.name"}  (extract one value via dotted/bracket path)
+- sqlite_query: {"path":"data.db","query":"SELECT id, name FROM users LIMIT 50","limit":50}
+  (read-only SELECT/WITH/PRAGMA/EXPLAIN against a workspace .db; returns a columns header plus JSON-array rows; blobs shown by size)
 `)
 }
 
@@ -85,6 +99,7 @@ func GitDescriptions() string {
 - git_status: {}  (short working-tree status)
 - git_diff: {"staged":false,"path":""}  (unified diff)
 - git_log: {"limit":10,"path":""}  (recent commits)
+- review_diff: {"staged":false}  (deterministic pre-finish check of your changes: conflict markers, leftover debug prints like fmt.Println/console.log/debugger, hard-coded secrets, oversized diff; call it before finish)
 `)
 }
 
@@ -144,10 +159,12 @@ func nativeDef(name, description string, props map[string]string, required []str
 // NativeCodeTools returns find_symbol/json_query definitions.
 func NativeCodeTools() []map[string]any {
 	return []map[string]any{
-		nativeDef(ToolFindSymbol, "Locate definitions by name; Go uses the real AST.",
-			map[string]string{"name": "string", "kind": "string", "glob": "string"}, []string{"name"}),
+		nativeDef(ToolFindSymbol, "Locate definitions by name (Go uses the real AST), or with references:true list text-level usage sites.",
+			map[string]string{"name": "string", "kind": "string", "glob": "string", "references": "boolean"}, []string{"name"}),
 		nativeDef(ToolJSONQuery, "Extract one value from a JSON file by a dotted/bracket path.",
 			map[string]string{"path": "string", "query": "string"}, []string{"path"}),
+		nativeDef(ToolSQLiteQuery, "Run one read-only SELECT/WITH/PRAGMA/EXPLAIN query against a workspace SQLite database.",
+			map[string]string{"path": "string", "query": "string", "limit": "integer"}, []string{"path", "query"}),
 	}
 }
 
@@ -159,6 +176,8 @@ func NativeGitTools() []map[string]any {
 			map[string]string{"staged": "boolean", "path": "string"}, nil),
 		nativeDef(ToolGitLog, "Show recent oneline commits.",
 			map[string]string{"limit": "integer", "path": "string"}, nil),
+		nativeDef(ToolReviewDiff, "Deterministic review of your diff before finish: conflict markers, leftover debug prints, hard-coded secrets, and oversized changes.",
+			map[string]string{"staged": "boolean"}, nil),
 	}
 }
 
@@ -167,6 +186,13 @@ func NativeHTTPTool() map[string]any {
 	return nativeDef(ToolHTTPRequest, "Perform a structured HTTP call; returns status/headers/body.",
 		map[string]string{"url": "string", "method": "string", "headers": "object", "body": "string"},
 		[]string{"url"})
+}
+
+// NativeDownloadTool returns the binary download definition.
+func NativeDownloadTool() map[string]any {
+	return nativeDef(ToolDownloadFile, "Download a public http(s) URL verbatim into a workspace file (binary-safe, size-capped).",
+		map[string]string{"url": "string", "path": "string"},
+		[]string{"url", "path"})
 }
 
 // NativeBrowserTools returns headless Chrome definitions.
@@ -218,7 +244,7 @@ func NativeTools() []map[string]any {
 			"path":    str("Relative file path"),
 			"content": str("Full file contents"),
 		}, []string{"path", "content"})),
-		fn(ToolReplaceLines, "Replace a line range or an exact string in a file.", obj(map[string]any{
+		fn(ToolReplaceLines, "Replace a line range, an exact string, or atomically apply several exact-string edits (all must match or the file is untouched).", obj(map[string]any{
 			"path":        str("Relative file path"),
 			"start_line":  map[string]any{"type": "integer"},
 			"end_line":    map[string]any{"type": "integer"},
@@ -226,7 +252,27 @@ func NativeTools() []map[string]any {
 			"old_string":  str("Exact text to find"),
 			"new_string":  str("Replacement text"),
 			"replace_all": map[string]any{"type": "boolean"},
+			"edits": map[string]any{
+				"type":        "array",
+				"description": "Atomic batch of exact-string replacements applied in order; the file changes only if every old_string matches.",
+				"items": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"old_string": str("Exact text to find"),
+						"new_string": str("Replacement text"),
+					},
+					"required": []string{"old_string"},
+				},
+			},
 		}, []string{"path"})),
+		fn(ToolDeletePath, "Delete a workspace file; directories need recursive=true.", obj(map[string]any{
+			"path":      str("Relative file or directory path"),
+			"recursive": map[string]any{"type": "boolean", "description": "Required and used only when deleting a directory"},
+		}, []string{"path"})),
+		fn(ToolMovePath, "Rename or move a file/directory inside the workspace.", obj(map[string]any{
+			"from": str("Relative source path"),
+			"to":   str("Relative destination path"),
+		}, []string{"from", "to"})),
 		fn(ToolRunBash, "Run a shell command in the workspace.", obj(map[string]any{
 			"command":     str("Shell command"),
 			"timeout_sec": map[string]any{"type": "integer", "description": "Timeout in seconds; default 60, raise for slow installs/builds"},
@@ -326,6 +372,17 @@ func (s *Sandbox) Call(ctx context.Context, name string, args map[string]any) (s
 		if err != nil {
 			return "", err
 		}
+		if raw, ok := args["edits"]; ok && raw != nil {
+			edits, err := editsArg(args, "edits")
+			if err != nil {
+				return "", err
+			}
+			all := boolArg(args, "replace_all", false)
+			if err := s.ReplaceTexts(path, edits, all); err != nil {
+				return "", err
+			}
+			return fmt.Sprintf("applied %d edit(s) in %s", len(edits), path), nil
+		}
 		if old, ok := stringArg(args, "old_string"); ok && old != "" {
 			neu, _ := stringArg(args, "new_string")
 			all := boolArg(args, "replace_all", false)
@@ -347,6 +404,31 @@ func (s *Sandbox) Call(ctx context.Context, name string, args map[string]any) (s
 			return "", err
 		}
 		return fmt.Sprintf("replaced lines %d-%d in %s", start, end, path), nil
+
+	case ToolDeletePath:
+		path, err := requireString(args, "path")
+		if err != nil {
+			return "", err
+		}
+		recursive := boolArg(args, "recursive", false)
+		if err := s.DeletePath(path, recursive); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("deleted %s", path), nil
+
+	case ToolMovePath:
+		from, err := requireString(args, "from")
+		if err != nil {
+			return "", err
+		}
+		to, err := requireString(args, "to")
+		if err != nil {
+			return "", err
+		}
+		if err := s.MovePath(from, to); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("moved %s -> %s", from, to), nil
 
 	case ToolRunBash:
 		command, err := requireString(args, "command")
@@ -427,6 +509,20 @@ func (s *Sandbox) Call(ctx context.Context, name string, args map[string]any) (s
 		}
 		return s.Web.Do(ctx, method, u, headers, body)
 
+	case ToolDownloadFile:
+		if s.Web == nil {
+			return "", fmt.Errorf("download_file needs -web (network access is off by default)")
+		}
+		u, err := requireString(args, "url")
+		if err != nil {
+			return "", err
+		}
+		p, err := requireString(args, "path")
+		if err != nil {
+			return "", err
+		}
+		return s.DownloadFile(ctx, u, p)
+
 	case ToolGitStatus:
 		return s.GitStatus(ctx)
 	case ToolGitDiff:
@@ -440,14 +536,20 @@ func (s *Sandbox) Call(ctx context.Context, name string, args map[string]any) (s
 		}
 		p, _ := stringArg(args, "path")
 		return s.GitLog(ctx, limit, p)
+	case ToolReviewDiff:
+		staged := boolArg(args, "staged", false)
+		return s.ReviewDiff(ctx, staged)
 
 	case ToolFindSymbol:
 		n, err := requireString(args, "name")
 		if err != nil {
 			return "", err
 		}
-		kind, _ := stringArg(args, "kind")
 		glob, _ := stringArg(args, "glob")
+		if boolArg(args, "references", false) {
+			return s.FindReferences(n, glob)
+		}
+		kind, _ := stringArg(args, "kind")
 		return s.FindSymbol(ctx, n, kind, glob)
 
 	case ToolJSONQuery:
@@ -457,6 +559,21 @@ func (s *Sandbox) Call(ctx context.Context, name string, args map[string]any) (s
 		}
 		query, _ := stringArg(args, "query")
 		return s.JSONQuery(p, query)
+
+	case ToolSQLiteQuery:
+		p, err := requireString(args, "path")
+		if err != nil {
+			return "", err
+		}
+		query, err := requireString(args, "query")
+		if err != nil {
+			return "", err
+		}
+		limit := 0
+		if n, err := intArg(args, "limit"); err == nil {
+			limit = n
+		}
+		return s.SQLiteQuery(p, query, limit)
 
 	case ToolBrowserNavigate:
 		if s.Browser == nil {
@@ -525,7 +642,7 @@ func (s *Sandbox) Call(ctx context.Context, name string, args map[string]any) (s
 		return summary, nil
 
 	default:
-		return "", fmt.Errorf("unknown tool %q; use list_dir, read_file, write_file, replace_lines, run_bash, search_files, find_files, web_search, web_fetch, finish", name)
+		return "", fmt.Errorf("unknown tool %q; use list_dir, read_file, write_file, replace_lines, delete_path, move_path, run_bash, search_files, find_files, web_search, web_fetch, download_file, sqlite_query, finish", name)
 	}
 }
 
@@ -577,6 +694,30 @@ func requireString(args map[string]any, key string) (string, error) {
 		return "", fmt.Errorf("missing %s", key)
 	}
 	return s, nil
+}
+
+// editsArg parses a replace_lines "edits" batch:
+// [{"old_string":"a","new_string":"b"}, ...].
+func editsArg(args map[string]any, key string) ([]TextEdit, error) {
+	raw, ok := args[key]
+	if !ok || raw == nil {
+		return nil, fmt.Errorf("missing %s", key)
+	}
+	list, ok := raw.([]any)
+	if !ok {
+		return nil, fmt.Errorf("%s must be an array of {old_string,new_string} objects", key)
+	}
+	edits := make([]TextEdit, 0, len(list))
+	for i, item := range list {
+		m, ok := item.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("%s[%d] must be an object", key, i)
+		}
+		old, _ := stringArg(m, "old_string")
+		neu, _ := stringArg(m, "new_string")
+		edits = append(edits, TextEdit{Old: old, New: neu})
+	}
+	return edits, nil
 }
 
 func stringArg(args map[string]any, key string) (string, bool) {

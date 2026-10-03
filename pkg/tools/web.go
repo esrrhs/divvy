@@ -21,6 +21,8 @@ const defaultSearchURL = "https://lite.duckduckgo.com/lite/?q={query}"
 const (
 	defaultWebTimeout = 30 * time.Second
 	maxFetchBytes     = 256 * 1024
+	// maxDownloadBytes caps files written by the download_file tool.
+	maxDownloadBytes = 20 * 1024 * 1024
 )
 
 // WebClient performs outbound web searches and page fetches. It is nil-safe
@@ -113,6 +115,50 @@ func (w *WebClient) Fetch(ctx context.Context, rawURL string) (string, error) {
 // "status/headers/body" report. Used by the http_request tool.
 func (w *WebClient) Do(ctx context.Context, method, rawURL string, headers map[string]string, body string) (string, error) {
 	return w.request(ctx, method, rawURL, headers, body, true)
+}
+
+// Download streams a public http(s) URL into out with the same scheme,
+// private-address, port, and redirect policy as Fetch. It requires a 2xx
+// response and aborts once more than maxDownloadBytes arrive (the caller
+// must discard the partial destination on error); the content type is
+// returned for confirmation.
+func (w *WebClient) Download(ctx context.Context, rawURL string, out io.Writer) (string, int64, error) {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return "", 0, fmt.Errorf("invalid URL: %w", err)
+	}
+	if err := w.validateURL(u); err != nil {
+		return "", 0, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return "", 0, err
+	}
+	req.Header.Set("User-Agent", "divvy/1.0 (+download)")
+	resp, err := w.client.Do(req)
+	if err != nil {
+		return "", 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", 0, fmt.Errorf("download failed: %s", resp.Status)
+	}
+	// One extra byte reveals an oversized body before it silently truncates.
+	n, err := io.Copy(out, io.LimitReader(resp.Body, maxDownloadBytes+1))
+	if err != nil {
+		return "", n, err
+	}
+	if n > maxDownloadBytes {
+		return "", n, fmt.Errorf("download exceeds %d-byte limit", maxDownloadBytes)
+	}
+	ct := strings.TrimSpace(resp.Header.Get("Content-Type"))
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = strings.TrimSpace(ct[:i])
+	}
+	if ct == "" {
+		ct = "application/octet-stream"
+	}
+	return ct, n, nil
 }
 
 // request implements both Fetch (GET, HTML→text) and Do (raw report).
