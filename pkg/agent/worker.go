@@ -13,6 +13,10 @@ import (
 )
 
 func (o *Orchestrator) runWorker(ctx context.Context, sb *tools.Sandbox, node *models.TaskNode, prevError string) (string, error) {
+	// Release the leaf-level browser lease no matter how the worker ends,
+	// so a queued parallel leaf is never stuck waiting after a failure.
+	defer sb.ReleaseBrowser()
+
 	messages := []llm.Message{
 		{Role: llm.RoleSystem, Content: workerSystemFor(o.cfg.WebEnabled, sb.DynamicToolDescriptions())},
 		{Role: llm.RoleUser, Content: o.projectContext(sb, node, prevError)},
@@ -64,6 +68,41 @@ func (o *Orchestrator) runWorker(ctx context.Context, sb *tools.Sandbox, node *m
 		for _, act := range actions {
 			o.log.Actionf("%s %s %s", node.ID, act.Name, previewArgs(act))
 			if act.Name == tools.ToolFinish {
+				// Deterministic pre-finish gate (git workspaces): conflict
+				// markers and hard-coded secrets reject finish so the leaf
+				// must fix them in another turn; debug prints / large diffs
+				// are only logged as warnings.
+				gate, gateErr := sb.PreFinishGate(ctx)
+				if gateErr != nil {
+					o.log.Warnf("pre-finish review unavailable: %v", gateErr)
+				} else if gate != nil {
+					if gate.Blocking {
+						o.log.Warnf("%s finish rejected by review gate", node.ID)
+						o.events.Record("finish_gate", node.ID, map[string]any{
+							"blocking": true,
+							"report":   clip(gate.Report, evReasonChars),
+						})
+						blocked := "finish REJECTED by review_diff. Fix these blocking issue(s) before finishing (conflict markers and hard-coded secrets are never accepted):\n" +
+							gate.Report +
+							"\nFix the code, then call finish again. Debug-print and large-diff items are warnings only, but conflict/secret items must be removed."
+						if o.cfg.NativeTools && act.ID != "" {
+							messages = append(messages, llm.Message{
+								Role: llm.RoleTool, ToolCallID: act.ID, Name: act.Name, Content: blocked,
+							})
+						} else {
+							messages = append(messages, llm.Message{
+								Role: llm.RoleUser, Content: "Tool finish result:\n" + blocked,
+							})
+						}
+						continue
+					}
+					o.log.Warnf("%s pre-finish warnings:\n%s", node.ID, gate.Report)
+					o.events.Record("finish_gate", node.ID, map[string]any{
+						"blocking": false,
+						"report":   clip(gate.Report, evReasonChars),
+					})
+				}
+
 				summary, _ = stringFromArgs(act.Args, "summary")
 				if summary == "" {
 					summary = act.Thought

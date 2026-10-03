@@ -576,8 +576,8 @@ func (s *Sandbox) Call(ctx context.Context, name string, args map[string]any) (s
 		return s.SQLiteQuery(p, query, limit)
 
 	case ToolBrowserNavigate:
-		if s.Browser == nil {
-			return "", browserDisabledErr
+		if err := s.acquireBrowserLease(ctx); err != nil {
+			return "", err
 		}
 		u, err := requireString(args, "url")
 		if err != nil {
@@ -585,8 +585,8 @@ func (s *Sandbox) Call(ctx context.Context, name string, args map[string]any) (s
 		}
 		return s.Browser.Navigate(ctx, u)
 	case ToolBrowserClick:
-		if s.Browser == nil {
-			return "", browserDisabledErr
+		if err := s.acquireBrowserLease(ctx); err != nil {
+			return "", err
 		}
 		sel, err := requireString(args, "selector")
 		if err != nil {
@@ -594,8 +594,8 @@ func (s *Sandbox) Call(ctx context.Context, name string, args map[string]any) (s
 		}
 		return reportOK(s.Browser.Click(ctx, sel), "clicked "+sel)
 	case ToolBrowserType:
-		if s.Browser == nil {
-			return "", browserDisabledErr
+		if err := s.acquireBrowserLease(ctx); err != nil {
+			return "", err
 		}
 		sel, err := requireString(args, "selector")
 		if err != nil {
@@ -605,14 +605,14 @@ func (s *Sandbox) Call(ctx context.Context, name string, args map[string]any) (s
 		clear := boolArg(args, "clear", true)
 		return reportOK(s.Browser.Type(ctx, sel, text, clear), "typed into "+sel)
 	case ToolBrowserText:
-		if s.Browser == nil {
-			return "", browserDisabledErr
+		if err := s.acquireBrowserLease(ctx); err != nil {
+			return "", err
 		}
 		sel, _ := stringArg(args, "selector")
 		return s.Browser.Text(ctx, sel)
 	case ToolBrowserScreenshot:
-		if s.Browser == nil {
-			return "", browserDisabledErr
+		if err := s.acquireBrowserLease(ctx); err != nil {
+			return "", err
 		}
 		out, err := requireString(args, "path")
 		if err != nil {

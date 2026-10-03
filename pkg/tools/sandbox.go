@@ -49,6 +49,37 @@ type Sandbox struct {
 
 	// Browser, when set, enables headless Chrome tools. Nil disables them.
 	Browser *BrowserClient
+
+	// browserHeld records that this sandbox owns the BrowserClient's leaf
+	// lease, so repeated browser tool calls in one leaf do not re-acquire.
+	// RunWorker defers ReleaseBrowser; isolated mirrors get a fresh flag.
+	browserHeld bool
+}
+
+// acquireBrowserLease takes exclusive leaf-level ownership of the shared
+// browser tab on first use. Browser multi-step flows (navigate → click →
+// text) must not interleave across parallel leaves.
+func (s *Sandbox) acquireBrowserLease(ctx context.Context) error {
+	if s.Browser == nil {
+		return browserDisabledErr
+	}
+	if s.browserHeld {
+		return nil
+	}
+	if err := s.Browser.Acquire(ctx); err != nil {
+		return err
+	}
+	s.browserHeld = true
+	return nil
+}
+
+// ReleaseBrowser returns the leaf browser lease if this sandbox acquired it.
+// Safe to defer unconditionally for every worker.
+func (s *Sandbox) ReleaseBrowser() {
+	if s.Browser != nil && s.browserHeld {
+		s.Browser.Release()
+		s.browserHeld = false
+	}
 }
 
 // NewSandbox creates a workspace-rooted sandbox. root is created if missing.

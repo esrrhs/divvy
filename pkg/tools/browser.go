@@ -14,14 +14,55 @@ import (
 
 // BrowserClient drives a single headless Chrome tab shared across leaves.
 // Like WebClient it is nil-safe: a Sandbox without one reports the browser
-// tools disabled. All Chrome actions are serialized because one tab is used.
+// tools disabled. Two levels of serialization exist:
+//
+//   - mu serializes individual CDP actions (data-race safety on one tab);
+//   - the leaf lease (Acquire/Release) makes a whole leaf's multi-step
+//     navigate/click/type flow exclusive. Under -parallel several leaves
+//     share this client, and per-action locking alone would let leaf B
+//     navigate between leaf A's navigate and its click, sending A's click
+//     to B's page. A leaf that actually uses the browser holds the lease
+//     from its first browser tool call until the worker finishes; leaves
+//     that never touch the browser are not serialized.
 type BrowserClient struct {
 	mu sync.Mutex
+
+	leaseOnce sync.Once
+	lease     chan struct{} // single token; Acquire takes it, Release returns it
 
 	allocCancel context.CancelFunc
 	ctx         context.Context // long-lived browser + tab context
 	cancel      context.CancelFunc
 	started     bool
+}
+
+// Acquire waits for exclusive leaf-level ownership of the browser tab. It
+// honors ctx cancellation so a leaf interrupted while queued does not leak
+// a pending acquire. Lazy initialization keeps a zero-value client usable
+// in tests without a Chrome binary.
+func (b *BrowserClient) Acquire(ctx context.Context) error {
+	b.leaseOnce.Do(func() {
+		b.lease = make(chan struct{}, 1)
+		b.lease <- struct{}{}
+	})
+	select {
+	case <-b.lease:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// Release returns the leaf lease. It is idempotent: a lease that was never
+// acquired or already released is a no-op rather than a spurious token.
+func (b *BrowserClient) Release() {
+	if b.lease == nil {
+		return
+	}
+	select {
+	case b.lease <- struct{}{}:
+	default:
+	}
 }
 
 // NewBrowserClient verifies a Chrome/Chromium binary exists and builds a

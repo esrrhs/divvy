@@ -84,6 +84,7 @@ Rules:
 - Prefer write_file for new files. Prefer old_string/new_string for small edits.
 - Stay inside the workspace. Do not access the network.
 - After writing code, you MAY run_bash to compile or test.
+- In a git repository, finish is automatically checked via review_diff: unresolved conflict markers or hard-coded secrets REJECT finish and send the report back to you. Remove them (or call review_diff first) rather than finishing twice.
 - When the task is done and likely to pass the verification commands, call finish.
 - Never wrap JSON in markdown.
 - One action per turn.
@@ -98,6 +99,7 @@ Rules:
 - Prefer write_file for new files. Prefer old_string/new_string for small edits.
 - Stay inside the workspace for files. Network access is limited to web_search/web_fetch for public pages the task genuinely needs; do not fetch unrelated sites.
 - After writing code, you MAY run_bash to compile or test.
+- In a git repository, finish is automatically checked via review_diff: unresolved conflict markers or hard-coded secrets REJECT finish and send the report back to you. Remove them (or call review_diff first) rather than finishing twice.
 - When the task is done and likely to pass the verification commands, call finish.
 - Never wrap JSON in markdown.
 - One action per turn.

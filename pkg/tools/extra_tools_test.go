@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // The browser tests share one Chrome process: launching Chrome is expensive
@@ -53,6 +54,9 @@ func TestBrowser_NavigateJavaScript(t *testing.T) {
 
 	sb, _ := NewSandbox(t.TempDir())
 	sb.Browser = testBrowserClient(t)
+	// The leaf lease is normally released by runWorker; a direct tool test
+	// must release it itself so later browser tests are not queued forever.
+	t.Cleanup(sb.ReleaseBrowser)
 
 	out, err := sb.Call(context.Background(), ToolBrowserNavigate, map[string]any{"url": srv.URL})
 	if err != nil {
@@ -75,6 +79,9 @@ func TestBrowser_TypeClickFlow(t *testing.T) {
 
 	sb, _ := NewSandbox(t.TempDir())
 	sb.Browser = testBrowserClient(t)
+	// The leaf lease is normally released by runWorker; a direct tool test
+	// must release it itself so later browser tests are not queued forever.
+	t.Cleanup(sb.ReleaseBrowser)
 	ctx := context.Background()
 
 	if _, err := sb.Call(ctx, ToolBrowserNavigate, map[string]any{"url": srv.URL}); err != nil {
@@ -103,6 +110,9 @@ func TestBrowser_ScreenshotSaved(t *testing.T) {
 
 	sb, _ := NewSandbox(t.TempDir())
 	sb.Browser = testBrowserClient(t)
+	// The leaf lease is normally released by runWorker; a direct tool test
+	// must release it itself so later browser tests are not queued forever.
+	t.Cleanup(sb.ReleaseBrowser)
 	ctx := context.Background()
 
 	if _, err := sb.Call(ctx, ToolBrowserNavigate, map[string]any{"url": srv.URL}); err != nil {
@@ -128,6 +138,101 @@ func TestBrowser_DisabledByDefault(t *testing.T) {
 	if _, err := sb.Call(context.Background(), ToolBrowserNavigate, map[string]any{"url": "https://x"}); err == nil ||
 		!strings.Contains(err.Error(), "-browser") {
 		t.Fatalf("expected disabled error, got %v", err)
+	}
+}
+
+func TestBrowser_LeafLease(t *testing.T) {
+	// A zero-value client works without a Chrome binary: lease logic is
+	// independent of the browser process.
+	b := &BrowserClient{}
+	ctx := context.Background()
+
+	// First acquire succeeds; the second holder must wait for release.
+	if err := b.Acquire(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got := make(chan error, 1)
+	go func() { got <- b.Acquire(ctx) }()
+	select {
+	case err := <-got:
+		t.Fatalf("second Acquire must block until release, got %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	b.Release()
+	select {
+	case err := <-got:
+		if err != nil {
+			t.Fatalf("queued Acquire should succeed after release: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("queued Acquire never unblocked after release")
+	}
+	b.Release()
+
+	// Double release is idempotent (no spurious second token).
+	b.Release()
+	if err := b.Acquire(ctx); err != nil {
+		t.Fatalf("re-acquire after redundant release failed: %v", err)
+	}
+	b.Release()
+}
+
+func TestBrowser_LeaseAcquireCancelable(t *testing.T) {
+	b := &BrowserClient{}
+	if err := b.Acquire(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer b.Release()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- b.Acquire(ctx) }()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("canceled acquire must return an error")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("canceled acquire did not return")
+	}
+}
+
+// TestBrowser_LeaseSerializesSandboxes proves the -parallel hazard is
+// closed: two leaf sandboxes sharing one client cannot hold the tab at once.
+func TestBrowser_LeaseSerializesSandboxes(t *testing.T) {
+	b := &BrowserClient{}
+	ctx := context.Background()
+	sb1, _ := NewSandbox(t.TempDir())
+	sb1.Browser = b
+	sb2, _ := NewSandbox(t.TempDir())
+	sb2.Browser = b
+	defer sb1.ReleaseBrowser()
+	defer sb2.ReleaseBrowser()
+
+	// Emulate a first browser tool call taking the lease (acquire directly,
+	// since no Chrome is available for a real call).
+	if err := b.Acquire(ctx); err != nil {
+		t.Fatal(err)
+	}
+	sb1.browserHeld = true
+
+	queued := make(chan error, 1)
+	go func() { queued <- sb2.acquireBrowserLease(ctx) }()
+	select {
+	case <-queued:
+		t.Fatal("second leaf must not get the browser while leaf 1 holds it")
+	case <-time.After(50 * time.Millisecond):
+	}
+	sb1.ReleaseBrowser()
+	select {
+	case err := <-queued:
+		if err != nil {
+			t.Fatalf("lease should transfer on release: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("lease never transferred to the waiting leaf")
 	}
 }
 

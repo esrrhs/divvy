@@ -143,6 +143,7 @@ Go 工作区验收失败时，Verifier 会从输出里抽取去重、单行截�
 - `browser_click`（CSS 选择器）、`browser_type`（输入文本，可先清空）、`browser_text`（读取元素/正文渲染文本）；
 - `browser_screenshot`：整页 **PNG** 存入工作区（`{"path":"shot.png"}`）。
 - 浏览器进程懒启动、跨叶子复用同一标签页；用户中断时才关闭。这也让 Web 前端交付物具备"真实浏览器交互"级别的验收手段。
+- `-parallel >1` 时多个叶子共享同一个浏览器：**叶子级租约**保证一个叶子的 navigate→click→type 多步流程不被另一个叶子的导航插队（per-action 锁只防数据竞争，防不了跨叶子串台）。叶子在首次浏览器工具调用时取租约、worker 结束（含失败/中断）时释放；等待取约可被 ctx 取消，从不用浏览器的叶子完全不受串行化影响。
 
 **结构化 HTTP（`-web` 下）**
 
@@ -151,7 +152,8 @@ Go 工作区验收失败时，Verifier 会从输出里抽取去重、单行截�
 **Git 只读工具（工作区为 git 仓库时）**
 
 - `git_status`、`git_diff`（可选 `staged`/`path`）、`git_log`（可选 `limit`/`path`）；均为只读，不改动仓库。
-- `review_diff`（可选 `staged`）：finish 前的**确定性自检**，解析 `git diff --unified=0` 只检查新增行——未解决的冲突标记（`<<<<<<<`/`=======`/`>>>>>>>`）、误留的调试语句（`fmt.Print*`、`println`、`console.log`、`debugger`、`pdb.set_trace`、`breakpoint`）、高置信硬编码密钥（私钥头、`AKIA…`、Slack token、带引号字面量的 `token/password/secret/api_key`），以及超过 600 行的大 diff 告警；每类最多列 10 条并提示省略数。干净时返回 `review_diff: clean (...)`，未跟踪文件不在 diff 内。
+- `review_diff`（可选 `staged`）：finish 前的**确定性自检**，解析 `git diff --unified=0` 只检查新增行——未解决的冲突标记（`<<<<<<<`/`=======`/`>>>>>>>`）、误留的调试语句（`fmt.Print*`、`println`、`console.log`、`debugger`、`pdb.set_trace`、`breakpoint`）、高置信硬编码密钥（私钥头、`AKIA…`、Slack token、带引号字面量的 `token/password/secret/api_key`），以及超过 600 行的大 diff 告警；每类最多列 10 条并提示省略数。干净时返回 `review_diff: clean (...)`。
+- **finish 自动门控**：叶子调用 finish 时引擎自动跑一次覆盖**未跟踪新文件**的 review（`git diff` 不包含新建文件，门控额外扫描 `git ls-files --others` 的文本文件，二进制自动跳过）。发现冲突标记或硬编码密钥则**拒绝 finish**，把问题清单作为工具结果回灌，叶子在新的一轮里修复后才能完成；调试残留和大 diff 只记录告警、不拦截。门控出错（非仓库/git 异常）时 fail-open，不会因为检查工具本身故障卡死交付。
 
 **代码/数据理解（默认可用）**
 
@@ -286,5 +288,6 @@ go test ./...
 - [x] 阶段 18：原子多点编辑与文件原语（replace_lines 的 edits 批量、delete_path、move_path）、Go 验收失败诊断块前置
 - [x] 阶段 19：引用查找（find_symbol references 文本级用法扫描）与 finish 前确定性自检 review_diff（冲突标记/调试残留/密钥/大 diff）
 - [x] 阶段 20：二进制下载 download_file（`-web` 门控、SSRF 防护复用、20MB 上限、失败清理）与只读 sqlite_query（纯 Go modernc 驱动、mode=ro/query_only、结果集压缩）
+- [x] 阶段 21：并发正确性收尾——浏览器叶子级租约（-parallel 下多步流程不再跨叶子串台、可取消等待）与 finish 自动门控（覆盖未跟踪新文件，冲突标记/密钥硬拦截并回灌、debug/大 diff 仅告警）
 
 弱模型上的 Prompt 与拆分粒度仍需按具体模型微调（`-max-depth`、`-max-steps`、`-extra`）。
