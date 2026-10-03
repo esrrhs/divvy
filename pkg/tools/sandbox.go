@@ -132,6 +132,49 @@ func (s *Sandbox) Rel(abs string) string {
 	return rel
 }
 
+// maxBatchReadFiles bounds how many files one read_file paths-batch may
+// return, protecting the model context from an over-broad request.
+const maxBatchReadFiles = 8
+
+// ReadFiles reads several whole files in one call (each capped independently
+// by MaxRead), returning them under "### path" headers. All paths are
+// validated up front so a single bad name fails the whole batch instead of
+// silently returning a partial list.
+func (s *Sandbox) ReadFiles(paths []string) (string, error) {
+	if len(paths) == 0 {
+		return "", fmt.Errorf("paths must contain at least one file")
+	}
+	if len(paths) > maxBatchReadFiles {
+		return "", fmt.Errorf("paths accepts at most %d files; narrow the list", maxBatchReadFiles)
+	}
+	// Validate every path up front so one bad name fails the whole batch.
+	for _, p := range paths {
+		a, err := s.Resolve(p)
+		if err != nil {
+			return "", err
+		}
+		info, err := os.Stat(a)
+		if err != nil {
+			return "", err
+		}
+		if info.IsDir() {
+			return "", fmt.Errorf("%s is a directory", p)
+		}
+	}
+	var b strings.Builder
+	for i, p := range paths {
+		content, err := s.ReadFile(p)
+		if err != nil {
+			return "", err
+		}
+		if i > 0 {
+			b.WriteString("\n")
+		}
+		fmt.Fprintf(&b, "### %s\n%s\n", filepath.ToSlash(p), content)
+	}
+	return strings.TrimRight(b.String(), "\n"), nil
+}
+
 // ReadFile reads a text file, truncating if necessary.
 func (s *Sandbox) ReadFile(path string) (string, error) {
 	abs, err := s.Resolve(path)

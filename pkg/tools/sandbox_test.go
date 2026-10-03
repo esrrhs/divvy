@@ -210,6 +210,54 @@ func TestSandbox_CallReadFileRange(t *testing.T) {
 	}
 }
 
+func TestSandbox_ReadFilesBatch(t *testing.T) {
+	sb, _ := NewSandbox(t.TempDir())
+	if err := sb.WriteFile("a.txt", "aaa\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := sb.WriteFile("dir/b.txt", "bbb\n"); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := sb.Call(context.Background(), ToolReadFile, map[string]any{
+		"paths": []any{"a.txt", "dir/b.txt"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"### a.txt", "aaa", "### dir/b.txt", "bbb"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("batch read missing %q:\n%s", want, out)
+		}
+	}
+	// Header order follows the requested order.
+	if strings.Index(out, "### a.txt") > strings.Index(out, "### dir/b.txt") {
+		t.Fatalf("batch order not preserved:\n%s", out)
+	}
+
+	// One missing path fails the whole batch (no partial return).
+	if _, err := sb.Call(context.Background(), ToolReadFile, map[string]any{
+		"paths": []any{"a.txt", "missing.txt"},
+	}); err == nil {
+		t.Fatal("batch with a missing file must fail")
+	}
+	// Empty batch and over-cap batch are rejected.
+	if _, err := sb.Call(context.Background(), ToolReadFile, map[string]any{
+		"paths": []any{},
+	}); err == nil {
+		t.Fatal("empty batch must fail")
+	}
+	many := make([]any, maxBatchReadFiles+1)
+	for i := range many {
+		many[i] = "a.txt"
+	}
+	if _, err := sb.Call(context.Background(), ToolReadFile, map[string]any{
+		"paths": many,
+	}); err == nil {
+		t.Fatalf("batch over %d files must fail", maxBatchReadFiles)
+	}
+}
+
 func TestSandbox_CallWrite(t *testing.T) {
 	dir := t.TempDir()
 	sb, err := NewSandbox(dir)

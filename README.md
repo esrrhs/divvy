@@ -77,9 +77,9 @@ export OPENAI_MODEL=qwen2.5-coder:14b
 
 叶子执行**不携带**其它叶子的对话历史，只注入：当前任务、契约、父节点/依赖摘要、少量相关文件、验收命令。
 `search_files` 用正则搜索文件内容并返回紧凑的 `相对路径:行号:匹配行`：修改现有代码时，弱模型用它一次定位符号，不必逐个读整个文件，省步骤也省上下文（自动跳过 `.git` 等目录，可用 `glob` 过滤，默认忽略大小写）。`find_files` 则按文件名 glob 查找（`*_test.go` 裸模式按 basename 递归匹配任意深度，`pkg/*.go` 按相对路径匹配），返回路径列表。
-`read_file` 支持可选的 `start_line`/`end_line`（1-indexed、含端点，返回带行号的片段）：配合 `search_files` 的行号只读目标区段，大文件也能直接跳到 64KB 整读截断点之后，无需在 shell 里拼 `sed`。`run_bash` 支持 `timeout_sec`（默认 60s），跑 `npm install`、`cargo build` 这类慢命令时显式放大超时。
+`read_file` 支持可选的 `start_line`/`end_line`（1-indexed、含端点，返回带行号的片段）：配合 `search_files` 的行号只读目标区段，大文件也能直接跳到 64KB 整读截断点之后，无需在 shell 里拼 `sed`。也支持 `{"paths":["a.go","b.go"]}` **一次批量读最多 8 个文件**（各自独立套 64KB 上限，带 `### path` 分隔头）——弱模型每轮只能调一个工具，批量读把"看 N 个相关文件"从 N 次 LLM 往返压成 1 次；任一路径不存在则整批失败，不会返回半截结果。`run_bash` 支持 `timeout_sec`（默认 60s），跑 `npm install`、`cargo build` 这类慢命令时显式放大超时。
 `replace_lines` 除行号区间和单点 `old_string`/`new_string` 外，还接受 `edits: [{old_string,new_string}…]` **批量原子编辑**：所有锚点先在内存里逐条校验（缺失或不唯一即整体失败、文件一字节都不改），全部通过后才一次写回——同一文件改多处不必串行多轮，也不会留下半改状态，用文本锚点还能避开行号漂移。`delete_path`（删目录必须显式 `recursive:true`，工作区根目录受保护）和 `move_path`（工作区内重命名/移动，禁止移入自身子树）让删除和重命名走沙箱校验，不用再借 `run_bash` 拼 `rm`/`mv`。
-Go 工作区验收失败时，Verifier 会从输出里抽取去重、单行截断的 `file:line: message` 编译/测试诊断（含 `--- FAIL`/`panic` 状态行，最多 25 行）作为**诊断块前置**到错误全文之前；重试叶子只截取错误前缀注入上下文（4000 字符），根因因此一定在最显眼的位置，原始日志完整附在块后。
+验收失败时，Verifier 会按已探测的技术栈从输出里抽取去重、单行截断的根因诊断（最多 25 行）作为**诊断块前置**到错误全文之前；重试叶子只截取错误前缀注入上下文（4000 字符），根因因此一定在最显眼的位置，原始日志完整附在块后。目前覆盖：Go（`x.go:4:2: undefined:`、`--- FAIL`、`panic`）、Python（traceback 的 `File "x", line N`、`XError:`、pytest 的 `E` 行与 `FAILED`）、Rust（`error[E0xxx]:`、`--> file:line:col`、`panicked at`）、Node/TypeScript（tsc 的 `x.ts(10,5): error TS…`、Node 的源码位置行与 `ReferenceError:` 等异常头；刻意不收冗长的 `at …` 栈帧）。
 没有依赖关系的就绪叶子可以并发执行（`-parallel N`，默认 `1`）；每次 LLM 调用的 token 用量按节点记入任务树并随会话持久化，运行结束打印本次与会话累计（resume 后自动累加），树状进度与 `-status` 里也会显示每个节点的消耗。
 
 开启隔离（`-isolate`，`-parallel >1` 时自动生效）后，叶子在主工作区的**临时镜像副本**里写代码、跑验收命令：
@@ -158,6 +158,7 @@ Go 工作区验收失败时，Verifier 会从输出里抽取去重、单行截�
 **代码/数据理解（默认可用）**
 
 - `find_symbol`：按名字定位定义——**Go 走真实 AST**（func/type/var 精确到行），其它语言回退正则；加 `references:true` 则做**文本级引用扫描**（词边界匹配、过滤函数/类型/变量声明行，复用 `search_files` 的输出形态；不做类型分析，注释和字符串里的同名提及也会出现，别名/动态调用会漏掉），改签名前先看谁在用；
+- `outline`：`{"path":"x.go"}` 返回单个文件的**顶层声明地图**（带行号）：Go 走真实 AST，func/方法显示完整签名、type 显示底层形状（`type Widget struct`）、函数体一律省略；其它语言按 def/class/fn/struct/enum/trait 等声明模式回退。探索陌生文件时先 outline 拿地图，再用 `read_file` 的行号区间精读，比整读省上下文、比 find_symbol（需先知名字）更适合浏览；
 - `json_query`：用点号/方括号路径（`items.0.name`、`items[0].name`）从大 JSON 里抽单个值，避免整文件进上下文。
 - `sqlite_query`：`{"path":"data.db","query":"SELECT ...","limit":50}` 对工作区内的 SQLite 数据库跑**只读**查询（`mode=ro` + `query_only`，只接受单条 SELECT/WITH/PRAGMA/EXPLAIN，带分号的多语句直接拒绝）；返回 `columns:` 头加每行一个 JSON 数组，NULL 正常显示、BLOB 标注字节数、单元格超 500 字符截断，默认 50 行（上限 200）。使用**纯 Go 驱动** [modernc.org/sqlite](https://pkg.go.dev/modernc.org/sqlite)，无需 cgo 或本机 sqlite3 CLI——弱模型不必再拼命令行、也不会因环境缺工具而失败。
 
@@ -289,5 +290,6 @@ go test ./...
 - [x] 阶段 19：引用查找（find_symbol references 文本级用法扫描）与 finish 前确定性自检 review_diff（冲突标记/调试残留/密钥/大 diff）
 - [x] 阶段 20：二进制下载 download_file（`-web` 门控、SSRF 防护复用、20MB 上限、失败清理）与只读 sqlite_query（纯 Go modernc 驱动、mode=ro/query_only、结果集压缩）
 - [x] 阶段 21：并发正确性收尾——浏览器叶子级租约（-parallel 下多步流程不再跨叶子串台、可取消等待）与 finish 自动门控（覆盖未跟踪新文件，冲突标记/密钥硬拦截并回灌、debug/大 diff 仅告警）
+- [x] 阶段 22：少轮次与全栈诊断——read_file 的 paths 批量读（最多 8 个文件/次）、outline 顶层声明地图（Go AST 签名、其它语言模式回退）、诊断压缩扩展到 Python/Rust/Node
 
 弱模型上的 Prompt 与拆分粒度仍需按具体模型微调（`-max-depth`、`-max-steps`、`-extra`）。

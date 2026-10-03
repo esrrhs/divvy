@@ -15,14 +15,81 @@ const maxCompactDiagnostics = 25
 // so one diagnostic cannot crowd the others out of the prompt.
 const maxDiagnosticLineLen = 240
 
-var (
-	// goLocationLine matches compiler/vet/test lines anchored at a .go file,
-	// relative (./pkg/x.go:3:2: ...), absolute (/a/b/x.go:3:2: ...), or bare
-	// indented test assertions (    x_test.go:10: expected ...).
-	goLocationLine = regexp.MustCompile(`^\s*(?:\S*[\\/])?[\w.-]+\.go:\d+(?::\d+)?: .+$`)
-	// goStatusLine catches test/build verdicts that carry no file location.
-	goStatusLine = regexp.MustCompile(`^(?:--- FAIL: .*|FAIL(?:\s|$).*|panic: .*)$`)
-)
+// diagMatcher recognizes file-anchored error lines (which carry the
+// location) and status/error-header lines (which carry the verdict or
+// exception class) in one toolchain's output.
+type diagMatcher struct {
+	anchored []*regexp.Regexp
+	status   []*regexp.Regexp
+}
+
+func (m diagMatcher) matches(line string) bool {
+	for _, re := range m.anchored {
+		if re.MatchString(line) {
+			return true
+		}
+	}
+	for _, re := range m.status {
+		if re.MatchString(line) {
+			return true
+		}
+	}
+	return false
+}
+
+// diagMatchers maps detected project types to their output patterns. Every
+// pattern is intentionally narrow: the block must contain root causes, not
+// the whole log.
+var diagMatchers = map[ProjectType]diagMatcher{
+	ProjectGo: {
+		anchored: []*regexp.Regexp{
+			// ./x.go:4:2: undefined: nope  (also absolute/indented forms)
+			regexp.MustCompile(`^\s*(?:\S*[\\/])?[\w.-]+\.go:\d+(?::\d+)?: .+$`),
+		},
+		status: []*regexp.Regexp{
+			regexp.MustCompile(`^(?:--- FAIL: .*|FAIL(?:\s|$).*|panic: .*)$`),
+		},
+	},
+	ProjectPython: {
+		anchored: []*regexp.Regexp{
+			//   File "app.py", line 12, in main
+			regexp.MustCompile(`^\s*File\s+"[^"]+",\s*line\s+\d+`),
+		},
+		status: []*regexp.Regexp{
+			// NameError: name 'x' is not defined / module.Err: ...
+			regexp.MustCompile(`^[A-Za-z_]\w*(?:\.[\w.]+)*(?:Error|Exception|Warning)\b:.*$`),
+			// pytest embeds the exception under an "E" prefix:
+			// E       AssertionError: assert 1 == 2
+			regexp.MustCompile(`^E\s+\S*(?:Error|Exception)\b:.*$`),
+			regexp.MustCompile(`^FAILED\s+.+$`),
+		},
+	},
+	ProjectRust: {
+		anchored: []*regexp.Regexp{
+			//   --> src/main.rs:3:9
+			regexp.MustCompile(`^\s*-->\s*\S+:\d+:\d+`),
+			// thread '...' panicked at 'msg', src/main.rs:3:9
+			regexp.MustCompile(`panicked at\s+.*:\d+:\d+`),
+		},
+		status: []*regexp.Regexp{
+			regexp.MustCompile(`^error(?:\[\w+\])?: .+$`),
+			regexp.MustCompile(`^test\s+.+\s+\.\.\.\s*FAILED$`),
+		},
+	},
+	ProjectNode: {
+		anchored: []*regexp.Regexp{
+			// tsc: src/x.ts(10,5): error TS2304: Cannot find name 'y'.
+			regexp.MustCompile(`^\S+\.(?:ts|tsx|js|jsx|mjs|cjs)\(\d+,\d+\):\s*(?:error|note)\b.*$`),
+			// Node runtime source-location line: /app/x.js:3 or
+			// file:///app/x.mjs:3
+			regexp.MustCompile(`^(?:file://)?/\S+\.(?:ts|tsx|js|jsx|mjs|cjs):\d+$`),
+		},
+		status: []*regexp.Regexp{
+			// ReferenceError: y is not defined / SyntaxError: Unexpected token
+			regexp.MustCompile(`^[\w.]*Error: .+$`),
+		},
+	},
+}
 
 // CompactDiagnostics extracts the root-cause lines from a failed build/test
 // output and renders them as a short block suitable for prepending to the raw
@@ -30,17 +97,18 @@ var (
 // Unsupported toolchains, or output without recognizable diagnostics, return
 // "" so callers can prepend unconditionally on a non-empty result.
 func CompactDiagnostics(project ProjectType, output string) string {
-	if project != ProjectGo || strings.TrimSpace(output) == "" {
+	matcher, ok := diagMatchers[project]
+	if !ok || strings.TrimSpace(output) == "" {
 		return ""
 	}
 	seen := map[string]bool{}
 	var lines []string
 	skipped := 0
 	for _, line := range strings.Split(output, "\n") {
-		if !goLocationLine.MatchString(line) && !goStatusLine.MatchString(line) {
+		if !matcher.matches(line) {
 			continue
 		}
-		// Normalize whitespace so the same error repeated with different
+		// Normalize whitespace so the same error reached via different
 		// indentation/tabs counts once.
 		key := strings.Join(strings.Fields(line), " ")
 		if seen[key] {

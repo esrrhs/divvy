@@ -35,6 +35,7 @@ const (
 	ToolReviewDiff = "review_diff"
 
 	ToolFindSymbol  = "find_symbol"
+	ToolOutline     = "outline"
 	ToolJSONQuery   = "json_query"
 	ToolSQLiteQuery = "sqlite_query"
 
@@ -52,6 +53,7 @@ Tools (call exactly one per turn):
 - list_dir: {"path":".","recursive":true}
 - read_file: {"path":"file.go","start_line":100,"end_line":200}
   start_line/end_line are optional, 1-indexed and inclusive; lines come back numbered. Omit them to read the whole file.
+  batch: {"paths":["a.go","b.go"]} reads up to 8 whole files at once with ### path headers (one turn instead of many)
 - write_file: {"path":"file.go","content":"...full file..."}
 - replace_lines: {"path":"file.go","start_line":1,"end_line":3,"content":"new lines"}
   alternative: {"path":"file.go","old_string":"exact old","new_string":"exact new"}
@@ -87,6 +89,7 @@ func CodeDescriptions() string {
 	return strings.TrimSpace(`
 - find_symbol: {"name":"Foo","kind":"func|type|var","glob":"*.go","references":true}
   (default: definition locations, Go uses a real AST; references:true = text-level usage sites, declarations excluded but comments/strings are included)
+- outline: {"path":"file.go"}  (top-level declarations of one file with line numbers — functions/methods/types/vars; Go shows real signatures, other languages use patterns. Read this first in an unfamiliar file, then read_file the line ranges you need)
 - json_query: {"path":"file.json","query":"items.0.name"}  (extract one value via dotted/bracket path)
 - sqlite_query: {"path":"data.db","query":"SELECT id, name FROM users LIMIT 50","limit":50}
   (read-only SELECT/WITH/PRAGMA/EXPLAIN against a workspace .db; returns a columns header plus JSON-array rows; blobs shown by size)
@@ -156,11 +159,13 @@ func nativeDef(name, description string, props map[string]string, required []str
 	}
 }
 
-// NativeCodeTools returns find_symbol/json_query definitions.
+// NativeCodeTools returns find_symbol/outline/json_query/sqlite definitions.
 func NativeCodeTools() []map[string]any {
 	return []map[string]any{
 		nativeDef(ToolFindSymbol, "Locate definitions by name (Go uses the real AST), or with references:true list text-level usage sites.",
 			map[string]string{"name": "string", "kind": "string", "glob": "string", "references": "boolean"}, []string{"name"}),
+		nativeDef(ToolOutline, "List a file's top-level declarations with line numbers (Go uses the real AST with signatures); use it to map an unfamiliar file before reading ranges.",
+			map[string]string{"path": "string"}, []string{"path"}),
 		nativeDef(ToolJSONQuery, "Extract one value from a JSON file by a dotted/bracket path.",
 			map[string]string{"path": "string", "query": "string"}, []string{"path"}),
 		nativeDef(ToolSQLiteQuery, "Run one read-only SELECT/WITH/PRAGMA/EXPLAIN query against a workspace SQLite database.",
@@ -235,11 +240,16 @@ func NativeTools() []map[string]any {
 			"path":      str("Relative directory path"),
 			"recursive": map[string]any{"type": "boolean"},
 		}, []string{"path"})),
-		fn(ToolReadFile, "Read a UTF-8 text file, optionally an inclusive 1-indexed line range; ranged output is numbered.", obj(map[string]any{
+		fn(ToolReadFile, "Read a UTF-8 text file, optionally an inclusive 1-indexed line range; ranged output is numbered. Also accepts paths (up to 8) to batch-read several whole files.", obj(map[string]any{
 			"path":       str("Relative file path"),
 			"start_line": map[string]any{"type": "integer", "description": "First line to read (1-indexed)"},
 			"end_line":   map[string]any{"type": "integer", "description": "Last line to read, inclusive; defaults to EOF"},
-		}, []string{"path"})),
+			"paths": map[string]any{
+				"type":        "array",
+				"description": "Batch mode: read up to 8 whole files, returned under ### path headers.",
+				"items":       map[string]any{"type": "string"},
+			},
+		}, []string{})),
 		fn(ToolWriteFile, "Create or overwrite a whole file.", obj(map[string]any{
 			"path":    str("Relative file path"),
 			"content": str("Full file contents"),
@@ -340,6 +350,13 @@ func (s *Sandbox) Call(ctx context.Context, name string, args map[string]any) (s
 		return out, nil
 
 	case ToolReadFile:
+		if raw, ok := args["paths"]; ok && raw != nil {
+			paths, err := stringsArg(args, "paths")
+			if err != nil {
+				return "", err
+			}
+			return s.ReadFiles(paths)
+		}
 		path, err := requireString(args, "path")
 		if err != nil {
 			return "", err
@@ -552,6 +569,13 @@ func (s *Sandbox) Call(ctx context.Context, name string, args map[string]any) (s
 		kind, _ := stringArg(args, "kind")
 		return s.FindSymbol(ctx, n, kind, glob)
 
+	case ToolOutline:
+		p, err := requireString(args, "path")
+		if err != nil {
+			return "", err
+		}
+		return s.Outline(p)
+
 	case ToolJSONQuery:
 		p, err := requireString(args, "path")
 		if err != nil {
@@ -642,7 +666,7 @@ func (s *Sandbox) Call(ctx context.Context, name string, args map[string]any) (s
 		return summary, nil
 
 	default:
-		return "", fmt.Errorf("unknown tool %q; use list_dir, read_file, write_file, replace_lines, delete_path, move_path, run_bash, search_files, find_files, web_search, web_fetch, download_file, sqlite_query, finish", name)
+		return "", fmt.Errorf("unknown tool %q; use list_dir, read_file, write_file, replace_lines, delete_path, move_path, run_bash, search_files, find_files, outline, web_search, web_fetch, download_file, sqlite_query, finish", name)
 	}
 }
 
@@ -694,6 +718,28 @@ func requireString(args map[string]any, key string) (string, error) {
 		return "", fmt.Errorf("missing %s", key)
 	}
 	return s, nil
+}
+
+// stringsArg parses a string-array argument such as read_file "paths":
+// ["a.go", "b.go"]. Non-string elements are stringified via JSON.
+func stringsArg(args map[string]any, key string) ([]string, error) {
+	raw, ok := args[key]
+	if !ok || raw == nil {
+		return nil, fmt.Errorf("missing %s", key)
+	}
+	list, ok := raw.([]any)
+	if !ok {
+		return nil, fmt.Errorf("%s must be an array of strings", key)
+	}
+	out := make([]string, 0, len(list))
+	for _, item := range list {
+		s, ok := item.(string)
+		if !ok {
+			return nil, fmt.Errorf("%s entries must be strings", key)
+		}
+		out = append(out, s)
+	}
+	return out, nil
 }
 
 // editsArg parses a replace_lines "edits" batch:

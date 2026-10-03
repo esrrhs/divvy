@@ -55,6 +55,7 @@ Tools:
 - list_dir: {"path":".","recursive":true}
 - read_file: {"path":"file.go","start_line":100,"end_line":200}
   start_line/end_line optional, 1-indexed inclusive; lines come back numbered. Omit to read the whole file.
+  or {"paths":["a.go","b.go"]} to batch-read up to 8 whole files in one turn.
 - write_file: {"path":"file.go","content":"full file contents"}
 - replace_lines: {"path":"file.go","start_line":1,"end_line":3,"content":"replacement"}
   or {"path":"file.go","old_string":"exact old text","new_string":"exact new text"}

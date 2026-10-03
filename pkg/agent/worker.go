@@ -235,7 +235,7 @@ func nativeToolDefs(sb *tools.Sandbox) []llm.Tool {
 
 func previewArgs(act taggedAction) string {
 	switch act.Name {
-	case tools.ToolReadFile, tools.ToolWriteFile, tools.ToolReplaceLines, tools.ToolListDir, tools.ToolDeletePath:
+	case tools.ToolReadFile, tools.ToolWriteFile, tools.ToolReplaceLines, tools.ToolListDir, tools.ToolDeletePath, tools.ToolOutline:
 		p, _ := stringFromArgs(act.Args, "path")
 		return p
 	case tools.ToolMovePath:
