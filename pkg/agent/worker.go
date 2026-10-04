@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -41,7 +42,7 @@ func (o *Orchestrator) runWorker(ctx context.Context, sb *tools.Sandbox, node *m
 
 		resp, err := o.chat(ctx, "worker", node.ID, llm.Request{
 			Model:       o.cfg.Model,
-			Messages:    messages,
+			Messages:    o.stepBudgetMessages(messages, step, maxSteps),
 			Tools:       native,
 			Temperature: o.cfg.Temperature,
 			MaxTokens:   o.cfg.MaxTokens,
@@ -168,7 +169,43 @@ func (o *Orchestrator) runWorker(ctx context.Context, sb *tools.Sandbox, node *m
 	if summary == "" {
 		summary = "max steps reached"
 	}
-	return summary, nil
+	// Running out of steps is a failure, not a finish: the model never
+	// claimed the work was done, so its files may be half-written and the
+	// pre-finish review gate never ran. Returning nil here used to send the
+	// attempt straight to verification, where a placeholder DoD (`ls`)
+	// could mark an unfinished leaf COMPLETED.
+	return summary, fmt.Errorf("%w: used all %d tool calls without calling finish — on the next attempt, call finish as soon as the task is done instead of starting another edit", ErrMaxSteps, maxSteps)
+}
+
+// ErrMaxSteps marks a leaf attempt that exhausted its tool-call budget
+// without the model calling finish. Callers treat it like any other attempt
+// failure (retry, then re-split or give up), never as success.
+var ErrMaxSteps = errors.New("max tool calls reached")
+
+// stepBudgetWindow is how many calls before the end of the budget the worker
+// starts telling the model what it has left. Small models lose track of the
+// turn count long before the last call, so a late reminder is worth little.
+const stepBudgetWindow = 3
+
+// stepBudgetMessages returns the messages to send for one worker step. In the
+// last few steps it appends a reminder of how many tool calls remain, which
+// is the difference between a weak model calling finish in time and losing
+// the whole attempt. The reminder is added to a copy: it must not become part
+// of the persisted history, or every later step would inherit a stale count.
+func (o *Orchestrator) stepBudgetMessages(messages []llm.Message, step, maxSteps int) []llm.Message {
+	remaining := maxSteps - step + 1
+	if remaining > stepBudgetWindow || remaining <= 0 {
+		return messages
+	}
+	hint := llm.Message{
+		Role: llm.RoleUser,
+		Content: fmt.Sprintf("[budget] %d tool call(s) left before this attempt is abandoned. "+
+			"Call finish now with a summary of what is done; do not start another edit.", remaining),
+	}
+	out := make([]llm.Message, 0, len(messages)+1)
+	out = append(out, messages...)
+	out = append(out, hint)
+	return out
 }
 
 type taggedAction struct {
@@ -380,7 +417,7 @@ func (o *Orchestrator) projectContext(sb *tools.Sandbox, node *models.TaskNode, 
 	}
 
 	if prevError != "" {
-		fmt.Fprintf(&b, "\nPrevious attempt failed verification. Fix this error:\n%s\n", truncate(prevError, 4000))
+		fmt.Fprintf(&b, "\nPrevious attempt failed. Fix this error:\n%s\n", truncate(prevError, 4000))
 	}
 	b.WriteString("\nStart by listing or reading only what you need, then implement the task.")
 	return b.String()
