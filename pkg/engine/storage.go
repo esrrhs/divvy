@@ -98,6 +98,97 @@ func (s *Storage) LoadTree(sessionID string) (*TaskTree, error) {
 	return tree, nil
 }
 
+// SessionArtifacts lists every file on disk that belongs to one session: the
+// task tree plus its run log and JSONL event stream, when they exist.
+type SessionArtifacts struct {
+	ID    string
+	Paths []string
+	Bytes int64
+}
+
+// PruneResult reports what a prune removed (or would remove under a dry run).
+type PruneResult struct {
+	Removed []SessionArtifacts // oldest first
+	Kept    []string           // session ids left on disk
+	Bytes   int64
+}
+
+// PlanPrune chooses which sessions a prune with the given keep count would
+// delete: the oldest ones beyond `keep`, newest-first ordering. The session
+// the LATEST pointer names is exempt, so a prune can never orphan the session
+// a plain `-resume` would pick up.
+func (s *Storage) PlanPrune(keep int) (*PruneResult, error) {
+	if keep < 1 {
+		return nil, fmt.Errorf("keep must be >= 1 (got %d): pruning everything would delete the session you are working on", keep)
+	}
+	sessions, err := s.ListSessions()
+	if err != nil {
+		return nil, err
+	}
+	latest := s.latestID()
+	res := &PruneResult{}
+	for i, info := range sessions {
+		if i < keep || info.ID == latest {
+			res.Kept = append(res.Kept, info.ID)
+			continue
+		}
+		art := SessionArtifacts{ID: info.ID, Paths: s.existingArtifacts(info.ID)}
+		for _, p := range art.Paths {
+			if st, serr := os.Stat(p); serr == nil {
+				art.Bytes += st.Size()
+			}
+		}
+		res.Removed = append(res.Removed, art)
+		res.Bytes += art.Bytes
+	}
+	return res, nil
+}
+
+// PruneSessions deletes the sessions chosen by PlanPrune, along with their
+// run log and event stream. Unreadable files are skipped and reported rather
+// than aborting the whole prune.
+func (s *Storage) PruneSessions(keep int) (*PruneResult, error) {
+	plan, err := s.PlanPrune(keep)
+	if err != nil {
+		return nil, err
+	}
+	for i := range plan.Removed {
+		var kept []string
+		for _, p := range plan.Removed[i].Paths {
+			if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+				kept = append(kept, p)
+			}
+		}
+		plan.Removed[i].Paths = kept
+	}
+	return plan, nil
+}
+
+// existingArtifacts returns the paths of the files that exist for a session.
+func (s *Storage) existingArtifacts(id string) []string {
+	candidates := []string{
+		s.GetTreeFilePath(id),
+		filepath.Join(s.baseDir, "logs", id+".log"),
+		filepath.Join(s.baseDir, "events", id+".jsonl"),
+	}
+	out := make([]string, 0, len(candidates))
+	for _, p := range candidates {
+		if _, err := os.Stat(p); err == nil {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// latestID reads the LATEST pointer, returning "" when there is none.
+func (s *Storage) latestID() string {
+	data, err := os.ReadFile(filepath.Join(s.baseDir, "LATEST"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
 // TreeExists checks whether a persisted session tree exists.
 func (s *Storage) TreeExists(sessionID string) bool {
 	targetPath := s.GetTreeFilePath(sessionID)

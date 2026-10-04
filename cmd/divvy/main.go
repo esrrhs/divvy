@@ -43,6 +43,7 @@ func run(args []string) error {
 	extra := fs.String("extra", "", "extra JSON merged into chat request body")
 	maxSteps := fs.Int("max-steps", cfg.MaxSteps, "max tool calls per leaf attempt")
 	maxRetries := fs.Int("max-retries", cfg.MaxRetries, "max verify retries per leaf (0 = unlimited)")
+	maxStall := fs.Int("max-stall", cfg.MaxStall, "give up on a leaf after this many identical failures in a row (0 = never)")
 	maxElapsed := fs.Duration("max-elapsed", cfg.MaxElapsed, "wall-clock budget for one leaf across all attempts (0 = unlimited)")
 	retryMaxWait := fs.Duration("retry-max-wait", cfg.RetryMaxInterval, "exponential backoff cap between retries")
 	maxDepth := fs.Int("max-depth", cfg.MaxDepth, "max decomposition depth")
@@ -66,6 +67,10 @@ func run(args []string) error {
 	guided := fs.Bool("guided", false, "human-in-the-loop: plan, review/approve, then execute (mid-run plan edits and questions)")
 	listSessions := fs.Bool("sessions", false, "list saved sessions and exit")
 	status := fs.Bool("status", false, "print saved tree and exit")
+	report := fs.Bool("report", false, "print a post-mortem summary of a saved session and exit (-session or LATEST)")
+	prune := fs.Bool("prune", false, "delete old saved sessions, keeping the newest -keep ones (LATEST is never removed)")
+	keep := fs.Int("keep", 5, "with -prune: how many recent sessions to keep")
+	dryRun := fs.Bool("dry-run", false, "with -prune: only show what would be deleted")
 	showLog := fs.Bool("log", false, "print this session's run log and exit (-session or LATEST)")
 	showEvents := fs.Bool("events", false, "print this session's JSONL event stream and exit (-session or LATEST)")
 	verbose := fs.Bool("v", false, "verbose logs (raw model snippets, tool output)")
@@ -86,6 +91,7 @@ func run(args []string) error {
 	cfg.ExtraJSON = *extra
 	cfg.MaxSteps = *maxSteps
 	cfg.MaxRetries = *maxRetries
+	cfg.MaxStall = *maxStall
 	cfg.MaxElapsed = *maxElapsed
 	cfg.RetryMaxInterval = *retryMaxWait
 	cfg.MaxDepth = *maxDepth
@@ -232,12 +238,25 @@ func run(args []string) error {
 		return nil
 	}
 
+	if *prune {
+		return pruneSessions(cfg, *keep, *dryRun)
+	}
+
 	if *status {
 		o, err := agent.Load(cfg, nil, log)
 		if err != nil {
 			return err
 		}
 		o.Status()
+		return nil
+	}
+
+	if *report {
+		o, err := agent.Load(cfg, nil, log)
+		if err != nil {
+			return err
+		}
+		fmt.Print(o.Report())
 		return nil
 	}
 
@@ -259,6 +278,9 @@ func run(args []string) error {
 	}
 	if cfg.MaxRetries < 0 {
 		return fmt.Errorf("-max-retries must be >= 0")
+	}
+	if cfg.MaxStall < 0 {
+		return fmt.Errorf("-max-stall must be >= 0")
 	}
 
 	client := llm.NewOpenAIClient(cfg.APIKey, cfg.BaseURL, cfg.RequestTimeout)
@@ -297,6 +319,53 @@ func run(args []string) error {
 	}
 	log.Okf("done in %s", time.Since(start).Truncate(time.Millisecond))
 	return nil
+}
+
+// pruneSessions drops the oldest saved sessions and their logs/event streams.
+// It never touches the LATEST session, so a bare `-resume` keeps working.
+func pruneSessions(cfg agent.Config, keep int, dryRun bool) error {
+	storage, err := engine.NewStorage(cfg.DataDir)
+	if err != nil {
+		return err
+	}
+	verb := "deleted"
+	plan, err := storage.PlanPrune(keep)
+	if err != nil {
+		return err
+	}
+	if dryRun {
+		verb = "would delete"
+	} else {
+		plan, err = storage.PruneSessions(keep)
+		if err != nil {
+			return err
+		}
+	}
+	if len(plan.Removed) == 0 {
+		fmt.Printf("nothing to prune: %d session(s) in %s, keeping %d\n", len(plan.Kept), cfg.DataDir, keep)
+		return nil
+	}
+	for _, art := range plan.Removed {
+		for _, p := range art.Paths {
+			fmt.Printf("%s %s (%s)\n", verb, p, art.ID)
+		}
+	}
+	fmt.Printf("%s %d session(s), %s; %d kept\n", verb, len(plan.Removed), humanBytes(plan.Bytes), len(plan.Kept))
+	return nil
+}
+
+// humanBytes renders a byte count compactly for the prune summary.
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for v := n / unit; v >= unit; v /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
 // printSessionArtifact streams one session's run log (events=false) or JSONL
@@ -341,6 +410,8 @@ Usage:
   divvy -guided [flags] <goal>
   divvy -resume [-session ID]
   divvy -status [-session ID]
+  divvy -report [-session ID]   # 事后复盘：进度、成本、重试/停滞、失败原因
+  divvy -prune -keep 5          # 清理旧会话（-dry-run 先看清单）
   divvy -log [-session ID]     # 查看运行日志（时间戳文本）
   divvy -events [-session ID]  # 查看结构化事件流（JSONL，便于 jq/grep）
 
@@ -357,7 +428,9 @@ Examples:
   divvy -resume -workdir ./ws        # 再执行
 
   divvy -max-cost 1 -budget-tokens 200000 -workdir ./ws "目标"
-  divvy -max-retries 0 -max-elapsed 30m -workdir ./ws "目标"   # 无限重试时务必加时间闸门
+  divvy -max-retries 0 -max-elapsed 30m -max-stall 3 -workdir ./ws "目标"   # 无限重试时的两道闸门
+  divvy -report                   # 事后看这次跑得怎么样
+  divvy -prune -keep 5 -dry-run   # 旧会话占空间时的清理清单
   divvy -parallel 4 -workdir ./ws "拆成多个独立模块的目标"
   divvy -git-commit -workdir ./ws "每个叶子一个提交，便于审计回滚"
   divvy -isolate -workdir ./ws "叶子失败不污染工作区"

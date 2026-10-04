@@ -173,7 +173,117 @@ func (r *EventRecorder) LLMCall(kind, nodeID string, req llm.Request, resp *llm.
 	r.Record("llm_call", nodeID, fields)
 }
 
-// ToolCall records one worker tool invocation with arguments and output summaries.
+// EventSummary is a post-mortem roll-up of one session's JSONL event stream.
+// The tree already records where the run *ended*; this records how it got
+// there — how many attempts, retries and interventions it took.
+type EventSummary struct {
+	Counts     map[string]int // event kind -> occurrences
+	LLMCalls   int
+	ToolCalls  int
+	ToolErrors int
+	VerifyFail int
+	Retries    int
+	Stalls     int
+	Resplits   int
+	GiveUps    int
+	Timeouts   int
+	Outcome    string    // from the newest session_end, "" if the run never ended cleanly
+	DurationMS int64     // wall clock of the newest session_end
+	FirstTS    time.Time // newest session_start, i.e. the latest entry point
+	LastTS     time.Time
+	Malformed  int // lines that were not valid JSON objects
+	Available  bool
+}
+
+// SummarizeEvents reads one session's event stream and rolls it up. A missing
+// or unreadable stream is not an error: reports degrade to tree-only.
+func SummarizeEvents(path string) (EventSummary, error) {
+	s := EventSummary{Counts: map[string]int{}}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return s, nil
+		}
+		return s, err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var ev map[string]any
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			s.Malformed++
+			continue
+		}
+		s.Available = true
+		kind, _ := ev["kind"].(string)
+		s.Counts[kind]++
+		switch kind {
+		case "llm_call":
+			s.LLMCalls++
+		case "tool_call":
+			s.ToolCalls++
+			if ok, isBool := ev["ok"].(bool); isBool && !ok {
+				s.ToolErrors++
+			}
+		case "verify":
+			if ok, isBool := ev["ok"].(bool); isBool && !ok {
+				s.VerifyFail++
+			}
+		case "retry":
+			s.Retries++
+		case "leaf_stall":
+			s.Stalls++
+		case "leaf_resplit":
+			s.Resplits++
+		case "leaf_giveup":
+			s.GiveUps++
+		case "leaf_timeout":
+			s.Timeouts++
+		case "session_start":
+			if ts, ok := eventTime(ev); ok {
+				s.FirstTS = ts
+			}
+		case "session_end":
+			if ts, ok := eventTime(ev); ok {
+				s.LastTS = ts
+			}
+			if v, ok := ev["outcome"].(string); ok {
+				s.Outcome = v
+			}
+			if v, ok := ev["duration_ms"].(float64); ok {
+				s.DurationMS = int64(v)
+			}
+		}
+		if ts, ok := eventTime(ev); ok && (s.LastTS.IsZero() || ts.After(s.LastTS)) {
+			s.LastTS = ts
+		}
+	}
+	return s, nil
+}
+
+// eventTime parses the RFC3339 timestamp recorded on every event.
+func eventTime(ev map[string]any) (time.Time, bool) {
+	v, ok := ev["ts"].(string)
+	if !ok {
+		return time.Time{}, false
+	}
+	ts, err := time.Parse(time.RFC3339Nano, v)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return ts, true
+}
+
+// Total returns the number of events of any kind.
+func (s EventSummary) Total() int {
+	n := 0
+	for _, v := range s.Counts {
+		n += v
+	}
+	return n
+}
 func (r *EventRecorder) ToolCall(nodeID, tool string, args map[string]any, out string, callErr error, start time.Time) {
 	fields := map[string]any{
 		"tool":        tool,
