@@ -33,6 +33,12 @@ type Config struct {
 	Parallel       int  // concurrent leaf executions; <= 1 means serial
 	Isolate        bool // run each leaf in a mirror copy of the workspace; merge only on success
 
+	// MaxElapsed bounds the wall-clock time a single leaf may spend across
+	// all of its attempts (0 = unlimited). It is the safety net for
+	// MaxRetries=0: without it a leaf that can never satisfy its DoD retries
+	// forever, burning tokens on a goal that will never land.
+	MaxElapsed time.Duration
+
 	RetryMinInterval time.Duration
 	RetryMaxInterval time.Duration
 
@@ -74,6 +80,7 @@ func DefaultConfig() Config {
 		RequestTimeout:   120 * time.Second,
 		MaxSteps:         20,
 		MaxRetries:       0,
+		MaxElapsed:       45 * time.Minute,
 		MaxDepth:         4,
 		MaxSubtasks:      6,
 		MaxRedecompose:   2,

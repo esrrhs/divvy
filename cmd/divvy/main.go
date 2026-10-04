@@ -43,6 +43,7 @@ func run(args []string) error {
 	extra := fs.String("extra", "", "extra JSON merged into chat request body")
 	maxSteps := fs.Int("max-steps", cfg.MaxSteps, "max tool calls per leaf attempt")
 	maxRetries := fs.Int("max-retries", cfg.MaxRetries, "max verify retries per leaf (0 = unlimited)")
+	maxElapsed := fs.Duration("max-elapsed", cfg.MaxElapsed, "wall-clock budget for one leaf across all attempts (0 = unlimited)")
 	retryMaxWait := fs.Duration("retry-max-wait", cfg.RetryMaxInterval, "exponential backoff cap between retries")
 	maxDepth := fs.Int("max-depth", cfg.MaxDepth, "max decomposition depth")
 	maxTokens := fs.Int("max-tokens", cfg.MaxTokens, "max completion tokens")
@@ -85,6 +86,7 @@ func run(args []string) error {
 	cfg.ExtraJSON = *extra
 	cfg.MaxSteps = *maxSteps
 	cfg.MaxRetries = *maxRetries
+	cfg.MaxElapsed = *maxElapsed
 	cfg.RetryMaxInterval = *retryMaxWait
 	cfg.MaxDepth = *maxDepth
 	cfg.MaxTokens = *maxTokens
@@ -252,6 +254,12 @@ func run(args []string) error {
 	if cfg.BudgetTokens < 0 {
 		return fmt.Errorf("-budget-tokens must be >= 0")
 	}
+	if cfg.MaxElapsed < 0 {
+		return fmt.Errorf("-max-elapsed must be >= 0")
+	}
+	if cfg.MaxRetries < 0 {
+		return fmt.Errorf("-max-retries must be >= 0")
+	}
 
 	client := llm.NewOpenAIClient(cfg.APIKey, cfg.BaseURL, cfg.RequestTimeout)
 	client.ExtraJSON = cfg.ExtraJSON
@@ -349,6 +357,7 @@ Examples:
   divvy -resume -workdir ./ws        # 再执行
 
   divvy -max-cost 1 -budget-tokens 200000 -workdir ./ws "目标"
+  divvy -max-retries 0 -max-elapsed 30m -workdir ./ws "目标"   # 无限重试时务必加时间闸门
   divvy -parallel 4 -workdir ./ws "拆成多个独立模块的目标"
   divvy -git-commit -workdir ./ws "每个叶子一个提交，便于审计回滚"
   divvy -isolate -workdir ./ws "叶子失败不污染工作区"
