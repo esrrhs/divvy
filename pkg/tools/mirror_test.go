@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -164,5 +165,172 @@ func TestHasGoMod(t *testing.T) {
 	writeFile(t, filepath.Join(dir, "go.mod"), "module x\n")
 	if !HasGoMod(dir) {
 		t.Fatal("go.mod not detected")
+	}
+}
+
+// TestMirror_MergeBackDetectsStaleOverwrite is the regression test for the
+// lost-update defect: two leaves snapshot the same base, both edit the same
+// file, and the second merge used to silently overwrite the first leaf's
+// already-verified change.
+func TestMirror_MergeBackDetectsStaleOverwrite(t *testing.T) {
+	src := t.TempDir()
+	writeFile(t, filepath.Join(src, "shared.go"), "original\n")
+
+	m1, err := NewMirror(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m1.Close()
+	m2, err := NewMirror(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m2.Close()
+
+	// Leaf 1 edits and merges successfully.
+	writeFile(t, filepath.Join(m1.Dir, "shared.go"), "leaf1 version\n")
+	if merged, _, err := m1.MergeBack(); err != nil {
+		t.Fatalf("leaf1 merge should succeed: %v", err)
+	} else if len(merged) != 1 {
+		t.Fatalf("leaf1 merged %v, want one file", merged)
+	}
+	if got := readFile(t, filepath.Join(src, "shared.go")); got != "leaf1 version\n" {
+		t.Fatalf("leaf1 not applied: %q", got)
+	}
+
+	// Leaf 2's mirror predates leaf1's merge, so it must be rejected.
+	writeFile(t, filepath.Join(m2.Dir, "shared.go"), "leaf2 version\n")
+	_, _, err = m2.MergeBack()
+	if err == nil {
+		t.Fatal("stale mirror merge should have been rejected")
+	}
+	var conflict *MergeConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("want *MergeConflictError, got %T: %v", err, err)
+	}
+	if len(conflict.Paths) != 1 || conflict.Paths[0] != "shared.go" {
+		t.Fatalf("conflict paths = %v, want [shared.go]", conflict.Paths)
+	}
+	// The already-verified leaf1 content must survive untouched.
+	if got := readFile(t, filepath.Join(src, "shared.go")); got != "leaf1 version\n" {
+		t.Fatalf("leaf1 change was clobbered: %q", got)
+	}
+}
+
+// TestMirror_MergeBackConflictIsAllOrNothing verifies a conflicting merge
+// applies none of its writes, leaving no half-applied state behind.
+func TestMirror_MergeBackConflictIsAllOrNothing(t *testing.T) {
+	src := t.TempDir()
+	writeFile(t, filepath.Join(src, "contested.go"), "base\n")
+	writeFile(t, filepath.Join(src, "mine.go"), "base\n")
+
+	m, err := NewMirror(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+
+	// A sibling merges a change to contested.go after our snapshot.
+	writeFile(t, filepath.Join(src, "contested.go"), "sibling version\n")
+
+	// Our leaf changes both files.
+	writeFile(t, filepath.Join(m.Dir, "contested.go"), "our version\n")
+	writeFile(t, filepath.Join(m.Dir, "mine.go"), "our version\n")
+
+	if _, _, err := m.MergeBack(); err == nil {
+		t.Fatal("expected conflict")
+	}
+	if got := readFile(t, filepath.Join(src, "mine.go")); got != "base\n" {
+		t.Fatalf("non-conflicting file was written despite conflict: %q", got)
+	}
+	if got := readFile(t, filepath.Join(src, "contested.go")); got != "sibling version\n" {
+		t.Fatalf("sibling content clobbered: %q", got)
+	}
+}
+
+// TestMirror_MergeBackDeletionConflict covers a leaf deleting a file that a
+// sibling modified after the snapshot.
+func TestMirror_MergeBackDeletionConflict(t *testing.T) {
+	src := t.TempDir()
+	writeFile(t, filepath.Join(src, "victim.go"), "base\n")
+
+	m, err := NewMirror(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+
+	if err := os.Remove(filepath.Join(m.Dir, "victim.go")); err != nil {
+		t.Fatal(err)
+	}
+	// Sibling rewrites the file after our snapshot.
+	writeFile(t, filepath.Join(src, "victim.go"), "sibling edit\n")
+
+	_, _, err = m.MergeBack()
+	var conflict *MergeConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("want conflict on deleting a sibling-modified file, got %v", err)
+	}
+	if got := readFile(t, filepath.Join(src, "victim.go")); got != "sibling edit\n" {
+		t.Fatalf("sibling edit lost: %q", got)
+	}
+}
+
+// TestMirror_MergeBackSamePathCreatedTwice covers two leaves independently
+// creating the same new file.
+func TestMirror_MergeBackSamePathCreatedTwice(t *testing.T) {
+	src := t.TempDir()
+	m1, err := NewMirror(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m1.Close()
+	m2, err := NewMirror(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m2.Close()
+
+	writeFile(t, filepath.Join(m1.Dir, "new.go"), "leaf1\n")
+	if _, _, err := m1.MergeBack(); err != nil {
+		t.Fatalf("leaf1 create should merge: %v", err)
+	}
+	writeFile(t, filepath.Join(m2.Dir, "new.go"), "leaf2\n")
+	_, _, err = m2.MergeBack()
+	var conflict *MergeConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("want conflict when both leaves create the same path, got %v", err)
+	}
+	if got := readFile(t, filepath.Join(src, "new.go")); got != "leaf1\n" {
+		t.Fatalf("first create was clobbered: %q", got)
+	}
+}
+
+// TestMirror_MergeBackCleanFastForwardStillWorks guards against the conflict
+// check being too strict: a leaf that is the only writer must still merge.
+func TestMirror_MergeBackCleanFastForwardStillWorks(t *testing.T) {
+	src := t.TempDir()
+	writeFile(t, filepath.Join(src, "a.go"), "base\n")
+	writeFile(t, filepath.Join(src, "untouched.go"), "base\n")
+
+	m, err := NewMirror(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+
+	writeFile(t, filepath.Join(m.Dir, "a.go"), "changed\n")
+	merged, deleted, err := m.MergeBack()
+	if err != nil {
+		t.Fatalf("sole writer should merge cleanly: %v", err)
+	}
+	if len(merged) != 1 || merged[0] != "a.go" {
+		t.Fatalf("merged = %v, want [a.go]", merged)
+	}
+	if len(deleted) != 0 {
+		t.Fatalf("deleted = %v, want none", deleted)
+	}
+	if got := readFile(t, filepath.Join(src, "a.go")); got != "changed\n" {
+		t.Fatalf("change not applied: %q", got)
 	}
 }

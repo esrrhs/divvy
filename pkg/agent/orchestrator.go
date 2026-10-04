@@ -32,6 +32,12 @@ type Orchestrator struct {
 	cpMu    sync.Mutex
 	mergeMu sync.Mutex
 
+	// leafStart records when each leaf first started executing, so the
+	// MaxElapsed budget spans all of that leaf's attempts rather than
+	// restarting on every retry.
+	leafMu    sync.Mutex
+	leafStart map[string]time.Time
+
 	// Session trace sinks: the human-readable log and the JSONL event stream.
 	logFile *os.File
 	events  *EventRecorder
@@ -80,15 +86,16 @@ func New(cfg Config, tree *engine.TaskTree, client llm.Client, log *Logger) (*Or
 	tree.ModelName = cfg.Model
 	tree.PriceFor = pricing.PriceFor
 	o := &Orchestrator{
-		cfg:     cfg,
-		tree:    tree,
-		sched:   engine.NewScheduler(tree),
-		storage: storage,
-		llm:     client,
-		sandbox: sandbox,
-		log:     log,
-		usage:   NewUsageTracker(),
-		pricing: pricing,
+		cfg:       cfg,
+		tree:      tree,
+		sched:     engine.NewScheduler(tree),
+		storage:   storage,
+		llm:       client,
+		sandbox:   sandbox,
+		log:       log,
+		usage:     NewUsageTracker(),
+		pricing:   pricing,
+		leafStart: make(map[string]time.Time),
 	}
 	o.openSinks()
 	return o, nil
@@ -259,16 +266,43 @@ func (o *Orchestrator) Run(ctx context.Context) (runErr error) {
 		return err
 	}
 
+	// Surface plan-quality warnings during a normal run, not just under -plan.
+	// A resumed session already has its tree, so this reports immediately; a
+	// fresh session reports once decomposition has produced leaves.
+	warned := map[string]bool{}
+	reportPlanWarnings := func() {
+		for _, w := range o.planWarnings() {
+			if warned[w] {
+				continue
+			}
+			warned[w] = true
+			o.log.Warnf("plan check: %s", w)
+			o.events.Record("plan_warning", "", map[string]any{
+				"warning": clip(w, evReasonChars),
+			})
+		}
+	}
+	reportPlanWarnings()
+
 	parallel := o.parallel()
 	done := make(chan string, 64)
 	var mu sync.Mutex
 	inFlight := make(map[string]bool, parallel)
+	// outputClaims tracks the workspace-relative output files held by
+	// in-flight leaves. Concurrent leaves writing the same file race, and the
+	// loser silently loses verified work, so a ready leaf whose declared
+	// outputs are already claimed waits for the claim to be released.
+	outputClaims := map[string]bool{}
 	var wg sync.WaitGroup
 	var firstErr error
 
 	// tryDispatch launches fn. It reports (started, poolFull): started is false
-	// when id is already in flight or the pool is full.
-	tryDispatch := func(id string, fn func(context.Context) error) (started, poolFull bool) {
+	// when id is already in flight, when the pool is full, or when one of the
+	// leaf's claimed outputs is already held by another in-flight leaf.
+	// claims (may be nil) are reserved for the duration of fn. The claim test
+	// and the reservation happen under one lock hold so two leaves that both
+	// want the same file can never both be admitted.
+	tryDispatch := func(id string, claims map[string]bool, fn func(context.Context) error) (started, poolFull bool) {
 		mu.Lock()
 		if inFlight[id] {
 			mu.Unlock()
@@ -278,7 +312,16 @@ func (o *Orchestrator) Run(ctx context.Context) (runErr error) {
 			mu.Unlock()
 			return false, true
 		}
+		for c := range claims {
+			if outputClaims[c] {
+				mu.Unlock()
+				return false, false
+			}
+		}
 		inFlight[id] = true
+		for c := range claims {
+			outputClaims[c] = true
+		}
 		mu.Unlock()
 		wg.Add(1)
 		go func() {
@@ -294,6 +337,9 @@ func (o *Orchestrator) Run(ctx context.Context) (runErr error) {
 			}
 			mu.Lock()
 			delete(inFlight, id)
+			for c := range claims {
+				delete(outputClaims, c)
+			}
 			mu.Unlock()
 			select {
 			case done <- id:
@@ -357,7 +403,7 @@ func (o *Orchestrator) Run(ctx context.Context) (runErr error) {
 		// Decomposition fills the tree; leaves then fill the pool.
 		if node := o.sched.GetNextDecomposableNode(); node != nil {
 			n := node
-			if started, _ := tryDispatch(n.ID, func(c context.Context) error {
+			if started, _ := tryDispatch(n.ID, nil, func(c context.Context) error {
 				if derr := o.decompose(c, n); derr != nil {
 					if c.Err() != nil {
 						_ = o.sched.UpdateNodeState(n.ID, models.TaskStatePending, "interrupted")
@@ -370,10 +416,19 @@ func (o *Orchestrator) Run(ctx context.Context) (runErr error) {
 			}); started {
 				progressed = true
 			}
+			// New leaves may carry weak contracts; surface that before they run.
+			reportPlanWarnings()
 		}
-		for _, leaf := range o.sched.GetReadyLeafNodes() {
+		mu.Lock()
+		claims := make(map[string]bool, len(outputClaims))
+		for k := range outputClaims {
+			claims[k] = true
+		}
+		mu.Unlock()
+		for _, leaf := range o.sched.GetReadyLeafNodesAvoiding(claims) {
 			lf := leaf
-			started, poolFull := tryDispatch(lf.ID, func(c context.Context) error {
+			leafClaims := engine.OutputSetClaims(lf.Contract.Outputs)
+			started, poolFull := tryDispatch(lf.ID, leafClaims, func(c context.Context) error {
 				return o.executeLeaf(c, lf)
 			})
 			if poolFull {
@@ -388,6 +443,10 @@ func (o *Orchestrator) Run(ctx context.Context) (runErr error) {
 			mu.Lock()
 			busy = len(inFlight)
 			mu.Unlock()
+			// busy == 0 also means no output is claimed (claims are taken and
+			// released under this same mutex), so no leaf is being held back by
+			// a claim here — a claim-blocked leaf always implies busy > 0, and
+			// the wait below releases it.
 			if busy == 0 {
 				idle++
 				if idle > 3 {
@@ -613,19 +672,11 @@ func (o *Orchestrator) executeLeaf(ctx context.Context, leaf *models.TaskNode) e
 	sb := o.sandbox
 	if o.cfg.Isolate {
 		var err error
-		mirror, err = tools.NewMirror(o.sandbox.Root)
+		mirror, sb, err = o.newLeafMirror()
 		if err != nil {
 			return err
 		}
 		defer mirror.Close()
-		sb, err = mirror.Sandbox()
-		if err != nil {
-			return err
-		}
-		// Isolated leaves keep the same read-only capabilities.
-		sb.Web = o.sandbox.Web
-		sb.Browser = o.sandbox.Browser
-		o.log.Infof("isolated %s in %s", leaf.ID, tools.TrimPath(sb.Root))
 	}
 
 	prevErr := ""
@@ -635,6 +686,14 @@ func (o *Orchestrator) executeLeaf(ctx context.Context, leaf *models.TaskNode) e
 			return fmt.Errorf("leaf %s disappeared", leaf.ID)
 		}
 		leaf = live
+
+		// Stamp the first attempt only: the wall-clock budget must span every
+		// retry of this leaf, not restart on each one.
+		o.leafMu.Lock()
+		if _, seen := o.leafStart[leaf.ID]; !seen {
+			o.leafStart[leaf.ID] = time.Now()
+		}
+		o.leafMu.Unlock()
 
 		o.log.Infof("execute %s [attempt %d]: %s", leaf.ID, attempt, leaf.Title)
 		if err := o.sched.UpdateNodeState(leaf.ID, models.TaskStateRunning, ""); err != nil {
@@ -675,6 +734,24 @@ func (o *Orchestrator) executeLeaf(ctx context.Context, leaf *models.TaskNode) e
 					prevErr = merr.Error()
 					o.recordNodeError(leaf.ID, prevErr)
 					o.log.Warnf("publish failed for %s (attempt %d): %v", leaf.ID, attempt, merr)
+					// A merge conflict means a sibling leaf committed a change
+					// to the same files after this mirror was taken. Retrying
+					// against the same mirror would hit the identical
+					// conflict forever, so re-snapshot: the fresh mirror
+					// already contains the sibling's merged work, and the
+					// retried leaf can reconcile against it.
+					var conflict *tools.MergeConflictError
+					if errors.As(merr, &conflict) {
+						mirror.Close()
+						fresh, fsb, ferr := o.newLeafMirror()
+						if ferr != nil {
+							return ferr
+						}
+						mirror, sb = fresh, fsb
+						prevErr = merr.Error() + "\n\nA sibling leaf already changed those file(s) and its version was kept. " +
+							"Re-read them, reconcile your change with what is now there, and re-apply only your part."
+						o.log.Warnf("re-snapshotting %s after merge conflict on %s", leaf.ID, strings.Join(conflict.Paths, ", "))
+					}
 					if err := o.retryOrGiveUp(ctx, leaf, attempt, prevErr); err != nil {
 						return err
 					}
@@ -706,6 +783,25 @@ func (o *Orchestrator) executeLeaf(ctx context.Context, leaf *models.TaskNode) e
 			return nil
 		}
 	}
+}
+
+// newLeafMirror snapshots the shared workspace into a fresh isolated mirror
+// and returns a sandbox confined to it, carrying over the read-only
+// capabilities (web/browser) that are not workspace-scoped.
+func (o *Orchestrator) newLeafMirror() (*tools.Mirror, *tools.Sandbox, error) {
+	mirror, err := tools.NewMirror(o.sandbox.Root)
+	if err != nil {
+		return nil, nil, err
+	}
+	sb, err := mirror.Sandbox()
+	if err != nil {
+		mirror.Close()
+		return nil, nil, err
+	}
+	sb.Web = o.sandbox.Web
+	sb.Browser = o.sandbox.Browser
+	o.log.Infof("isolated workspace: %s", tools.TrimPath(sb.Root))
+	return mirror, sb, nil
 }
 
 // retryable reports whether the leaf should keep retrying inside this worker:
@@ -759,6 +855,14 @@ func firstLine(s string) string {
 }
 
 func (o *Orchestrator) retryOrGiveUp(ctx context.Context, leaf *models.TaskNode, attempt int, errMsg string) error {
+	// The wall-clock guard is the backstop for MaxRetries=0: a leaf whose DoD
+	// can never pass would otherwise retry forever, spending tokens on a goal
+	// that cannot land. It is checked before scheduling more work, and the
+	// node is failed (not left pending) so the run terminates with a clear
+	// reason instead of spinning.
+	if o.deadlineExceeded(leaf.ID, attempt) {
+		return o.giveUpOnDeadline(leaf, errMsg)
+	}
 	if o.cfg.MaxRetries > 0 && attempt >= o.cfg.MaxRetries {
 		return o.handleLeafFailure(leaf, errMsg)
 	}
@@ -776,6 +880,51 @@ func (o *Orchestrator) retryOrGiveUp(ctx context.Context, leaf *models.TaskNode,
 	if err := waitBackoff(ctx, delay); err != nil {
 		_ = o.sched.UpdateNodeState(leaf.ID, models.TaskStatePending, "interrupted")
 		return err
+	}
+	return nil
+}
+
+// deadlineExceeded reports whether a leaf has spent longer than MaxElapsed
+// across all of its attempts. The per-leaf start time is stashed on the
+// orchestrator while executeLeaf runs, so the budget covers retries of the
+// same leaf rather than restarting each attempt.
+func (o *Orchestrator) deadlineExceeded(leafID string, attempt int) bool {
+	if o.cfg.MaxElapsed <= 0 {
+		return false
+	}
+	o.leafMu.Lock()
+	start, ok := o.leafStart[leafID]
+	o.leafMu.Unlock()
+	if !ok {
+		return false
+	}
+	if time.Since(start) < o.cfg.MaxElapsed {
+		return false
+	}
+	o.log.Errorf("leaf %s exceeded its time budget (%s over %d attempt(s))",
+		leafID, o.cfg.MaxElapsed, attempt)
+	o.events.Record("leaf_timeout", leafID, map[string]any{
+		"elapsed_ms": o.cfg.MaxElapsed.Milliseconds(),
+		"attempts":   attempt,
+	})
+	return true
+}
+
+// giveUpOnDeadline fails a leaf that exhausted its wall-clock budget, reusing
+// the normal terminal-failure path so the root surfaces the reason.
+func (o *Orchestrator) giveUpOnDeadline(leaf *models.TaskNode, errMsg string) error {
+	msg := fmt.Sprintf("gave up after %s (time budget exhausted; raise -max-elapsed to allow more attempts): %s",
+		o.cfg.MaxElapsed, truncate(errMsg, 300))
+	o.events.Record("leaf_giveup", leaf.ID, map[string]any{
+		"reason": "time budget exhausted",
+	})
+	// Skip the re-split path: a leaf that ran out of time has not proven it
+	// is too big, so re-decomposing would restart the same clock.
+	if err := o.sched.UpdateNodeState(leaf.ID, models.TaskStateFailed, msg); err != nil {
+		return err
+	}
+	if o.sched.HasFailed() {
+		return fmt.Errorf("task %s failed: %s", leaf.ID, truncate(msg, 500))
 	}
 	return nil
 }

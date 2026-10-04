@@ -2,6 +2,7 @@ package engine
 
 import (
 	"fmt"
+	"path"
 	"sort"
 	"strings"
 	"time"
@@ -125,16 +126,33 @@ func (s *Scheduler) GetNextDecomposableNode() *models.TaskNode {
 // GetReadyLeafNodes returns pending leaf nodes whose dependencies are satisfied.
 // Nodes are clones, ordered by depth then ID for stable scheduling.
 func (s *Scheduler) GetReadyLeafNodes() []*models.TaskNode {
+	return s.GetReadyLeafNodesAvoiding(nil)
+}
+
+// GetReadyLeafNodesAvoiding returns ready leaves that do not declare any output
+// already claimed by an in-flight leaf.
+//
+// Two concurrent leaves that write the same file race: whichever finishes last
+// silently discards the other's verified work. Waiting for the claim to be
+// released turns that race into ordinary sequential execution, so declared
+// outputs act as a mutual-exclusion boundary. Leaves with no declared outputs
+// are always eligible — a contract that names no file cannot be checked.
+func (s *Scheduler) GetReadyLeafNodesAvoiding(claimed map[string]bool) []*models.TaskNode {
 	s.tree.mu.RLock()
 	defer s.tree.mu.RUnlock()
 
 	ready := make([]*models.TaskNode, 0)
 	for _, node := range s.tree.Nodes {
-		if node.Type == models.NodeTypeLeaf && node.State == models.TaskStatePending {
-			if s.areDependenciesSatisfiedLocked(node) {
-				ready = append(ready, node.Clone())
-			}
+		if node.Type != models.NodeTypeLeaf || node.State != models.TaskStatePending {
+			continue
 		}
+		if !s.areDependenciesSatisfiedLocked(node) {
+			continue
+		}
+		if OutputSetConflicts(node.Contract.Outputs, claimed) {
+			continue
+		}
+		ready = append(ready, node.Clone())
 	}
 	sort.Slice(ready, func(i, j int) bool {
 		if ready[i].Depth != ready[j].Depth {
@@ -143,6 +161,51 @@ func (s *Scheduler) GetReadyLeafNodes() []*models.TaskNode {
 		return ready[i].ID < ready[j].ID
 	})
 	return ready
+}
+
+// NormalizeOutputPath canonicalizes a declared output so "pkg/a.go",
+// "./pkg/a.go" and "pkg//a.go" compare equal.
+func NormalizeOutputPath(p string) string {
+	p = strings.TrimSpace(strings.ReplaceAll(p, "\\", "/"))
+	if p == "" {
+		return ""
+	}
+	p = path.Clean(p)
+	p = strings.TrimPrefix(p, "./")
+	if p == "." {
+		return ""
+	}
+	return p
+}
+
+// OutputSetClaims normalizes a node's declared outputs into a claim set.
+func OutputSetClaims(outputs []string) map[string]bool {
+	if len(outputs) == 0 {
+		return nil
+	}
+	set := make(map[string]bool, len(outputs))
+	for _, o := range outputs {
+		if n := NormalizeOutputPath(o); n != "" {
+			set[n] = true
+		}
+	}
+	if len(set) == 0 {
+		return nil
+	}
+	return set
+}
+
+// OutputSetConflicts reports whether any of outputs is already in claimed.
+func OutputSetConflicts(outputs []string, claimed map[string]bool) bool {
+	if len(claimed) == 0 || len(outputs) == 0 {
+		return false
+	}
+	for _, o := range outputs {
+		if n := NormalizeOutputPath(o); n != "" && claimed[n] {
+			return true
+		}
+	}
+	return false
 }
 
 // UpdateNodeState updates the state of a node and bubbles completion/failure to ancestors.
