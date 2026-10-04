@@ -280,6 +280,17 @@ func stringFromArgs(args map[string]any, key string) (string, bool) {
 	return s, ok
 }
 
+// trimHistory caps the conversation to roughly max messages. It preserves two
+// invariants every OpenAI-compatible server enforces:
+//
+//  1. the system prompt and the original task turn stay at the head;
+//  2. the retained tail never splits a tool-call group — a role:"tool"
+//     message must follow the assistant turn whose tool_calls it answers.
+//
+// Violating (2) makes the server reject the whole request with 400, which
+// costs a leaf its entire context and burns a retry. The cut is therefore
+// walked backwards to the nearest boundary that keeps every tool result
+// attached to its assistant turn.
 func trimHistory(messages []llm.Message, max int) []llm.Message {
 	if len(messages) <= max {
 		return messages
@@ -289,11 +300,37 @@ func trimHistory(messages []llm.Message, max int) []llm.Message {
 	if len(messages) < head {
 		return messages
 	}
-	tail := max - head
-	out := make([]llm.Message, 0, max)
+	if max <= head {
+		// No room for a tail; the head alone is still a valid request.
+		return messages[:head]
+	}
+	cut := len(messages) - (max - head)
+	if cut < head {
+		cut = head
+	}
+	for cut > head && splitsToolGroup(messages, cut) {
+		cut--
+	}
+	out := make([]llm.Message, 0, head+len(messages)-cut)
 	out = append(out, messages[:head]...)
-	out = append(out, messages[len(messages)-tail:]...)
+	out = append(out, messages[cut:]...)
 	return out
+}
+
+// splitsToolGroup reports whether starting the retained tail at index cut
+// would orphan a tool result or leave an assistant's tool_calls unanswered.
+// Tool replies for one assistant turn are always contiguous in the worker
+// loop, so the seam is safe when it is not a role:"tool" message and the
+// preceding message is not an assistant awaiting replies.
+func splitsToolGroup(messages []llm.Message, cut int) bool {
+	if cut >= len(messages) {
+		return false
+	}
+	if messages[cut].Role == llm.RoleTool {
+		return true
+	}
+	prev := messages[cut-1]
+	return prev.Role == llm.RoleAssistant && len(prev.ToolCalls) > 0
 }
 
 func (o *Orchestrator) projectContext(sb *tools.Sandbox, node *models.TaskNode, prevError string) string {
