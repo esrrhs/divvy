@@ -81,10 +81,15 @@ jobs:
           go-version: "1.27"
           cache: true
 
+      # Pin the major version: golangci-lint v1 is built with an older Go and
+      # refuses to load a config targeting go 1.27 ("the Go language version
+      # used to build golangci-lint is lower than the targeted Go version").
+      # The v2 series also uses a different config schema, which is what
+      # .golangci.yml is written against.
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v8
         with:
-          version: latest
+          version: v2.14.0
 
   # Headless-Chrome tests are skipped when no browser is present; run one job
   # with Chrome installed so browser code paths actually get exercised.
