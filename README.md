@@ -46,6 +46,7 @@ export OPENAI_MODEL=qwen2.5-coder:14b
 | `-parallel` | 同时执行的叶子数，默认 `1`；>1 时自动开启 `-isolate` |
 | `-isolate` | 叶子在主工作区的临时镜像里执行，验收通过才合并回主工作区，失败即丢弃 |
 | `-max-retries` | 叶子验收失败最多重试几次，`0`（默认）为无限 |
+| `-max-stall` | 同一个失败**连续**出现 N 次后停止重试，转去重新拆解或判失败，`0` 为不限（默认 `3`） |
 | `-max-elapsed` | 单个叶子的墙钟预算（跨其所有尝试累计），默认 `45m`，`0` 为不限；`-max-retries 0` 时的安全网 |
 | `-retry-max-wait` | 指数退避上限，默认 `30s` |
 | `-native-tools` | 改用 OpenAI `tool_calls`（强模型可开；弱模型默认 JSON 更稳） |
@@ -54,6 +55,10 @@ export OPENAI_MODEL=qwen2.5-coder:14b
 | `-budget-tokens` | 会话 token 上限，含 resume 之前的花费；超限即停并保存，`0` 为不限 |
 | `-pricing` | 自定义价目表：JSON 文本或 JSON 文件路径，如 `'{"my-model":{"input":0.15,"output":0.6}}'`（每百万 token 美元价） |
 | `-sessions` | 列出已保存的会话（状态、叶子进度、目标），不执行 |
+| `-report` | 打印某个会话的复盘汇总（目标/进度/成本/重试与停滞/失败原因），不执行 |
+| `-prune` | 删除旧会话，只保留最近的 `-keep` 个（含其日志与事件流；`LATEST` 指向的会话永不删） |
+| `-keep` | 配合 `-prune` 保留几个最近会话，默认 `5` |
+| `-dry-run` | 配合 `-prune`：只列出将被删除的内容，不真删 |
 | `-v` | 打印模型原文和工具输出（结束时附带分项 token 用量） |
 
 中断（Ctrl+C）会保存任务树，之后：
@@ -81,6 +86,10 @@ export OPENAI_MODEL=qwen2.5-coder:14b
 `read_file` 支持可选的 `start_line`/`end_line`（1-indexed、含端点，返回带行号的片段）：配合 `search_files` 的行号只读目标区段，大文件也能直接跳到 64KB 整读截断点之后，无需在 shell 里拼 `sed`。也支持 `{"paths":["a.go","b.go"]}` **一次批量读最多 8 个文件**（各自独立套 64KB 上限，带 `### path` 分隔头）——弱模型每轮只能调一个工具，批量读把"看 N 个相关文件"从 N 次 LLM 往返压成 1 次；任一路径不存在则整批失败，不会返回半截结果。`run_bash` 支持 `timeout_sec`（默认 60s），跑 `npm install`、`cargo build` 这类慢命令时显式放大超时。
 `replace_lines` 除行号区间和单点 `old_string`/`new_string` 外，还接受 `edits: [{old_string,new_string}…]` **批量原子编辑**：所有锚点先在内存里逐条校验（缺失或不唯一即整体失败、文件一字节都不改），全部通过后才一次写回——同一文件改多处不必串行多轮，也不会留下半改状态，用文本锚点还能避开行号漂移。`delete_path`（删目录必须显式 `recursive:true`，工作区根目录受保护）和 `move_path`（工作区内重命名/移动，禁止移入自身子树）让删除和重命名走沙箱校验，不用再借 `run_bash` 拼 `rm`/`mv`。
 验收失败时，Verifier 会按已探测的技术栈从输出里抽取去重、单行截断的根因诊断（最多 25 行）作为**诊断块前置**到错误全文之前；重试叶子只截取错误前缀注入上下文（4000 字符），根因因此一定在最显眼的位置，原始日志完整附在块后。目前覆盖：Go（`x.go:4:2: undefined:`、`--- FAIL`、`panic`）、Python（traceback 的 `File "x", line N`、`XError:`、pytest 的 `E` 行与 `FAILED`）、Rust（`error[E0xxx]:`、`--> file:line:col`、`panicked at`）、Node/TypeScript（tsc 的 `x.ts(10,5): error TS…`、Node 的源码位置行与 `ReferenceError:` 等异常头；刻意不收冗长的 `at …` 栈帧）。
+重试不是无条件的。每次失败都会算一个**指纹**（优先用上面那套根因诊断行，没有诊断规则时取输出头部并把数字统一掩码），连续 `-max-stall` 次（默认 `3`）指纹相同，就判定这个叶子在**原地打转**——它失败得很快，但每次失败都一样，时间闸门永远等不到。此时停止重试，转去重新拆解（拆解预算还有的话）或直接判 `FAILED`，并记一条 `leaf_stall` 事件。失败**各不相同**的叶子不受影响，照旧重试到 `-max-retries` / `-max-elapsed`。这是默认 `-max-retries 0` 下无限重试能真正收敛的关键：在此之前，只有 45 分钟的墙钟能结束一个卡死的叶子。
+
+叶子用完 `-max-steps`（默认 20）还没调用 `finish` **一律算失败**，不会送去验收：模型没有声称完成，文件可能是半截的，finish 前的 `review_diff` 自检也还没跑。（早先这里会直接进验收，碰上 `ls` 这类占位 DoD，一个没干完的叶子会被判成 COMPLETED。）最后 3 次工具调用时 worker 会附一条 `[budget] N tool call(s) left` 提醒——只进当次请求、不写进对话历史，避免后续步骤读到过期的计数。
+
 没有依赖关系的就绪叶子可以并发执行（`-parallel N`，默认 `1`）；每次 LLM 调用的 token 用量按节点记入任务树并随会话持久化，运行结束打印本次与会话累计（resume 后自动累加），树状进度与 `-status` 里也会显示每个节点的消耗。
 
 开启隔离（`-isolate`，`-parallel >1` 时自动生效）后，叶子在主工作区的**临时镜像副本**里写代码、跑验收命令：
@@ -230,9 +239,9 @@ go build -o divvy ./cmd/divvy
 - `-max-cost`（美元）与 `-budget-tokens` 是**会话级硬上限**，计入 resume 之前已持久化的花费；超限立即取消运行、把在途节点复位为 `PENDING` 并保存任务树。提高上限后用 `-resume` 继续即可，不会重试或重复烧钱。
 - 模型在价目表中无对应价格时不显示估算（本地零成本模型的典型情况），token 预算仍然生效。
 
-三层闸门互相独立：会话级 `-max-cost` / `-budget-tokens` 管总量，单叶子 `-max-elapsed`（默认 `45m`）管"一个叶子卡住"。
+四层闸门互相独立：会话级 `-max-cost` / `-budget-tokens` 管总量；单叶子 `-max-elapsed`（默认 `45m`）管"一个慢叶子"；`-max-stall`（默认 `3`）管"一个快但在原地打转的叶子"；`-max-steps` 管单次尝试的收尾。
 
-> `-max-retries 0`（默认）表示验收失败**无限重试**。这一点必须配合 `-max-elapsed`：没有时间闸门时，一个永远无法通过验收的叶子会一直重试下去持续烧 token。超时的叶子直接判 `FAILED` 并写明原因，**不会**触发重新拆解——时间不够不代表任务太大，重拆只会重置时钟。
+> `-max-retries 0`（默认）表示验收失败**无限重试**。这一点必须配合 `-max-elapsed` 与 `-max-stall`：没有闸门时，一个永远无法通过验收的叶子会一直重试下去持续烧 token。超时的叶子直接判 `FAILED` 并写明原因，**不会**触发重新拆解——时间不够不代表任务太大，重拆只会重置时钟；但**停滞**（重复同一失败）的叶子会触发重新拆解，那才是"任务太大/方向不对"的信号。
 
 ---
 
@@ -311,6 +320,7 @@ golangci-lint run ./...  # 静态检查
 - [x] 阶段 24：重试时间闸门（`-max-elapsed`，单叶子跨尝试的墙钟预算，堵住 `-max-retries 0` 的无限烧钱）、`Clone` 深拷贝修正（`ErrorHistory` 不再共享底层数组）
 - [x] 阶段 25：工程基线——CI 增加 `-race`、`golangci-lint`、gofmt 检查与浏览器 job；`pkg/models` 补齐单测（0% → 100%）；新增 `docs/architecture.md`
 - [x] 阶段 26：覆盖与健壮性收口——总覆盖率 71% → 80%（`llm` 57%→92%、`engine` 62%→95%、`cmd` 48%→66%）；`UpdateNode` 改为原子写入（回调失败不再留下半改状态）；诊断规则补齐 Makefile 与通用工作区（此前这两类工作区失败时**完全不压缩**，24KB 原始日志整个进 prompt）
+- [x] 阶段 27：停滞检测与失败语义收口——失败指纹（复用根因诊断行、数字掩码）与 `-max-stall` 让默认无限重试真正收敛；步数耗尽不再伪装成功并补上步数预算提醒；`-report` 会话复盘与 `-prune` 旧会话清理
 
 弱模型上的 Prompt 与拆分粒度仍需按具体模型微调（`-max-depth`、`-max-steps`、`-extra`）。
 
@@ -327,4 +337,6 @@ golangci-lint run ./...  # 静态检查
 - **验收命令由模型生成，默认值只是兜底。** 根目标验收的兜底命令（各栈的 build / `npm test`）远弱于模型显式给出的端到端命令（启动服务 + `curl -f`）。若计划里没有集成叶子，根会直接 `FAILED` 而不是假装完成。
 - **多语言诊断按语言的规则表抽取**（Go/Python/Rust/Node 各自的专用规则，外加 Makefile 与通用工作区的兜底规则），新语言需要在 `pkg/tools/diagnostics.go` 的 `diagRules` 里加一条；未覆盖的工具链会退回通用规则，不会完全没有压缩。
 - **`-max-elapsed` 是单叶子预算，不是全局预算。** 全局请用 `-max-cost` / `-budget-tokens`。
+- **`-max-stall` 靠指纹比对，太宽的指纹会误伤。** 指纹优先取根因诊断行（已去重、已剥离易变细节），没有诊断规则时才回退到"输出头部 + 数字掩码"——这意味着只有数字变化的失败会被视为同一个。若某个工具链的输出结构特殊导致误判，可以 `-max-stall 0` 关掉，只用 `-max-elapsed` 兜底。
+- **`-prune` 会真删文件**（会话 JSON + 日志 + 事件流），只保留 `-keep` 个最近的会话。它永不删 `LATEST` 指向的会话，但先跑一次 `-prune -dry-run` 看看清单永远是值得的。
 - **浏览器工具需要本机 Chrome/Chromium**，且 `-parallel` 下多个叶子共享一个标签页（靠叶子级租约保证多步流程不串台），因此浏览器步骤整体是串行的。
