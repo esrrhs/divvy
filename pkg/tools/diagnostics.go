@@ -15,21 +15,27 @@ const maxCompactDiagnostics = 25
 // so one diagnostic cannot crowd the others out of the prompt.
 const maxDiagnosticLineLen = 240
 
-// diagMatcher recognizes file-anchored error lines (which carry the
-// location) and status/error-header lines (which carry the verdict or
-// exception class) in one toolchain's output.
-type diagMatcher struct {
+// diagRule is one toolchain's output grammar. Keeping each toolchain's
+// knowledge in a single table entry means adding a language is a data change,
+// not a control-flow change.
+type diagRule struct {
+	project ProjectType
+	// anchored matches file-anchored error lines, which carry the location
+	// and are almost always the root cause.
 	anchored []*regexp.Regexp
-	status   []*regexp.Regexp
+	// status matches verdict or exception-class lines ("--- FAIL",
+	// "error[E0308]:", "ReferenceError:") that name the failure even when
+	// the location is on another line.
+	status []*regexp.Regexp
 }
 
-func (m diagMatcher) matches(line string) bool {
-	for _, re := range m.anchored {
+func (r diagRule) matches(line string) bool {
+	for _, re := range r.anchored {
 		if re.MatchString(line) {
 			return true
 		}
 	}
-	for _, re := range m.status {
+	for _, re := range r.status {
 		if re.MatchString(line) {
 			return true
 		}
@@ -37,11 +43,16 @@ func (m diagMatcher) matches(line string) bool {
 	return false
 }
 
-// diagMatchers maps detected project types to their output patterns. Every
+// diagRules maps detected project types to their output patterns. Every
 // pattern is intentionally narrow: the block must contain root causes, not
 // the whole log.
-var diagMatchers = map[ProjectType]diagMatcher{
-	ProjectGo: {
+//
+// The generic rules at the end are a deliberate fallback for Makefiles and
+// unmarked workspaces. Without them a failing `make` produced a full-length
+// raw log, which is exactly the context bloat this block exists to prevent.
+var diagRules = []diagRule{
+	{
+		project: ProjectGo,
 		anchored: []*regexp.Regexp{
 			// ./x.go:4:2: undefined: nope  (also absolute/indented forms)
 			regexp.MustCompile(`^\s*(?:\S*[\\/])?[\w.-]+\.go:\d+(?::\d+)?: .+$`),
@@ -50,10 +61,13 @@ var diagMatchers = map[ProjectType]diagMatcher{
 			regexp.MustCompile(`^(?:--- FAIL: .*|FAIL(?:\s|$).*|panic: .*)$`),
 		},
 	},
-	ProjectPython: {
+	{
+		project: ProjectPython,
 		anchored: []*regexp.Regexp{
 			//   File "app.py", line 12, in main
 			regexp.MustCompile(`^\s*File\s+"[^"]+",\s*line\s+\d+`),
+			//   app.py:12: SyntaxError: invalid syntax  (py_compile / pyflakes)
+			regexp.MustCompile(`^\s*[\w./\\-]+\.py:\d+(?::\d+)?: .+$`),
 		},
 		status: []*regexp.Regexp{
 			// NameError: name 'x' is not defined / module.Err: ...
@@ -64,7 +78,8 @@ var diagMatchers = map[ProjectType]diagMatcher{
 			regexp.MustCompile(`^FAILED\s+.+$`),
 		},
 	},
-	ProjectRust: {
+	{
+		project: ProjectRust,
 		anchored: []*regexp.Regexp{
 			//   --> src/main.rs:3:9
 			regexp.MustCompile(`^\s*-->\s*\S+:\d+:\d+`),
@@ -76,7 +91,8 @@ var diagMatchers = map[ProjectType]diagMatcher{
 			regexp.MustCompile(`^test\s+.+\s+\.\.\.\s*FAILED$`),
 		},
 	},
-	ProjectNode: {
+	{
+		project: ProjectNode,
 		anchored: []*regexp.Regexp{
 			// tsc: src/x.ts(10,5): error TS2304: Cannot find name 'y'.
 			regexp.MustCompile(`^\S+\.(?:ts|tsx|js|jsx|mjs|cjs)\(\d+,\d+\):\s*(?:error|note)\b.*$`),
@@ -89,15 +105,70 @@ var diagMatchers = map[ProjectType]diagMatcher{
 			regexp.MustCompile(`^[\w.]*Error: .+$`),
 		},
 	},
+	{
+		// Make: the recipe output is arbitrary, but make and its tools still
+		// emit recognizable compiler diagnostics, and make's own errors name
+		// the failing target.
+		project: ProjectMake,
+		anchored: []*regexp.Regexp{
+			// make: *** [Makefile:12: build] Error 1
+			regexp.MustCompile(`^\s*(?:make(?:\[\d+\])?:\s*)?\*\*\*\s+\[.*\]\s+Error\b.*$`),
+			// A compiler diagnostic surfaced through a recipe.
+			regexp.MustCompile(`^\s*(?:\S*[\\/])?[\w.-]+\.(?:c|cc|cpp|h|java|go|rs|ts|js)\b:[\d:]*\s*(?:error|fatal error)\b.*$`),
+		},
+		status: []*regexp.Regexp{
+			// make: recipe for target 'x' failed
+			regexp.MustCompile(`^\s*make(?:\[\d+\])?: \*\*\* .*$`),
+			// g++/gcc/clang headline errors.
+			regexp.MustCompile(`^\S*(?:error|Error): .+$`),
+		},
+	},
+	{
+		// Generic fallback for unmarked workspaces. Deliberately broad: it
+		// only fires on lines that clearly name a failure, which is still far
+		// better than handing the model an unfiltered build log.
+		project: ProjectGeneric,
+		anchored: []*regexp.Regexp{
+			// path:line: anything, and path(line,col): anything
+			regexp.MustCompile(`^\s*\S+:\d+(?::\d+)?[:(]\s*\S.*$`),
+		},
+		status: []*regexp.Regexp{
+			regexp.MustCompile(`^(?:--- FAIL: .*|FAIL(?:\s|$).*|panic: .*|fatal error: .*)$`),
+			regexp.MustCompile(`^[\w.]*(?:Error|Exception)\b:.*$`),
+			// make-style target failure.
+			regexp.MustCompile(`^\s*make(?:\[\d+\])?: \*\*\* .*$`),
+		},
+	},
+}
+
+// diagRuleFor returns the rule set for a project type.
+func diagRuleFor(project ProjectType) (diagRule, bool) {
+	for _, r := range diagRules {
+		if r.project == project {
+			return r, true
+		}
+	}
+	return diagRule{}, false
+}
+
+// SupportedDiagnosticProjects lists the toolchains CompactDiagnostics
+// understands. Callers can use it to explain why a workspace gets no
+// compressed block.
+func SupportedDiagnosticProjects() []ProjectType {
+	out := make([]ProjectType, 0, len(diagRules))
+	for _, r := range diagRules {
+		out = append(out, r.project)
+	}
+	return out
 }
 
 // CompactDiagnostics extracts the root-cause lines from a failed build/test
 // output and renders them as a short block suitable for prepending to the raw
 // output (prevError is later head-truncated, so root causes must come first).
-// Unsupported toolchains, or output without recognizable diagnostics, return
-// "" so callers can prepend unconditionally on a non-empty result.
+// Output without recognizable diagnostics returns "" so callers can prepend
+// unconditionally on a non-empty result.
 func CompactDiagnostics(project ProjectType, output string) string {
-	matcher, ok := diagMatchers[project]
+	rule, ok := diagRuleFor(project)
 	if !ok || strings.TrimSpace(output) == "" {
 		return ""
 	}
@@ -105,7 +176,7 @@ func CompactDiagnostics(project ProjectType, output string) string {
 	var lines []string
 	skipped := 0
 	for _, line := range strings.Split(output, "\n") {
-		if !matcher.matches(line) {
+		if !rule.matches(line) {
 			continue
 		}
 		// Normalize whitespace so the same error reached via different

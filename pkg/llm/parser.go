@@ -270,10 +270,7 @@ func closeTruncatedJSON(s string) string {
 			s = strings.TrimRight(s[:stringStart], " \t\n\r,")
 		}
 	}
-	s = strings.TrimRight(s, " \t\n\r")
-	if strings.HasSuffix(s, ",") {
-		s = strings.TrimSuffix(s, ",")
-	}
+	s = strings.TrimRight(s, " \t\n\r,")
 	for i := len(stack) - 1; i >= 0; i-- {
 		if stack[i] == '{' {
 			s += "}"

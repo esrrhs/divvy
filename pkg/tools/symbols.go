@@ -22,7 +22,9 @@ func (s *Sandbox) FindSymbol(ctx context.Context, name, kind, glob string) (stri
 	}
 
 	var hits []string
-	filepath.WalkDir(s.Root, func(p string, d fs.DirEntry, err error) error {
+	// A walk error (unreadable subdirectory, vanished file) must not abort the
+	// whole scan: skip that entry and keep the results gathered so far.
+	if err := filepath.WalkDir(s.Root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
@@ -32,7 +34,10 @@ func (s *Sandbox) FindSymbol(ctx context.Context, name, kind, glob string) (stri
 			}
 			return nil
 		}
-		rel, _ := filepath.Rel(s.Root, p)
+		rel, relErr := filepath.Rel(s.Root, p)
+		if relErr != nil {
+			return nil
+		}
 		rel = filepath.ToSlash(rel)
 		if glob != "" && !simpleGlobMatch(rel, glob) {
 			return nil
@@ -41,7 +46,9 @@ func (s *Sandbox) FindSymbol(ctx context.Context, name, kind, glob string) (stri
 			hits = append(hits, findGoSymbol(p, rel, name, kind)...)
 		}
 		return nil
-	})
+	}); err != nil {
+		return "", fmt.Errorf("find_symbol scan: %w", err)
+	}
 
 	// Non-Go / additional matches: regex fallback across all text files.
 	if len(hits) == 0 {

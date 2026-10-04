@@ -45,8 +45,8 @@ func TestTaskTree_Operations(t *testing.T) {
 	// Update leaf to completed
 	leaf1.State = models.TaskStateCompleted
 	comp, total, pct = tree.GetProgress()
-	if comp != 1 || total != 3 {
-		t.Fatalf("progress after completion wrong")
+	if comp != 1 || total != 3 || pct <= 0 {
+		t.Fatalf("progress after completion wrong: comp=%d total=%d pct=%f", comp, total, pct)
 	}
 
 	// Visual tree render

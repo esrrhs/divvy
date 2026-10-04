@@ -186,18 +186,25 @@ func (t *TaskTree) GetLeafProgress() (int, int, float64) {
 }
 
 // UpdateNode mutates a node under the tree lock.
+//
+// The mutation is atomic: fn runs against a copy, and the copy only replaces
+// the live node if fn returns nil. A callback that fails partway therefore
+// leaves the tree exactly as it was, instead of persisting a half-applied
+// change to the session file.
 func (t *TaskTree) UpdateNode(id string, fn func(*models.TaskNode) error) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	node, exists := t.Nodes[id]
+	live, exists := t.Nodes[id]
 	if !exists {
 		return fmt.Errorf("node %s does not exist", id)
 	}
-	if err := fn(node); err != nil {
+	draft := live.Clone()
+	if err := fn(draft); err != nil {
 		return err
 	}
-	node.UpdatedAt = time.Now()
+	draft.UpdatedAt = time.Now()
+	t.Nodes[id] = draft
 	t.UpdatedAt = time.Now()
 	return nil
 }

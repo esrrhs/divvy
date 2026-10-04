@@ -103,5 +103,10 @@ func (n *TaskNode) Clone() *TaskNode {
 	cp.Contract.Dependencies = slices.Clone(n.Contract.Dependencies)
 	cp.Contract.Constraints = slices.Clone(n.Contract.Constraints)
 	cp.DoD.Commands = slices.Clone(n.DoD.Commands)
+	// ErrorHistory holds value records, so slices.Clone would share the
+	// backing array: an append by one holder could then overwrite another
+	// holder's view. Duplicate the records so each copy is independent.
+	cp.ErrorHistory = make([]ErrorRecord, len(n.ErrorHistory))
+	copy(cp.ErrorHistory, n.ErrorHistory)
 	return &cp
 }

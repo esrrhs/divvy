@@ -201,12 +201,20 @@ ReferenceError: foo is not defined
 	}
 }
 
-func TestCompactDiagnostics_OtherStacksUnsupported(t *testing.T) {
-	// Make/generic projects and the empty case produce nothing.
-	if got := CompactDiagnostics(ProjectMake, "x.go:1:1: bad\n"); got != "" {
-		t.Fatalf("make project must not use Go patterns: %q", got)
+// TestCompactDiagnostics_DoNotCrossApplyStacks verifies a toolchain's rules do
+// not leak into another: Go's `.go:line:col` pattern must not make a Make or
+// generic project look like it has diagnostics when the output holds none.
+func TestCompactDiagnostics_DoNotCrossApplyStacks(t *testing.T) {
+	// A Go-shaped line that is not a Go diagnostic, offered to make/generic.
+	notAnError := "Building x.go:1:1 in progress\n"
+	if got := CompactDiagnostics(ProjectMake, notAnError); got != "" {
+		t.Fatalf("make must not match on a non-error line: %q", got)
 	}
-	if got := CompactDiagnostics(ProjectGeneric, "whatever\n"); got != "" {
-		t.Fatalf("generic project has no diagnostics matcher: %q", got)
+	// Unrecognized output produces no block for any stack, so callers never
+	// prepend a misleading header.
+	for _, pt := range []ProjectType{ProjectMake, ProjectGeneric, ProjectRust, ProjectNode} {
+		if got := CompactDiagnostics(pt, "just some prose\n"); got != "" {
+			t.Errorf("%s: prose must not produce a block, got %q", pt, got)
+		}
 	}
 }
