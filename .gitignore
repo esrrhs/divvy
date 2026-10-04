@@ -13,3 +13,6 @@ bin/
 ws/
 workspace/
 ws_*/
+
+# Editor / agent local state (session memory, scratch files)
+.workbuddy/

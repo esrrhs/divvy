@@ -15,7 +15,7 @@ go install github.com/esrrhs/divvy/cmd/divvy@latest
 go build -o divvy ./cmd/divvy
 ```
 
-任意 **OpenAI 兼容** 接口都可以，包括 OpenAI、vLLM、Ollama、本地网关。本地 Ollama 实战配置见 [docs/qwen3.8-local.md](docs/qwen3.8-local.md)、[docs/debug-local-ollama.md](docs/debug-local-ollama.md)：
+任意 **OpenAI 兼容** 接口都可以，包括 OpenAI、vLLM、Ollama、本地网关。本地 Ollama 实战配置见 [docs/qwen3.8-local.md](docs/qwen3.8-local.md)、[docs/debug-local-ollama.md](docs/debug-local-ollama.md)；想改引擎内部看 [docs/architecture.md](docs/architecture.md)：
 
 ```bash
 export OPENAI_API_KEY=sk-...
@@ -46,6 +46,7 @@ export OPENAI_MODEL=qwen2.5-coder:14b
 | `-parallel` | 同时执行的叶子数，默认 `1`；>1 时自动开启 `-isolate` |
 | `-isolate` | 叶子在主工作区的临时镜像里执行，验收通过才合并回主工作区，失败即丢弃 |
 | `-max-retries` | 叶子验收失败最多重试几次，`0`（默认）为无限 |
+| `-max-elapsed` | 单个叶子的墙钟预算（跨其所有尝试累计），默认 `45m`，`0` 为不限；`-max-retries 0` 时的安全网 |
 | `-retry-max-wait` | 指数退避上限，默认 `30s` |
 | `-native-tools` | 改用 OpenAI `tool_calls`（强模型可开；弱模型默认 JSON 更稳） |
 | `-extra` | 合并进请求体的 JSON，例如 Qwen3：`'{"enable_thinking":false}'` |
@@ -84,6 +85,11 @@ export OPENAI_MODEL=qwen2.5-coder:14b
 
 开启隔离（`-isolate`，`-parallel >1` 时自动生效）后，叶子在主工作区的**临时镜像副本**里写代码、跑验收命令：
 验收通过才把新增/修改的文件合并回主工作区（删除也会传播），失败或中断则整个镜像丢弃——失败的尝试永远不会污染共享工作区或兄弟叶子。
+
+并发写同一个文件会互相覆盖，因此有两道防线：
+
+- **调度层（预防）**：声明了相同产出文件的叶子被互斥调度（`-parallel N` 也不会同时跑），路径按 `./a.go`、`a//go` 等价归一。
+- **合并层（兜底）**：契约没写产出时调度层无从判断，此时镜像合并会比对快照时的内容摘要——发现该文件在本叶子改动之后又被别人改过，就**整批放弃合并**（不覆盖、不半合并），该叶子重建镜像重试，新镜像已含兄弟叶子的成果，失败因此变成一次"对齐"。
 
 ### 集成叶子与根目标验收
 
@@ -214,7 +220,7 @@ go build -o divvy ./cmd/divvy
   -base-url http://127.0.0.1:11434/v1 -model qwen3.8:27b -workdir ./ws "你的目标"
 ```
 
-`-plan` 在拆解完成后会做完整性检查并对弱契约告警：无验收命令、验收只有占位符（`ls`）、无产出声明、兄弟叶子声明了相同产出文件。
+`-plan` 在拆解完成后会做完整性检查并对弱契约告警：无验收命令、验收只有占位符（`ls`）、无产出声明、兄弟叶子声明了相同产出文件。相同的检查在正常执行时也会跑（告警逐条打印并记入事件流），不必特意先跑一次 `-plan` 才发现契约很弱。
 
 ### 成本估算与预算护栏
 
@@ -223,6 +229,10 @@ go build -o divvy ./cmd/divvy
 - 每次调用的成本按节点随 token 用量一起显示：树视图节点标签、结束/`-status` 用量汇总（本次 + 会话累计）。
 - `-max-cost`（美元）与 `-budget-tokens` 是**会话级硬上限**，计入 resume 之前已持久化的花费；超限立即取消运行、把在途节点复位为 `PENDING` 并保存任务树。提高上限后用 `-resume` 继续即可，不会重试或重复烧钱。
 - 模型在价目表中无对应价格时不显示估算（本地零成本模型的典型情况），token 预算仍然生效。
+
+三层闸门互相独立：会话级 `-max-cost` / `-budget-tokens` 管总量，单叶子 `-max-elapsed`（默认 `45m`）管"一个叶子卡住"。
+
+> `-max-retries 0`（默认）表示验收失败**无限重试**。这一点必须配合 `-max-elapsed`：没有时间闸门时，一个永远无法通过验收的叶子会一直重试下去持续烧 token。超时的叶子直接判 `FAILED` 并写明原因，**不会**触发重新拆解——时间不够不代表任务太大，重拆只会重置时钟。
 
 ---
 
@@ -255,15 +265,21 @@ go build -o divvy ./cmd/divvy
 
 状态：`PENDING` → `DECOMPOSING` / `RUNNING` → `VERIFYING` → `COMPLETED` / `FAILED`。
 
+架构、并发与隔离的两道防线、失败恢复矩阵、扩展点（加工具 / 改 prompt / 加语言）见 **[docs/architecture.md](docs/architecture.md)**。
+
 ---
 
 ## 开发
 
 ```bash
-go test ./...
+go test ./...            # 全量测试
+go test -race ./...      # 并发路径
+golangci-lint run ./...  # 静态检查
 ```
 
-端到端单测使用脚本化 Mock LLM，不访问网络；会在临时目录里真正 `go test` 验收生成的包。
+端到端单测使用脚本化 Mock LLM，不访问网络；会在临时目录里真正 `go test` 验收生成的包。CI 跑四个 job：常规测试（含 gofmt）、`-race`、`golangci-lint`、以及装了 Chrome 的浏览器 job。
+
+当前语句覆盖率约 80%（`models` 100% / `cost` 95% / `engine` 95% / `llm` 92% / `agent` 79% / `tools` 77% / `cmd` 66%）。写 `cmd` 层的测试时注意：**不要用需要真实 LLM 的模式**（如 `-plan` 打到不存在的 endpoint）——`llm` 客户端默认无限重试，会让测试挂死；这类路径请用 `httptest` 或直接构造持久化产物。
 
 ---
 
@@ -291,5 +307,24 @@ go test ./...
 - [x] 阶段 20：二进制下载 download_file（`-web` 门控、SSRF 防护复用、20MB 上限、失败清理）与只读 sqlite_query（纯 Go modernc 驱动、mode=ro/query_only、结果集压缩）
 - [x] 阶段 21：并发正确性收尾——浏览器叶子级租约（-parallel 下多步流程不再跨叶子串台、可取消等待）与 finish 自动门控（覆盖未跟踪新文件，冲突标记/密钥硬拦截并回灌、debug/大 diff 仅告警）
 - [x] 阶段 22：少轮次与全栈诊断——read_file 的 paths 批量读（最多 8 个文件/次）、outline 顶层声明地图（Go AST 签名、其它语言模式回退）、诊断压缩扩展到 Python/Rust/Node
+- [x] 阶段 23：并发正确性收口——`trimHistory` 对齐 tool_call 边界（`-native-tools` 不再打出孤立 tool 消息）、镜像合并按快照摘要在冲突时放弃而非覆盖、声明相同产出的叶子调度互斥、契约体检接入 `Run` 路径
+- [x] 阶段 24：重试时间闸门（`-max-elapsed`，单叶子跨尝试的墙钟预算，堵住 `-max-retries 0` 的无限烧钱）、`Clone` 深拷贝修正（`ErrorHistory` 不再共享底层数组）
+- [x] 阶段 25：工程基线——CI 增加 `-race`、`golangci-lint`、gofmt 检查与浏览器 job；`pkg/models` 补齐单测（0% → 100%）；新增 `docs/architecture.md`
+- [x] 阶段 26：覆盖与健壮性收口——总覆盖率 71% → 80%（`llm` 57%→92%、`engine` 62%→95%、`cmd` 48%→66%）；`UpdateNode` 改为原子写入（回调失败不再留下半改状态）；诊断规则补齐 Makefile 与通用工作区（此前这两类工作区失败时**完全不压缩**，24KB 原始日志整个进 prompt）
 
 弱模型上的 Prompt 与拆分粒度仍需按具体模型微调（`-max-depth`、`-max-steps`、`-extra`）。
+
+---
+
+## 已知限制
+
+如实记录当前版本的边界，避免踩坑：
+
+- **`-parallel` 只在叶子产出互不重叠时才是完全并行的。** 声明了相同产出的叶子会被强制串行（这是正确的，但会牺牲并行度）；契约里**没写**产出的叶子无法预判，只能靠合并时的冲突检测兜底——那种情况会多一次重试。
+- **契约质量决定并行度与自愈能力。** 弱模型常常不填 `contract.outputs`，此时引擎既无法提前串行化冲突叶子，也拿不到"这个叶子该产出什么"的约束。`-plan` 的人工检查比事后补救便宜得多。
+- **`-native-tools` 与 JSON 动作模式的成熟度不同。** 默认的 JSON 动作模式是给弱模型准备的；`-native-tools` 走 OpenAI `tool_calls`，历史裁剪已做配对对齐，但对同样本要求更高的模型。
+- **`find_symbol` 的 `references` 是文本级扫描**，不做类型分析：注释和字符串里的同名提及也会出现，别名与动态调用会漏掉。Go 的**定义**定位走真实 AST，是准确的。
+- **验收命令由模型生成，默认值只是兜底。** 根目标验收的兜底命令（各栈的 build / `npm test`）远弱于模型显式给出的端到端命令（启动服务 + `curl -f`）。若计划里没有集成叶子，根会直接 `FAILED` 而不是假装完成。
+- **多语言诊断按语言的规则表抽取**（Go/Python/Rust/Node 各自的专用规则，外加 Makefile 与通用工作区的兜底规则），新语言需要在 `pkg/tools/diagnostics.go` 的 `diagRules` 里加一条；未覆盖的工具链会退回通用规则，不会完全没有压缩。
+- **`-max-elapsed` 是单叶子预算，不是全局预算。** 全局请用 `-max-cost` / `-budget-tokens`。
+- **浏览器工具需要本机 Chrome/Chromium**，且 `-parallel` 下多个叶子共享一个标签页（靠叶子级租约保证多步流程不串台），因此浏览器步骤整体是串行的。

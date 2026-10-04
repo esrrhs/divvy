@@ -1,0 +1,55 @@
+# golangci-lint configuration for divvy.
+#
+# The defaults are tuned to this codebase rather than left at their generic
+# defaults: `defer f.Close()` on a read-only handle is idiomatic Go and flagging
+# every one of them buries the findings that matter in noise.
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  # Start from the standard set, then add the checks that catch real bugs in an
+  # engine built around goroutines, shared state and unchecked errors.
+  default: standard
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - bodyclose
+    - misspell
+  exclusions:
+    generated: lax
+    rules:
+      # errcheck: deferred Close on a read-only handle, and cleanup paths that
+      # deliberately ignore os.Remove (best-effort temp-file cleanup), cannot
+      # meaningfully fail. This codebase uses those idioms throughout.
+      - linters: [errcheck]
+        text: "Error return value of `(f|db|rows|tmpFile|in|out)\\.Close` is not checked"
+      - linters: [errcheck]
+        text: "Error return value of `(resp|httpResp)\\.Body\\.Close` is not checked"
+      - linters: [errcheck]
+        text: "Error return value of `os\\.(Remove|RemoveAll)` is not checked"
+      # errcheck: writing progress output to a terminal or log sink is
+      # best-effort by nature; the logger has no way to report a failed write
+      # without recursing.
+      - linters: [errcheck]
+        text: "Error return value of `fmt\\.Fprint"
+      # staticcheck ST1012: a handful of package-level error values do not
+      # follow the errFoo convention; renaming them would churn call sites
+      # across packages for no behavioural gain.
+      - linters: [staticcheck]
+        text: "ST1012"
+      # staticcheck QF1012: WriteString(fmt.Sprintf(...)) is a style
+      # preference, and the tree renderer is deliberately built this way.
+      - linters: [staticcheck]
+        text: "QF1012"
+      # Test helpers routinely discard errors while asserting on other output.
+      - path: _test\.go
+        linters: [errcheck]
+
+formatters:
+  enable:
+    - gofmt

@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [master]
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -29,8 +32,80 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      - name: Check gofmt
+        run: |
+          # Only check tracked Go files: local scratch workspaces (ws_*/) are
+          # gitignored and must not fail the build.
+          unformatted=$(gofmt -l $(git ls-files '*.go'))
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt needed on these files:"
+            echo "$unformatted"
+            gofmt -d $unformatted
+            exit 1
+          fi
+
       - name: Build
         run: go build ./...
 
       - name: Test
         run: go test ./... -count=1 -v
+
+  # The engine runs leaves concurrently and shares a task tree, a merge lock
+  # and a browser across them. -race is the only thing that catches a bad
+  # interaction there, and it is cheap enough to always run.
+  race:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Race detector
+        run: go test -race ./... -count=1
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+          cache: true
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+
+  # Headless-Chrome tests are skipped when no browser is present; run one job
+  # with Chrome installed so browser code paths actually get exercised.
+  browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+          cache: true
+
+      - name: Install Chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Test with browser available
+        run: go test ./... -count=1
