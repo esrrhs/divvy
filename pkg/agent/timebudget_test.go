@@ -55,6 +55,11 @@ func TestOrchestrator_LeafTimeBudgetStopsInfiniteRetries(t *testing.T) {
 	cfg.Stream = false
 	cfg.MaxRetries = 0 // unlimited attempts — only the time budget can stop this
 	cfg.MaxElapsed = 900 * time.Millisecond
+	// Isolate the wall-clock gate. This leaf fails identically on every
+	// attempt (it never calls finish), so the stall detector would stop it
+	// first — that is covered by TestOrchestrator_StallStopsInfiniteRetries.
+	// Here we want to prove the clock alone is enough.
+	cfg.MaxStall = 0
 	cfg.RetryMinInterval = 10 * time.Millisecond
 	cfg.RetryMaxInterval = 20 * time.Millisecond
 

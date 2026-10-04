@@ -16,9 +16,37 @@ type TokenUsage struct {
 
 // ErrorRecord keeps one failed attempt for post-mortem debugging. ErrorMsg
 // only holds the latest failure; ErrorHistory preserves every retry.
+//
+// Fingerprint is a stable signature of the failure (same root cause → same
+// value), stored so the engine can tell "stuck, repeating itself" apart from
+// "still making progress". It is empty for records written before the field
+// existed, and those records never count towards a stall.
 type ErrorRecord struct {
-	Time  time.Time `json:"time"`
-	Error string    `json:"error"`
+	Time        time.Time `json:"time"`
+	Error       string    `json:"error"`
+	Fingerprint string    `json:"fingerprint,omitempty"`
+}
+
+// StallRun reports the length of the trailing run of error records that share
+// the newest record's fingerprint. A run of N means the last N attempts failed
+// the same way, i.e. the leaf is repeating itself rather than progressing.
+// Records without a fingerprint (legacy) end the run with 0.
+func (n *TaskNode) StallRun() int {
+	if n == nil || len(n.ErrorHistory) == 0 {
+		return 0
+	}
+	last := n.ErrorHistory[len(n.ErrorHistory)-1].Fingerprint
+	if last == "" {
+		return 0
+	}
+	run := 0
+	for i := len(n.ErrorHistory) - 1; i >= 0; i-- {
+		if n.ErrorHistory[i].Fingerprint != last {
+			break
+		}
+		run++
+	}
+	return run
 }
 
 // TaskNode represents a single unit of goal/work in the decomposition tree.

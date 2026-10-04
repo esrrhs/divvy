@@ -39,6 +39,14 @@ type Config struct {
 	// forever, burning tokens on a goal that will never land.
 	MaxElapsed time.Duration
 
+	// MaxStall bounds how many times a leaf may fail *the same way* in a row
+	// before it stops retrying (0 = unlimited). It complements MaxElapsed:
+	// the clock catches slow leaves, this catches leaves that are fast but
+	// stuck in a loop, repeating one failure until the budget runs out.
+	// Failures are compared by fingerprint, so a leaf that fails differently
+	// each time is still allowed to keep trying.
+	MaxStall int
+
 	RetryMinInterval time.Duration
 	RetryMaxInterval time.Duration
 
@@ -80,6 +88,7 @@ func DefaultConfig() Config {
 		RequestTimeout:   120 * time.Second,
 		MaxSteps:         20,
 		MaxRetries:       0,
+		MaxStall:         3,
 		MaxElapsed:       45 * time.Minute,
 		MaxDepth:         4,
 		MaxSubtasks:      6,

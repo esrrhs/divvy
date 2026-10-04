@@ -863,6 +863,12 @@ func (o *Orchestrator) retryOrGiveUp(ctx context.Context, leaf *models.TaskNode,
 	if o.deadlineExceeded(leaf.ID, attempt) {
 		return o.giveUpOnDeadline(leaf, errMsg)
 	}
+	// Quality gate: a leaf that keeps producing the same failure is looping,
+	// not progressing. Stop feeding it attempts — with MaxRetries=0 (the
+	// default) nothing else would ever end this loop.
+	if run, isStalled := o.stalled(leaf.ID); isStalled {
+		return o.handleStall(leaf, run, errMsg)
+	}
 	if o.cfg.MaxRetries > 0 && attempt >= o.cfg.MaxRetries {
 		return o.handleLeafFailure(leaf, errMsg)
 	}
@@ -1026,14 +1032,18 @@ func (o *Orchestrator) recordSessionEnd(mode string, start time.Time, err error)
 }
 
 // recordNodeError appends one failed attempt to the node's persistent error
-// history (alongside the retry counter and latest-error message).
+// history (alongside the retry counter and latest-error message). The failure
+// fingerprint is stored too: it is what lets the stall detector tell a leaf
+// that is repeating itself apart from one that is still making progress.
 func (o *Orchestrator) recordNodeError(nodeID, msg string) {
+	fp := stallFingerprint(o.projectType(), msg)
 	_ = o.tree.UpdateNode(nodeID, func(n *models.TaskNode) error {
 		n.RetryCount++
 		n.ErrorMsg = msg
 		n.ErrorHistory = append(n.ErrorHistory, models.ErrorRecord{
-			Time:  time.Now(),
-			Error: msg,
+			Time:        time.Now(),
+			Error:       msg,
+			Fingerprint: fp,
 		})
 		return nil
 	})
