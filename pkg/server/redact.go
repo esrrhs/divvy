@@ -1,0 +1,41 @@
+package server
+
+import "strings"
+
+// redaction replaces secret material in any outbound/logged text.
+const redaction = "***REDACTED***"
+
+// Redact replaces every occurrence of each non-trivial secret in s with a
+// fixed marker, so logs and SSE payloads can echo tool output without
+// leaking credentials. Empty/short values are ignored to avoid wiping
+// single characters (a 1-2 char key is not a real secret).
+func Redact(s string, secrets ...string) string {
+	for _, secret := range secrets {
+		if len(secret) < 4 {
+			continue
+		}
+		s = strings.ReplaceAll(s, secret, redaction)
+	}
+	return s
+}
+
+// RedactBytes is the byte-payload variant used on the SSE write path.
+func RedactBytes(data []byte, secrets ...string) []byte {
+	if len(secrets) == 0 {
+		return data
+	}
+	return []byte(Redact(string(data), secrets...))
+}
+
+// MaskSecret renders a secret for human-facing status lines (e.g. startup
+// logs): a short prefix/suffix stays recognizable, the middle is gone.
+func MaskSecret(secret string) string {
+	secret = strings.TrimSpace(secret)
+	if len(secret) < 8 {
+		return "****"
+	}
+	if len(secret) <= 12 {
+		return secret[:2] + "****"
+	}
+	return secret[:4] + "****" + secret[len(secret)-4:]
+}

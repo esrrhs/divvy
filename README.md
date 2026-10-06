@@ -231,6 +231,17 @@ go build -o divvy ./cmd/divvy
 
 `-plan` 在拆解完成后会做完整性检查并对弱契约告警：无验收命令、验收只有占位符（`ls`）、无产出声明、兄弟叶子声明了相同产出文件。相同的检查在正常执行时也会跑（告警逐条打印并记入事件流），不必特意先跑一次 `-plan` 才发现契约很弱。
 
+### Web 界面（`-serve`）
+
+`-serve` 在本机启动一个只绑定 `127.0.0.1` 的 HTTP + SSE 服务，并自动打开浏览器；终端会打印带一次性随机 token 的访问 URL（每次启动重新生成，浏览器之外的页面无法调用 API，Host 头仅允许 localhost/127.0.0.1）。
+
+```bash
+./divvy -serve -workdir ./ws                 # 随机端口、自动开浏览器
+./divvy -serve -port 8787 -no-open           # 固定端口、不自动打开
+```
+
+在界面里可以：新建会话（填 goal/model/baseURL/apiKey，apiKey 只在内存中，不写入事件流与日志）、实时看任务树与事件流、审批/调整/中止计划、逐叶子审查 diff（`approval_mode=manual`，批准才合并、拒绝带意见重做）、回答 ask、暂停/续跑/add/redo、浏览历史会话与只读查看工作区文件。Ctrl+C 会优雅关闭：运行中的会话先保存任务树，之后可在界面或用 `-guided -resume -session <id>` 继续。
+
 ### 成本估算与预算护栏
 
 引擎内置常见 OpenAI 模型的近似价目（每百万 token 美元价），用 `-pricing` 可覆盖或追加自有/本地模型的价格（JSON 文本或文件路径，键名同时支持精确匹配和最长子串匹配）。

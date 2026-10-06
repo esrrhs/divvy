@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>divvy</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      margin: 0; min-height: 100vh; display: grid; place-items: center;
+      background: #0d1117; color: #c9d1d9;
+      font: 15px/1.7 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+    .card { max-width: 560px; padding: 40px; border: 1px solid #21262d; border-radius: 12px; background: #161b22; }
+    h1 { margin: 0 0 12px; font-size: 22px; color: #f0f6fc; }
+    code { background: #21262d; padding: 2px 6px; border-radius: 5px; color: #79c0ff; }
+    p { margin: 10px 0; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>divvy serve 正在运行</h1>
+    <p>当前是内置占位页面：仓库中还没有构建好的前端产物（<code>web/dist</code>）。</p>
+    <p>开发模式请在 <code>web/</code> 目录执行 <code>npm run dev</code>，并将 Vite 代理指向本服务；</p>
+    <p>发布构建会把 <code>npm run build</code> 的产物通过 go:embed 替换此页。</p>
+    <p>API 健康检查：<code>GET /api/health</code>（需携带启动 token）。</p>
+  </div>
+</body>
+</html>

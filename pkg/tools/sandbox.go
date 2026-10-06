@@ -34,6 +34,12 @@ var skipDirNames = map[string]bool{
 	"coverage":     true,
 }
 
+// IsSkippedName reports whether a directory/file name is hidden from the
+// workspace snapshot, mirror listing and web file browser (.git,
+// node_modules, ...). It is exported so the read-only web API applies the
+// exact same ignore set as isolated mirrors.
+func IsSkippedName(name string) bool { return skipDirNames[name] }
+
 // Sandbox confines file and command operations to a workspace directory.
 type Sandbox struct {
 	Root      string

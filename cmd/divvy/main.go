@@ -63,6 +63,9 @@ func run(args []string) error {
 	budgetTokens := fs.Int("budget-tokens", cfg.BudgetTokens, "session token ceiling, incl. pre-resume spend (0 = unlimited)")
 	pricing := fs.String("pricing", cfg.PricingJSON, "custom price table as JSON text or path to a JSON file ({\"model\":{\"input\":0.15,\"output\":0.6}} per 1M tokens)")
 	resume := fs.Bool("resume", false, "resume a previous session")
+	serve := fs.Bool("serve", false, "start the local web UI server (loopback HTTP + SSE) and open the browser")
+	port := fs.Int("port", 0, "with -serve: port to listen on (0 = pick a free port)")
+	noOpen := fs.Bool("no-open", false, "with -serve: do not open a browser automatically")
 	interactive := fs.Bool("interactive", false, "interactive REPL mode (multi-turn)")
 	guided := fs.Bool("guided", false, "human-in-the-loop: plan, review/approve, then execute (mid-run plan edits and questions)")
 	listSessions := fs.Bool("sessions", false, "list saved sessions and exit")
@@ -153,6 +156,27 @@ func run(args []string) error {
 
 	if *interactive && *guided {
 		return fmt.Errorf("-interactive and -guided are mutually exclusive; choose one")
+	}
+
+	if *serve {
+		if *interactive || *guided || *plan || *resume {
+			return fmt.Errorf("-serve is mutually exclusive with -interactive/-guided/-plan/-resume; drive runs from the web UI instead")
+		}
+		if fs.NArg() > 0 {
+			return fmt.Errorf("-serve takes no goal argument; create sessions in the web UI")
+		}
+		for _, on := range []struct {
+			name string
+			v    bool
+		}{
+			{"sessions", *listSessions}, {"status", *status}, {"report", *report},
+			{"prune", *prune}, {"log", *showLog}, {"events", *showEvents},
+		} {
+			if on.v {
+				return fmt.Errorf("-serve is mutually exclusive with -%s", on.name)
+			}
+		}
+		return runServe(cfg, log, *port, *noOpen)
 	}
 
 	if *interactive {
@@ -408,6 +432,7 @@ Usage:
   divvy -plan [flags] <goal>
   divvy -interactive [flags] [first message]
   divvy -guided [flags] <goal>
+  divvy -serve [-port 0] [-no-open] [flags]   # 本机 Web 界面（loopback，带随机 token）
   divvy -resume [-session ID]
   divvy -status [-session ID]
   divvy -report [-session ID]   # 事后复盘：进度、成本、重试/停滞、失败原因
