@@ -676,7 +676,14 @@ func (o *Orchestrator) executeLeaf(ctx context.Context, leaf *models.TaskNode) e
 		if err != nil {
 			return err
 		}
-		defer mirror.Close()
+		// Close over the variable, not the pointer captured at defer time:
+		// a merge-conflict re-snapshot replaces mirror below, and the fresh
+		// mirror must be the one closed on exit.
+		defer func() {
+			if mirror != nil {
+				mirror.Close()
+			}
+		}()
 	}
 
 	prevErr := ""
@@ -743,6 +750,7 @@ func (o *Orchestrator) executeLeaf(ctx context.Context, leaf *models.TaskNode) e
 					var conflict *tools.MergeConflictError
 					if errors.As(merr, &conflict) {
 						mirror.Close()
+						mirror = nil // until the fresh snapshot exists; closes on the ferr return too
 						fresh, fsb, ferr := o.newLeafMirror()
 						if ferr != nil {
 							return ferr

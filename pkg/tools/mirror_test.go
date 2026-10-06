@@ -1,9 +1,12 @@
 package tools
 
 import (
+	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -332,5 +335,197 @@ func TestMirror_MergeBackCleanFastForwardStillWorks(t *testing.T) {
 	}
 	if got := readFile(t, filepath.Join(src, "a.go")); got != "changed\n" {
 		t.Fatalf("change not applied: %q", got)
+	}
+}
+
+// gitAvailable skips worktree tests on machines without git.
+func gitAvailable(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+}
+
+// assertWorktreeDeregistered verifies Close both removed the mirror
+// directory and deregistered it from the source repository.
+func assertWorktreeDeregistered(t *testing.T, repo, dir string) {
+	t.Helper()
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("mirror dir %s still exists after Close", dir)
+	}
+	out, err := exec.Command("git", "-C", repo, "worktree", "list", "--porcelain").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(out), dir) {
+		t.Fatalf("worktree still registered after Close:\n%s", out)
+	}
+}
+
+// TestMirror_WorktreeUsedForGitRepo is the core regression: an isolated leaf
+// in a git workspace used to run inside a plain .git-less copy, where the
+// pre-finish gate silently no-op'd. A worktree mirror is a git working tree.
+func TestMirror_WorktreeUsedForGitRepo(t *testing.T) {
+	gitAvailable(t)
+	sb := setupGitRepo(t, map[string]string{"main.go": "package main\n"})
+
+	m, err := NewMirror(sb.Root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if !m.worktree {
+		t.Fatal("git repo with commits must snapshot via git worktree")
+	}
+	if !IsRepo(m.Dir) {
+		t.Fatal("worktree mirror must itself be a git working tree")
+	}
+}
+
+// TestMirror_WorktreeFinishGateActive proves the finish gate works INSIDE an
+// isolated leaf: a hard-coded secret in a new file and a conflict marker in
+// a tracked file must both block finish.
+func TestMirror_WorktreeFinishGateActive(t *testing.T) {
+	gitAvailable(t)
+	sb := setupGitRepo(t, map[string]string{"main.go": "package main\n"})
+
+	m, err := NewMirror(sb.Root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	msb, err := m.Sandbox()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// New untracked file with a hard-coded AWS key.
+	if err := msb.WriteFile("leak.go", "package main\n\nvar awsKey = \"AKIAIOSFODNN7EXAMPLE\"\n"); err != nil {
+		t.Fatal(err)
+	}
+	// Tracked file with an unresolved conflict marker.
+	if err := msb.WriteFile("main.go", "package main\n\nfunc main() {\n<<<<<<< HEAD\nx()\n=======\ny()\n>>>>>>> b\n}\n"); err != nil {
+		t.Fatal(err)
+	}
+
+	gate, err := msb.PreFinishGate(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gate == nil || !gate.Blocking {
+		t.Fatalf("finish gate must block secret + conflict marker in worktree: %+v", gate)
+	}
+	if !strings.Contains(gate.Report, "[secret] leak.go:") {
+		t.Fatalf("report missing untracked-file secret:\n%s", gate.Report)
+	}
+	if !strings.Contains(gate.Report, "[conflict] main.go:") {
+		t.Fatalf("report missing tracked-file conflict marker:\n%s", gate.Report)
+	}
+}
+
+// TestMirror_WorktreeOverlaysDirtyState verifies a later leaf sees earlier
+// leaves' merged-but-uncommitted work: tracked modifications and deletions
+// (vs HEAD) and untracked files must be present in the new worktree, while
+// internal directories such as .divvy stay out.
+func TestMirror_WorktreeOverlaysDirtyState(t *testing.T) {
+	gitAvailable(t)
+	sb := setupGitRepo(t, map[string]string{
+		"tracked.txt": "v1\n",
+		"doomed.txt":  "x\n",
+	})
+
+	// Make the source working tree dirty without committing.
+	if err := sb.WriteFile("tracked.txt", "v2\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(sb.Root, "doomed.txt")); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(sb.Root, "untracked.txt"), "fresh\n")
+	writeFile(t, filepath.Join(sb.Root, ".divvy", "s.json"), "internal\n")
+
+	m, err := NewMirror(sb.Root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+
+	if got := readFile(t, filepath.Join(m.Dir, "tracked.txt")); got != "v2\n" {
+		t.Fatalf("dirty tracked change missing from mirror: %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(m.Dir, "doomed.txt")); !os.IsNotExist(err) {
+		t.Fatal("tracked deletion not reflected in mirror")
+	}
+	if got := readFile(t, filepath.Join(m.Dir, "untracked.txt")); got != "fresh\n" {
+		t.Fatalf("untracked file missing from mirror: %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(m.Dir, ".divvy")); !os.IsNotExist(err) {
+		t.Fatal(".divvy must not be overlaid into the mirror")
+	}
+
+	// Mirror matches the source's live state, so merging it back is a no-op.
+	merged, deleted, err := m.MergeBack()
+	if err != nil {
+		t.Fatalf("identical state should merge cleanly: %v", err)
+	}
+	if len(merged) != 0 || len(deleted) != 0 {
+		t.Fatalf("expected no merge output, got merged=%v deleted=%v", merged, deleted)
+	}
+}
+
+// TestMirror_WorktreeMergeConflict keeps the stale-overwrite guard working
+// on worktree mirrors: a sibling edit after snapshot must abort the merge.
+func TestMirror_WorktreeMergeConflict(t *testing.T) {
+	gitAvailable(t)
+	sb := setupGitRepo(t, map[string]string{"f.txt": "old\n"})
+
+	m, err := NewMirror(sb.Root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, filepath.Join(sb.Root, "f.txt")); got != "old\n" {
+		t.Fatalf("baseline: %q", got)
+	}
+
+	// Sibling merges after our snapshot; our leaf edits the same file.
+	writeFile(t, filepath.Join(sb.Root, "f.txt"), "sibling\n")
+	writeFile(t, filepath.Join(m.Dir, "f.txt"), "mine\n")
+
+	_, _, err = m.MergeBack()
+	var conflict *MergeConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("want *MergeConflictError, got %v", err)
+	}
+	if got := readFile(t, filepath.Join(sb.Root, "f.txt")); got != "sibling\n" {
+		t.Fatalf("sibling content clobbered: %q", got)
+	}
+
+	m.Close()
+	assertWorktreeDeregistered(t, sb.Root, m.Dir)
+}
+
+// TestMirror_RepoWithoutCommitsFallsBack covers an initialized repository
+// with no HEAD: worktree add cannot check anything out, so the copy path is
+// used (matching the old, always-working behavior).
+func TestMirror_RepoWithoutCommitsFallsBack(t *testing.T) {
+	gitAvailable(t)
+	root := t.TempDir()
+	cmd := exec.Command("git", "init", "-q")
+	cmd.Dir = root
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, out)
+	}
+	writeFile(t, filepath.Join(root, "only.txt"), "x\n")
+
+	m, err := NewMirror(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if m.worktree {
+		t.Fatal("repo with no commits must use the copy fallback")
+	}
+	if got := readFile(t, filepath.Join(m.Dir, "only.txt")); got != "x\n" {
+		t.Fatalf("file missing in copy mirror: %q", got)
 	}
 }

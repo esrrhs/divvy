@@ -1,16 +1,27 @@
 package tools
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 )
+
+// worktreeMu serializes git worktree admin operations (add/remove). Git
+// itself locks the worktrees admin directory, but older versions and slow
+// disks make concurrent admin commands flaky; one process-wide lock keeps
+// mirror setup/teardown deterministic.
+var worktreeMu sync.Mutex
 
 // Mirror is a disposable copy of a workspace for isolated leaf execution.
 // A leaf works inside the mirror; its changes reach the real workspace only
@@ -25,16 +36,40 @@ type Mirror struct {
 	// silently overwrites a sibling's already-verified work.
 	base map[string]string
 	src  string
+
+	// worktree marks a mirror created with `git worktree add` rather than a
+	// plain directory copy. Such a mirror IS a git working tree, so the
+	// pre-finish gate, review_diff and the read-only git tools work inside
+	// it. Close must deregister it with git instead of only deleting the
+	// directory.
+	worktree bool
 }
 
-// NewMirror copies the workspace at src into a fresh temp directory and
-// records a content digest for every file that existed at snapshot time.
-// Skips the usual ignored directories (.git, node_modules, ...) and
-// non-regular files (symlinks).
+// NewMirror snapshots the workspace at src into a fresh temp directory and
+// records a content digest for every file present at snapshot time.
+//
+// When src is a git repository with at least one commit, the snapshot is a
+// detached `git worktree`: it shares the source's object store (fast, no
+// .git copy) and is itself a git working tree, which keeps the finish gate
+// and git tooling functional inside isolated leaves. The source working
+// tree's uncommitted tracked changes and untracked files are overlaid onto
+// the new worktree, since merged sibling work is not necessarily committed.
+//
+// Non-git workspaces (and repositories with no commits) fall back to a plain
+// directory copy that skips ignored directories (.git, node_modules, ...)
+// and non-regular files (symlinks).
 func NewMirror(src string) (*Mirror, error) {
 	dir, err := os.MkdirTemp("", "divvy_mirror-")
 	if err != nil {
 		return nil, fmt.Errorf("create mirror dir: %w", err)
+	}
+	if repoReadyForWorktree(src) {
+		m, werr := newWorktreeMirror(src, dir)
+		if werr != nil {
+			os.RemoveAll(dir)
+			return nil, werr
+		}
+		return m, nil
 	}
 	base, err := copyTree(src, dir)
 	if err != nil {
@@ -42,6 +77,119 @@ func NewMirror(src string) (*Mirror, error) {
 		return nil, fmt.Errorf("snapshot %s: %w", src, err)
 	}
 	return &Mirror{Dir: dir, base: base, src: src}, nil
+}
+
+// repoReadyForWorktree reports whether src is a git repository whose HEAD
+// exists: `git worktree add --detach` needs a commit to check out, so a
+// freshly initialized repository with no commits must use the copy fallback.
+func repoReadyForWorktree(src string) bool {
+	if !IsRepo(src) {
+		return false
+	}
+	out, err := exec.Command("git", "-C", src, "rev-parse", "-q", "--verify", "HEAD").Output()
+	return err == nil && len(bytes.TrimSpace(out)) > 0
+}
+
+// newWorktreeMirror creates a detached git worktree at dir carrying the
+// source working tree's current state (HEAD plus uncommitted tracked changes
+// and untracked files), then digests its contents for MergeBack.
+func newWorktreeMirror(src, dir string) (*Mirror, error) {
+	worktreeMu.Lock()
+	defer worktreeMu.Unlock()
+
+	if out, err := exec.Command("git", "-C", src, "worktree", "add", "--detach", "-q", dir).CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("git worktree add: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	cleanup := func() {
+		_ = exec.Command("git", "-C", src, "worktree", "remove", "--force", dir).Run()
+		_ = os.RemoveAll(dir)
+	}
+	if err := overlayWorktreeState(src, dir); err != nil {
+		cleanup()
+		return nil, err
+	}
+	base, err := snapshotDigests(dir)
+	if err != nil {
+		cleanup()
+		return nil, fmt.Errorf("digest worktree %s: %w", dir, err)
+	}
+	return &Mirror{Dir: dir, base: base, src: src, worktree: true}, nil
+}
+
+// overlayWorktreeState makes a freshly checked-out HEAD worktree match the
+// source's live working tree:
+//
+//   - tracked modifications and deletions (staged or not) are ported with a
+//     binary diff against HEAD applied inside the worktree;
+//   - untracked, non-ignored regular files are copied individually (the
+//     skipDirNames filter keeps .divvy/.git/node_modules etc. out).
+//
+// Without this overlay a leaf created after a sibling merged (but
+// -git-commit was off) would see stale HEAD content instead of the sibling's
+// work.
+func overlayWorktreeState(src, wt string) error {
+	// `git diff` reads the index, which a concurrent `git add` (leaf
+	// publish) may briefly lock; retry that one transient failure.
+	var diff []byte
+	for attempt := 0; ; attempt++ {
+		out, runErr := exec.Command("git", "-C", src, "diff", "--binary", "HEAD").Output()
+		if runErr == nil {
+			diff = out
+			break
+		}
+		stderr := ""
+		var exitErr *exec.ExitError
+		if errors.As(runErr, &exitErr) {
+			stderr = string(exitErr.Stderr)
+		}
+		if attempt >= 3 || !strings.Contains(stderr, "index.lock") {
+			return fmt.Errorf("read working-tree diff from %s: %w: %s", src, runErr, strings.TrimSpace(stderr))
+		}
+		time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
+	}
+	if len(bytes.TrimSpace(diff)) > 0 {
+		cmd := exec.Command("git", "apply", "--whitespace=nowarn")
+		cmd.Dir = wt
+		cmd.Stdin = bytes.NewReader(diff)
+		if out, applyErr := cmd.CombinedOutput(); applyErr != nil {
+			return fmt.Errorf("overlay tracked changes onto worktree: %w: %s", applyErr, strings.TrimSpace(string(out)))
+		}
+	}
+
+	out, err := exec.Command("git", "-C", src, "ls-files", "--others", "--exclude-standard", "-z").Output()
+	if err != nil {
+		return fmt.Errorf("list untracked files in %s: %w", src, err)
+	}
+	for _, rel := range strings.Split(string(out), "\x00") {
+		if rel == "" || skippedRel(rel) {
+			continue
+		}
+		srcPath := filepath.Join(src, filepath.FromSlash(rel))
+		info, statErr := os.Stat(srcPath)
+		if statErr != nil || !info.Mode().IsRegular() {
+			continue // parity with copyTree: skip symlinks/special files
+		}
+		dst := filepath.Join(wt, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+			return err
+		}
+		if err := copyFile(srcPath, dst); err != nil {
+			return fmt.Errorf("overlay untracked %s: %w", rel, err)
+		}
+	}
+	return nil
+}
+
+// skippedRel reports whether any path segment of rel is in skipDirNames
+// (".git", ".divvy", "node_modules", ...). The filter is segment-based so
+// "a/node_modules/b" is skipped at any depth.
+func skippedRel(rel string) bool {
+	for _, seg := range strings.Split(filepath.ToSlash(rel), "/") {
+		if skipDirNames[seg] {
+			return true
+		}
+	}
+	return false
 }
 
 // Sandbox returns a workspace-confined sandbox rooted at the mirror.
@@ -192,10 +340,24 @@ func (m *Mirror) MergeBack() (merged, deleted []string, err error) {
 	return merged, deleted, nil
 }
 
-// Close removes the mirror directory.
+// Close removes the mirror. A worktree mirror is deregistered with git
+// first (plainly deleting its directory would leave an administrative entry
+// under the source's .git/worktrees); if git refuses (e.g. the worktree was
+// partially torn down), the directory is removed anyway and stale worktree
+// metadata pruned.
 func (m *Mirror) Close() {
-	if m != nil && m.Dir != "" {
+	if m == nil || m.Dir == "" {
+		return
+	}
+	if !m.worktree {
 		os.RemoveAll(m.Dir)
+		return
+	}
+	worktreeMu.Lock()
+	defer worktreeMu.Unlock()
+	if err := exec.Command("git", "-C", m.src, "worktree", "remove", "--force", m.Dir).Run(); err != nil {
+		_ = os.RemoveAll(m.Dir)
+		_, _ = exec.Command("git", "-C", m.src, "worktree", "prune").Output()
 	}
 }
 
@@ -255,6 +417,46 @@ func copyTree(src, dst string) (map[string]string, error) {
 		return nil, err
 	}
 	return copied, nil
+}
+
+// snapshotDigests maps every regular, non-ignored file under root to the
+// sha256 of its contents. It is the worktree counterpart of the digest map
+// copyTree builds for copy mirrors: in a linked worktree ".git" is a regular
+// file (not a directory), and it must be skipped just like the copy path
+// skips the .git directory.
+func snapshotDigests(root string) (map[string]string, error) {
+	digests := make(map[string]string)
+	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, werr error) error {
+		if werr != nil {
+			return werr
+		}
+		if p == root {
+			return nil
+		}
+		if d.IsDir() {
+			if skipDirNames[d.Name()] {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if skipDirNames[d.Name()] || !d.Type().IsRegular() {
+			return nil
+		}
+		rel, err := filepath.Rel(root, p)
+		if err != nil {
+			return err
+		}
+		sum, err := fileDigest(p)
+		if err != nil {
+			return err
+		}
+		digests[filepath.ToSlash(rel)] = sum
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return digests, nil
 }
 
 func copyFile(src, dst string) error {
