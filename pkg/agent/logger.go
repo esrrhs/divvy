@@ -35,6 +35,53 @@ type Logger struct {
 	color   bool
 	verbose bool
 	file    io.Writer
+
+	wMu   sync.Mutex
+	watch map[int]chan string
+	wID   int
+}
+
+// logLineBuffer bounds how many rendered lines a slow UI subscriber may queue.
+const logLineBuffer = 256
+
+// SubscribeLines fans out every rendered (plain, timestamped) log line. It is
+// the live source for the web UI log panel. Delivery is best-effort: a slow
+// subscriber drops lines instead of blocking workers.
+func (l *Logger) SubscribeLines() (<-chan string, func()) {
+	if l == nil {
+		ch := make(chan string)
+		return ch, func() { close(ch) }
+	}
+	l.wMu.Lock()
+	l.wID++
+	id := l.wID
+	if l.watch == nil {
+		l.watch = make(map[int]chan string)
+	}
+	ch := make(chan string, logLineBuffer)
+	l.watch[id] = ch
+	l.wMu.Unlock()
+	cancel := func() {
+		l.wMu.Lock()
+		if c, ok := l.watch[id]; ok {
+			delete(l.watch, id)
+			close(c)
+		}
+		l.wMu.Unlock()
+	}
+	return ch, cancel
+}
+
+// fanLines delivers one plain line to every watcher without blocking.
+func (l *Logger) fanLines(line string) {
+	l.wMu.Lock()
+	defer l.wMu.Unlock()
+	for _, ch := range l.watch {
+		select {
+		case ch <- line:
+		default:
+		}
+	}
 }
 
 // NewLogger writes to stdout/stderr.
@@ -76,10 +123,12 @@ func (l *Logger) emit(w io.Writer, colorCode, icon, level, format string, args .
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	fmt.Fprintln(w, screen)
+	line := fmt.Sprintf("%s %-7s %s",
+		time.Now().Format("2006-01-02 15:04:05.000"), level, plain)
 	if l.file != nil {
-		fmt.Fprintf(l.file, "%s %-7s %s\n",
-			time.Now().Format("2006-01-02 15:04:05.000"), level, plain)
+		fmt.Fprintln(l.file, line)
 	}
+	l.fanLines(line)
 }
 
 func (l *Logger) Infof(format string, args ...any) {
@@ -133,6 +182,9 @@ func (l *Logger) Print(s string) {
 		if !strings.HasSuffix(plain, "\n") {
 			fmt.Fprintln(l.file)
 		}
+	}
+	for _, line := range strings.Split(strings.TrimSuffix(plain, "\n"), "\n") {
+		l.fanLines(line)
 	}
 }
 

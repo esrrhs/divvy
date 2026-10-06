@@ -504,6 +504,168 @@ func TestMirror_WorktreeMergeConflict(t *testing.T) {
 	assertWorktreeDeregistered(t, sb.Root, m.Dir)
 }
 
+// TestMirror_PreviewChangesNoApply verifies the review payload describes
+// added/modified/deleted files with contents WITHOUT touching the source,
+// for BOTH mirror backends: a plain copy (non-git workspace) and a linked
+// git worktree (git workspace). TR-2.4.
+func TestMirror_PreviewChangesNoApply(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(t *testing.T) (src string)
+	}{
+		{
+			name: "copy",
+			setup: func(t *testing.T) string {
+				src := t.TempDir()
+				writeFile(t, filepath.Join(src, "edit.txt"), "old\n")
+				writeFile(t, filepath.Join(src, "gone.txt"), "doomed\n")
+				writeFile(t, filepath.Join(src, "keep.txt"), "same\n")
+				return src
+			},
+		},
+		{
+			name: "worktree",
+			setup: func(t *testing.T) string {
+				gitAvailable(t)
+				return setupGitRepo(t, map[string]string{
+					"edit.txt": "old\n",
+					"gone.txt": "doomed\n",
+					"keep.txt": "same\n",
+				}).Root
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src := tc.setup(t)
+
+			m, err := NewMirror(src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer m.Close()
+			if tc.name == "worktree" && !m.worktree {
+				t.Fatal("git workspace must produce a worktree mirror")
+			}
+
+			writeFile(t, filepath.Join(m.Dir, "edit.txt"), "new\n")
+			writeFile(t, filepath.Join(m.Dir, "added", "new.txt"), "fresh\n")
+			if err := os.Remove(filepath.Join(m.Dir, "gone.txt")); err != nil {
+				t.Fatal(err)
+			}
+
+			changes, err := m.PreviewChanges()
+			if err != nil {
+				t.Fatal(err)
+			}
+			byPath := map[string]FileChange{}
+			for _, c := range changes {
+				byPath[c.Path] = c
+			}
+			if len(byPath) != 3 {
+				t.Fatalf("want 3 changes (edit/add/delete), got %+v", changes)
+			}
+			if c := byPath["edit.txt"]; c.Status != ChangeModified || c.OldContent != "old\n" || c.NewContent != "new\n" || c.Conflict {
+				t.Fatalf("edit wrong: %+v", c)
+			}
+			if c := byPath["added/new.txt"]; c.Status != ChangeAdded || c.OldContent != "" || c.NewContent != "fresh\n" {
+				t.Fatalf("add wrong: %+v", c)
+			}
+			if c := byPath["gone.txt"]; c.Status != ChangeDeleted || c.OldContent != "doomed\n" || c.NewContent != "" {
+				t.Fatalf("delete wrong: %+v", c)
+			}
+
+			// Preview must not mutate anything: MergeBack afterwards still works.
+			if _, _, err := m.MergeBack(); err != nil {
+				t.Fatalf("preview poisoned the merge: %v", err)
+			}
+			if got := readFile(t, filepath.Join(src, "edit.txt")); got != "new\n" {
+				t.Fatalf("merge content wrong: %q", got)
+			}
+			if _, err := os.Stat(filepath.Join(src, "gone.txt")); !os.IsNotExist(err) {
+				t.Fatalf("deleted file still present after merge: %v", err)
+			}
+
+			if tc.name == "worktree" {
+				dir := m.Dir
+				m.Close()
+				assertWorktreeDeregistered(t, src, dir)
+			}
+		})
+	}
+}
+
+// TestMirror_PreviewChangesFlagsSiblingConflict covers a file the leaf
+// modified AND a sibling changed after the snapshot.
+func TestMirror_PreviewChangesFlagsSiblingConflict(t *testing.T) {
+	src := t.TempDir()
+	writeFile(t, filepath.Join(src, "f.txt"), "base\n")
+	m, err := NewMirror(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+
+	writeFile(t, filepath.Join(m.Dir, "f.txt"), "mine\n")
+	writeFile(t, filepath.Join(src, "f.txt"), "sibling\n")
+
+	changes, err := m.PreviewChanges()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 1 || !changes[0].Conflict || changes[0].Status != ChangeModified {
+		t.Fatalf("conflicting change not flagged: %+v", changes)
+	}
+}
+
+// TestMirror_PreviewChangesBinaryFlagged verifies NUL-containing content is
+// marked binary rather than shipped as text.
+func TestMirror_PreviewChangesBinaryFlagged(t *testing.T) {
+	src := t.TempDir()
+	m, err := NewMirror(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if err := writeBinary(filepath.Join(m.Dir, "blob.bin"), []byte{'P', 'K', 0x03, 0x04, 0x00}); err != nil {
+		t.Fatal(err)
+	}
+	changes, err := m.PreviewChanges()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 1 || !changes[0].Binary || changes[0].NewContent != "" {
+		t.Fatalf("binary change wrong: %+v", changes)
+	}
+}
+
+// TestMirror_MergeBackPreservesExecutableBit verifies a chmod +x inside the
+// mirror survives the merge.
+func TestMirror_MergeBackPreservesExecutableBit(t *testing.T) {
+	src := t.TempDir()
+	writeFile(t, filepath.Join(src, "run.sh"), "#!/bin/sh\necho hi\n")
+	m, err := NewMirror(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+
+	target := filepath.Join(m.Dir, "run.sh")
+	if err := os.Chmod(target, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := m.MergeBack(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(filepath.Join(src, "run.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm()&0o111 == 0 {
+		t.Fatalf("executable bit lost on merge: %v", info.Mode().Perm())
+	}
+}
+
 // TestMirror_RepoWithoutCommitsFallsBack covers an initialized repository
 // with no HEAD: worktree add cannot check anything out, so the copy path is
 // used (matching the old, always-working behavior).

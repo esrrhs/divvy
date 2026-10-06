@@ -66,6 +66,12 @@ type Config struct {
 	GitCommit bool // commit each leaf's merged changes to the workdir git repo
 	Strict    bool // plan mode: fail on plan-check warnings
 
+	// LeafApproval controls the human diff-review gate that pauses after a
+	// leaf verifies and before its changes merge: "auto" (default, never
+	// pause — the CLI behavior) or "manual" (pause every leaf for approval;
+	// requires Isolate so a rejection can discard the leaf's workdir).
+	LeafApproval string
+
 	// Cost & budget. PricingJSON is a custom price table as JSON text or a
 	// path to a JSON file; empty means the built-in table only. MaxCost and
 	// BudgetTokens are session-wide ceilings (0 = unlimited) that include
@@ -106,6 +112,21 @@ func DefaultConfig() Config {
 func (c Config) RequiresAPIKey() bool {
 	u := strings.ToLower(c.BaseURL)
 	return !strings.Contains(u, "localhost") && !strings.Contains(u, "127.0.0.1") && !strings.Contains(u, "0.0.0.0")
+}
+
+// Leaf approval modes.
+const (
+	LeafApprovalAuto   = "auto"
+	LeafApprovalManual = "manual"
+)
+
+// LeafApprovalMode returns the normalized approval mode; anything except the
+// explicit manual setting degrades to auto.
+func (c Config) LeafApprovalMode() string {
+	if strings.EqualFold(strings.TrimSpace(c.LeafApproval), LeafApprovalManual) {
+		return LeafApprovalManual
+	}
+	return LeafApprovalAuto
 }
 
 func firstEnv(keys ...string) string {

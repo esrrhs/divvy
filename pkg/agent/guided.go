@@ -63,6 +63,12 @@ type Guider struct {
 	// consumer of input) relays the reply.
 	askCh    chan string
 	answerCh chan string
+
+	// askNotice, when set, is called at the moment a worker question is
+	// waiting for an answer on GuidedIO. A channel-based (web) frontend uses
+	// it to surface the pending question; the answer still arrives as a line
+	// through GuidedIO. Nil in terminal mode.
+	askNotice func(question string)
 }
 
 // NewGuider wraps an orchestrator that has a goal but has not yet run.
@@ -129,6 +135,10 @@ func (g *Guider) Run(ctx context.Context) (runErr error) {
 // review shows the plan and waits for approval or adjustments.
 func (g *Guider) review(ctx context.Context) error {
 	for {
+		// Re-emitted every round (an adjustment replans and loops back): the
+		// terminal prompt and the structured pending event must stay in
+		// sync so a web UI re-enables its approve controls after a replan.
+		g.o.events.Record("plan_review", "", map[string]any{"phase": "pending"})
 		g.io.Printf("\nplan ready — /approve to start, type adjustments, or /abort\n> ")
 		select {
 		case line, ok := <-g.io.Lines():
@@ -292,6 +302,9 @@ func (g *Guider) runLeafInteractive(ctx context.Context, leaf *models.TaskNode) 
 
 		case question := <-g.askCh:
 			g.io.Printf("\n? %s\n> ", question)
+			if g.askNotice != nil {
+				g.askNotice(question)
+			}
 			select {
 			case ans, ok := <-g.io.Lines():
 				if !ok {

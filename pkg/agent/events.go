@@ -16,9 +16,94 @@ import (
 // event stream. The file is opened append-only, so a crash still leaves a
 // readable prefix and resumed sessions continue the same history. All methods
 // are nil-safe so call sites never need nil checks.
+//
+// Besides the file, a recorder fans every event out to in-process subscribers
+// (the web UI's SSE stream). Fan-out is best-effort and never blocks the
+// orchestration loop: a slow subscriber drops events and receives a synthetic
+// "_dropped" event reporting how many it missed.
 type EventRecorder struct {
 	mu sync.Mutex
 	f  *os.File
+
+	// seq is the monotonic event number, shared by the JSONL file and live
+	// subscribers. SSE replays the file tail and then skips live events at
+	// or below the last replayed seq, so reconnects neither gap nor dup.
+	seq int64
+
+	subMu sync.Mutex
+	subs  map[int]*eventSubscription
+	subID int
+}
+
+// eventBuffer is the per-subscriber channel capacity.
+const eventBuffer = 128
+
+type eventSubscription struct {
+	ch      chan map[string]any
+	dropped int
+}
+
+// Subscribe registers a live fan-out of every subsequently recorded event.
+// The returned cancel detaches the subscriber; the channel is closed after
+// cancellation or recorder Close. Callers must always call cancel to avoid
+// leaking goroutines.
+func (r *EventRecorder) Subscribe() (<-chan map[string]any, func()) {
+	if r == nil {
+		ch := make(chan map[string]any)
+		return ch, func() { close(ch) }
+	}
+	r.subMu.Lock()
+	r.subID++
+	id := r.subID
+	sub := &eventSubscription{ch: make(chan map[string]any, eventBuffer)}
+	if r.subs == nil {
+		r.subs = make(map[int]*eventSubscription)
+	}
+	r.subs[id] = sub
+	r.subMu.Unlock()
+	cancel := func() {
+		r.subMu.Lock()
+		if s, ok := r.subs[id]; ok {
+			delete(r.subs, id)
+			close(s.ch)
+		}
+		r.subMu.Unlock()
+	}
+	return sub.ch, cancel
+}
+
+// SubscriberCount reports how many live fan-out targets exist (tests/metrics).
+func (r *EventRecorder) SubscriberCount() int {
+	if r == nil {
+		return 0
+	}
+	r.subMu.Lock()
+	defer r.subMu.Unlock()
+	return len(r.subs)
+}
+
+// fanOut delivers one event to every subscriber without blocking: when a
+// subscriber buffer is full the event is counted as dropped for it.
+func (r *EventRecorder) fanOut(ev map[string]any) {
+	r.subMu.Lock()
+	defer r.subMu.Unlock()
+	for _, s := range r.subs {
+		if s.dropped > 0 {
+			note := map[string]any{"kind": "_dropped", "count": s.dropped}
+			select {
+			case s.ch <- note:
+				s.dropped = 0
+			default:
+				s.dropped++ // note itself could not be queued; keep counting
+				continue
+			}
+		}
+		select {
+		case s.ch <- ev:
+		default:
+			s.dropped++
+		}
+	}
 }
 
 // Per-field size caps: the goal is post-mortem traceability, not full
@@ -45,14 +130,22 @@ func NewEventRecorder(path string) (*EventRecorder, error) {
 	return &EventRecorder{f: f}, nil
 }
 
-// Close flips the underlying file.
+// Close flips the underlying file and detaches all subscribers.
 func (r *EventRecorder) Close() error {
 	if r == nil {
 		return nil
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.f.Close()
+	err := r.f.Close()
+	r.mu.Unlock()
+
+	r.subMu.Lock()
+	for id, s := range r.subs {
+		close(s.ch)
+		delete(r.subs, id)
+	}
+	r.subMu.Unlock()
+	return err
 }
 
 // Record appends one event. Fields may override the built-in ts/kind keys.
@@ -60,7 +153,7 @@ func (r *EventRecorder) Record(kind, nodeID string, fields map[string]any) {
 	if r == nil {
 		return
 	}
-	ev := make(map[string]any, len(fields)+3)
+	ev := make(map[string]any, len(fields)+4)
 	ev["ts"] = time.Now().Format(time.RFC3339Nano)
 	ev["kind"] = kind
 	if nodeID != "" {
@@ -73,9 +166,19 @@ func (r *EventRecorder) Record(kind, nodeID string, fields map[string]any) {
 	if err != nil {
 		return
 	}
+	// Assign the sequence and persist before fan-out while holding the same
+	// lock: a subscriber that reconnects can trust every seq on disk and
+	// never observe an event number the file does not contain.
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.seq++
+	ev["seq"] = r.seq
+	if data, err = json.Marshal(ev); err != nil {
+		r.mu.Unlock()
+		return
+	}
 	_, _ = r.f.Write(append(data, '\n'))
+	r.mu.Unlock()
+	r.fanOut(ev)
 }
 
 // clip trims and hard-cuts s to n chars, reporting how much was dropped.

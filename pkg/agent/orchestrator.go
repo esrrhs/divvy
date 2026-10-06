@@ -38,13 +38,26 @@ type Orchestrator struct {
 	leafMu    sync.Mutex
 	leafStart map[string]time.Time
 
-	// Session trace sinks: the human-readable log and the JSONL event stream.
+	// Session trace sinks: the human-readable log file and the JSONL event stream.
 	logFile *os.File
 	events  *EventRecorder
+
+	// treeBC coalesces and publishes tree_snapshot events to subscribers.
+	treeBC *treeBroadcaster
 
 	// askHook, when set, lets a leaf worker ask the user a question mid-run
 	// and block on the answer. Nil in batch mode; the guided flow sets it.
 	askHook func(question string) string
+
+	// leafApproval, when set, pauses verified leaves for human diff review
+	// (manual approval mode). Nil means the configured mode degrades to
+	// auto-approve with a warning.
+	leafApproval LeafApprovalHook
+}
+
+// SetLeafApprovalHook installs the human review gate used in manual mode.
+func (o *Orchestrator) SetLeafApprovalHook(h LeafApprovalHook) {
+	o.leafApproval = h
 }
 
 // New creates an orchestrator around an existing tree.
@@ -72,6 +85,9 @@ func New(cfg Config, tree *engine.TaskTree, client llm.Client, log *Logger) (*Or
 	}
 	if cfg.GitCommit && !tools.IsRepo(sandbox.Root) {
 		return nil, fmt.Errorf("-git-commit requires %s to be a git repository", sandbox.Root)
+	}
+	if cfg.LeafApprovalMode() == LeafApprovalManual && !cfg.Isolate {
+		return nil, fmt.Errorf("manual leaf approval requires isolate mode (-isolate): rejected changes must be discardable")
 	}
 	storage, err := engine.NewStorage(cfg.DataDir)
 	if err != nil {
@@ -121,6 +137,8 @@ func (o *Orchestrator) openSinks() {
 	evPath := filepath.Join(o.cfg.DataDir, "events", o.tree.ID+".jsonl")
 	if rec, err := NewEventRecorder(evPath); err == nil {
 		o.events = rec
+		o.treeBC = newTreeBroadcaster(o)
+		o.treeBC.start()
 	} else {
 		o.log.Warnf("event stream not writable (%s): %v", evPath, err)
 	}
@@ -131,6 +149,9 @@ func (o *Orchestrator) openSinks() {
 			f["error"] = clip(msg, evReasonChars)
 		}
 		o.events.Record("state_change", id, f)
+		if o.treeBC != nil {
+			o.treeBC.mark("state")
+		}
 	}
 }
 
@@ -145,6 +166,9 @@ func (o *Orchestrator) EventPath() string {
 
 // Close releases trace files and the shared browser process.
 func (o *Orchestrator) Close() {
+	if o.treeBC != nil {
+		o.treeBC.close()
+	}
 	if o.events != nil {
 		_ = o.events.Close()
 	}
@@ -734,6 +758,56 @@ func (o *Orchestrator) executeLeaf(ctx context.Context, leaf *models.TaskNode) e
 			return ctx.Err()
 		}
 		if vr.OK {
+			// Manual human review: pause with the leaf's diff BEFORE any merge.
+			// Requires an isolated mirror so a rejection can discard the whole
+			// attempt and re-run against a fresh snapshot.
+			if o.cfg.LeafApprovalMode() == LeafApprovalManual && mirror != nil {
+				if o.leafApproval == nil {
+					o.log.Warnf("manual leaf approval configured but no hook installed; auto-approving %s", leaf.ID)
+				} else {
+					changes, perr := mirror.PreviewChanges()
+					if perr != nil {
+						return fmt.Errorf("preview changes for review: %w", perr)
+					}
+					o.events.Record("leaf_approval", leaf.ID, map[string]any{"phase": "pending", "files": len(changes)})
+					decision, aerr := o.leafApproval(ctx, LeafApprovalRequest{
+						NodeID: leaf.ID, Title: leaf.Title, Changes: changes,
+					})
+					if aerr != nil {
+						if ctx.Err() != nil {
+							_ = o.sched.UpdateNodeState(leaf.ID, models.TaskStatePending, "interrupted")
+							_ = o.checkpoint()
+							return ctx.Err()
+						}
+						return aerr
+					}
+					if !decision.Approved {
+						o.events.Record("leaf_approval", leaf.ID, map[string]any{
+							"phase": "rejected", "comment": clip(decision.Comment, evReasonChars),
+						})
+						o.recordNodeError(leaf.ID, "changes rejected by reviewer: "+decision.Comment)
+						mirror.Close()
+						mirror = nil // until the fresh snapshot exists
+						fresh, fsb, ferr := o.newLeafMirror()
+						if ferr != nil {
+							return ferr
+						}
+						mirror, sb = fresh, fsb
+						prevErr = "Your changes were REVIEWED AND REJECTED by the human reviewer and have been discarded. " +
+							"Reviewer comment: " + strings.TrimSpace(decision.Comment) +
+							"\nRe-read the task, redo the work in the fresh isolated workspace, then finish again."
+						o.log.Warnf("leaf %s rejected by reviewer; re-snapshotting", leaf.ID)
+						if err := o.retryOrGiveUp(ctx, leaf, attempt, prevErr); err != nil {
+							return err
+						}
+						if !retryable(o, leaf.ID) {
+							return nil
+						}
+						continue
+					}
+					o.events.Record("leaf_approval", leaf.ID, map[string]any{"phase": "approved"})
+				}
+			}
 			if mirror != nil || o.cfg.GitCommit {
 				var merr error
 				summary, merr = o.publishLeaf(mirror, leaf, summary)
@@ -992,6 +1066,9 @@ func (o *Orchestrator) checkpoint() error {
 	}
 	latest := filepath.Join(o.cfg.DataDir, "LATEST")
 	_ = os.WriteFile(latest, []byte(o.tree.ID+"\n"), 0644)
+	// A persisted tree and its live snapshot must never disagree: publish
+	// synchronously (bypassing the state-change coalescer).
+	o.publishTreeSnapshot("checkpoint")
 	return nil
 }
 
@@ -1036,6 +1113,9 @@ func (o *Orchestrator) recordSessionEnd(mode string, start time.Time, err error)
 	fields["outcome"] = outcome
 	fields["calls_this_run"] = calls
 	fields["tokens_this_run"] = u.TotalTokens
+	// Emit the final tree before session_end so a UI always has a terminal
+	// snapshot paired with the outcome event.
+	o.publishTreeSnapshot("session_" + outcome)
 	o.events.Record("session_end", "", fields)
 }
 
