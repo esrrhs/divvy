@@ -243,9 +243,20 @@
   - `rule` TR-11.2: web job 构建并通过 dist 一致性检查。证据：CI web job。
 
 ## Task 12: Tauri 外壳（macOS dev 先行）
-- **Status**: `pending`
+- **Status**: `completed`
 - **Priority**: medium
 - **Depends On**: Task 11
+- **Completion Evidence**:
+  - 新 `desktop/` Tauri v2 工程（与 web/、Go 主仓隔离）：`Cargo.toml`（tauri 2 + url + rfd + unix libc，release panic=abort/lto/strip）、`build.rs`、`tauri.conf.json`（identifier `com.divvy.desktop`、devUrl 5173、frontendDist `../web/dist`、`bundle.externalBin: binaries/divvy-sidecar`、app+dmg target、icns/png 图标）、`capabilities/default.json`（仅 core:default，webview 不暴露任何 Tauri 命令，一切走 sidecar HTTP）、`package.json` 固定 `@tauri-apps/cli` 2.12。
+  - `desktop/scripts/build-sidecar.sh`：`go build ./cmd/divvy` 到 `binaries/divvy-sidecar-<triple>`，按 `$GOOS/$GOARCH` 映射 aarch64/x86_64-apple-darwin、x86_64/aarch64-unknown-linux-gnu、x86_64-pc-windows-msvc（windows 补 .exe）；`scripts/dev.sh`：先构建 sidecar、再以 `VITE_DEV_TARGET=http://127.0.0.1:8799` 起 vite。tauri.conf 的 beforeDevCommand(beforeDev script)/beforeBuildCommand(npm run build in ../web)/beforeBundleCommand(sidecar 脚本) 全部接线，`tauri dev` 与 `tauri build` 均自动完成。
+  - `desktop/src/sidecar.rs`（核心，可无头集成测试）：① `resolve_sidecar`——`DIVVY_SIDECAR` 覆盖优先；debug 用 manifest 下三重后缀文件；release 先找主程序同目录基础名（实测 Tauri v2 在 macOS 放 `Contents/MacOS/divvy-sidecar`、去后缀），再找 `<resources>/binaries/` 兜底；找不到给中文修复指引。② `launch_sidecar`——独立进程 spawn（stdin null、stdout/stderr piped），常驻线程持续 drain 两路输出防管道阻塞，从 banner 解析 `http://127.0.0.1:<port>/?token=`（dev 固定 8799 与 vite 代理对齐，release `-port 0` 随机），30s 超时与进程提前退出分别给明确错误，失败即 kill+wait 不留孤儿。③ `graceful_shutdown`——unix 先发 SIGINT 让 Go 侧 checkpoint，12s 宽限轮询 try_wait，超时 SIGKILL 兜底（Windows 走 TerminateProcess）。
+  - `desktop/src/main.rs`：setup 阶段建 `app_data_dir/{,workspace}`（即 `~/Library/Application Support/com.divvy.desktop/`）→定位并启动 sidecar→debug 窗口开 `http://localhost:5173/?token=<解析值>`（token 仅走 query，vite 代理 /api），release 直接开 sidecar URL（内嵌 UI）；1280×820、最小 960×600；`RunEvent::ExitRequested` 触发 shutdown；setup 任何失败弹 rfd 原生错误框（「divvy 无法启动」）并返回 Box<dyn Error> 使启动非零退出。环境变量排障：`DIVVY_SIDECAR/DIVVY_SIDECAR_PORT/DIVVY_SIDECAR_STARTUP_TIMEOUT_MS`。
+  - 图标：自研 1024×1024 PNG 源（纯 Node zlib 生成深色圆角底+分叉节点图案，无外部依赖），`tauri icon` 生成全套 icns/ico/png/android/ios 占位图标入库；`desktop/.gitignore` 忽略 node_modules/target/gen/sidecar 二进制（仅保留 `binaries/.gitkeep`），Cargo.lock 入库。
+  - TR-12.1 证据（macOS arm64，Rust 1.99 + Go 1.27 + Node 24 + tauri-cli 2.12.1 + good mock LLM :18999）：`tauri dev` 一键完成「go sidecar 构建→vite→cargo 构建→开窗」，日志输出 `URL http://127.0.0.1:8799/?token=...`；进程树确认 sidecar PPID=应用 PID，WKWebView 子进程与 vite 5173 ESTABLISHED；经该 sidecar HTTP 创建会话（mock baseURL/key）→plan_review→批准→`done COMPLETED`，out.txt 落盘 app workspace、树持久化 COMPLETED。**人工真实关窗（窗口红钮）后核验**：`pgrep divvy-desktop`、`pgrep divvy-sidecar-aarch64`、vite 全空，8799/5173 无监听，日志 `[shell] sidecar exited (exit status: 0)`——关窗即带走 sidecar，无残留。
+  - TR-12.2 证据：`sidecar.rs` 内 3 个 `cargo test` 集成测试（真实/假 sidecar）：`launch_parse_and_graceful_shutdown`（真 sidecar 解析 URL+token、原始 TCP 请求带 token 的 /api/health 返回 200 ok、SIGINT 后 exit 0 且 pid 消失）、`startup_timeout_is_reported_and_killed`（假脚本只 sleep，1.2s 超时返回「解析超时」、pgrep 无存活）、`early_exit_is_reported`（假脚本 exit 3，返回「提前退出」）；`cargo test` 3/3 绿。
+  - 发布构建（TR-12 附带验证 release 注入路径）：`tauri build` 产出 `divvy.app` 23.83 MiB 与 `divvy_0.1.0_aarch64.dmg` 12.80 MiB；sidecar 实测位于 `Contents/MacOS/divvy-sidecar` 并被应用成功拉起（`-port 0` → 随机端口 63095）；该端口提供内嵌真实 UI（root 200、hashed JS 208443 字节、SPA 回退、无 token /api 401、带 token health 200）；release 应用终止同样 sidecar exit 0 无残留。`cargo fmt --check` 通过。
+  - README 新增「桌面应用（Tauri，macOS）」小节：Xcode CLT/Rust/Go/Node 前置、`npm run dev`/`npm run build` 步骤、产物位置、sidecar 命名与排障环境变量。
+  - 环境注记：共享卷（SMB）上 Rust 产物链接会损坏（cgu.o file is empty），构建时 `CARGO_TARGET_DIR` 指向本地磁盘（如 `~/divvy-desktop-target`）即可；该变量仅本机使用，未写入仓库。
 - **Description**:
   - app/（或 desktop/）：Tauri v2 工程；externalBin sidecar 指向按平台命名的 divvy 二进制（构建脚本先 go build）；beforeDevCommand 启 vite，devUrl 走 vite，生产由 sidecar URL 注入（启动输出解析端口/token）。
   - 应用生命周期：启动 sidecar、关窗即 kill 进程组；窗口标题与图标占位。

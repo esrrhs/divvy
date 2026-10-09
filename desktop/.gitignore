@@ -1,0 +1,12 @@
+# Tauri CLI
+node_modules/
+
+# Rust build output
+target/
+gen/schemas/
+
+# Sidecar binaries are rebuilt from ../cmd/divvy by scripts/build-sidecar.sh
+binaries/divvy-sidecar-*
+
+# Local logs
+*.log

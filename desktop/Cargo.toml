@@ -1,0 +1,27 @@
+[package]
+name = "divvy-desktop"
+version = "0.1.0"
+description = "Tauri shell that launches the divvy serve sidecar"
+authors = ["divvy"]
+edition = "2021"
+rust-version = "1.77"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+url = "2"
+# Native message box for fatal startup errors (sidecar/port/token failures),
+# shown before any window exists.
+rfd = "0.15"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+# Sidecar-heavy app; keep the shell binary small (the Go sidecar carries
+# the real logic).
+panic = "abort"
+lto = true
+strip = true

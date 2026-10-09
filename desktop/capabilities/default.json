@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The webview drives everything over plain HTTP against the local sidecar; no Tauri commands are exposed to it. Core capability only.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

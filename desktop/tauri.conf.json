@@ -1,0 +1,41 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "divvy",
+  "version": "0.1.0",
+  "identifier": "com.divvy.desktop",
+  "build": {
+    "beforeDevCommand": {
+      "script": "sh scripts/dev.sh",
+      "cwd": "."
+    },
+    "beforeBuildCommand": {
+      "script": "npm run build",
+      "cwd": "../web"
+    },
+    "beforeBundleCommand": {
+      "script": "sh scripts/build-sidecar.sh",
+      "cwd": "."
+    },
+    "devUrl": "http://localhost:5173",
+    "frontendDist": "../web/dist"
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app", "dmg"],
+    "category": "DeveloperTool",
+    "copyright": "",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns"
+    ],
+    "externalBin": ["binaries/divvy-sidecar"]
+  }
+}
