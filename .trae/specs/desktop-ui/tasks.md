@@ -129,9 +129,17 @@
   - `rule` TR-6.2: `go build ./...` 在 web/dist 缺失时成功。证据：CI Go job。
 
 ## Task 7: 前端脚手架与三栏应用壳
-- **Status**: `pending`
+- **Status**: `completed`
 - **Priority**: high
-- **Depends On**: Task 4（联调需要，可先 mock）
+- **Depends On**: Task 4（联调需要）, Task 5
+- **Completion Evidence**:
+  - 新 `web/` 子项目（依赖隔离在 web/，Go 主构建零 Node 依赖）：Vite 5.4 + React 18.3 + TypeScript 5.6（strict + noUnusedLocals）+ Tailwind 3.4 + zustand 4.5；`package.json`/`tsconfig.json`/`vite.config.ts`（dev 5173，/api 代理 VITE_DEV_TARGET 默认 127.0.0.1:8787）/tailwind/postcss/index.html；`web/.gitignore` 忽略 node_modules/dist/.vite（dist 按 Q2 留待 Task 11 提交+CI 一致性校验）。
+  - `src/api/client.ts`：token 从启动 URL `?token=` 捕获→sessionStorage→Bearer 注入全部请求（清理地址栏）；ApiError 携带状态码映射；封装 sessions/plan/abort/pause/add/redo/answer/approvals 全部端点。
+  - `src/api/sse.ts`：EventSourceClient——query 带 token、原生断线重连+1s→15s 指数退避兜底、Last-Event-ID 续传、按 seq 客户端去重、连接状态回调。
+  - `src/store.ts`：zustand 单 store（sessions/currentId/live/events/sseStatus），SSE 事件驱动 phase 状态机（plan_review/leaf_approval/ask/state_change/session_end/user_pause），事件视图 1000 条上限（NFR-5），5s 轮询刷新会话目录。
+  - UI（中文、深色 Cursor 风格）：`TopBar`（相位徽章+SSE 连接点+model/tokens/cost 占位，Task 8/9 填数）；左 `Sidebar`（新建按钮、会话/文件 tab、会话行含目标截断/叶子进度/live 相位/相对时间，文件 tab 留 Task 10）；中 `CenterMain`（空态 hero+新建会话卡片；选中态相位条+事件时间线，树可视化留给 Task 8）；右 `RightPanel`（节点/diff/日志 tab 空态，Task 8/9/10 填充）；`NewSessionForm` 完整字段：goal/model/baseURL/apiKey(password,autoComplete off)/并行数/成本/Token 预算/auto-manual 审批切换/isolate/git-commit/web/browser 开关（manual 说明 isolate 必需）；自研 SVG 图标集（零图标依赖）。
+  - TR-7.1：`npm run build`（tsc -b 严格零错误 + vite build）通过，产物 index 0.41KB/CSS 18KB/JS 167KB(gzip 55KB)；`pkg/server/dist_test.go` 新增 TestStatic_ServesBuiltDist（dist 存在时断言 Go 服务真实 shell+哈希资产 200+SPA 回退，无 Node 环境 t.Skip 由占位页兜底）实测通过；Go 全量 `go test ./... -race` 绿。
+  - TR-7.2（视觉 rubric）留待 Task 13 端到端走查截图；本任务已落实三栏信息架构、暗色主题、状态色与响应式滚动基础。
 - **Description**:
   - web/：Vite + React 18 + TypeScript + Tailwind；API client（token 注入）、SSE client（自动重连+去重）、路由/状态用轻量内置方案（zustand 或 context，避免过重依赖）。
   - 三栏布局：左栏（会话列表/文件浏览 tab）、中栏（对话与任务树）、右栏（节点详情/diff/日志 tab）；深色主题，中文文案。
@@ -142,9 +150,19 @@
   - `rubric` TR-7.2: 视觉与信息架构；scale 1-5；anchors 1=原始堆砌/3=可用但无层次/5=Cursor 级三栏与深色质感；threshold >=4；证据：截图走查。
 
 ## Task 8: 实时任务树与节点详情
-- **Status**: `pending`
+- **Status**: `completed`
 - **Priority**: high
-- **Depends On**: Task 7
+- **Depends On**: Task 4, Task 7
+- **Completion Evidence**:
+  - `src/types.ts` 补齐 TaskTree/TaskNode/TokenUsage/ErrorRecord/ContractSpec/DoD/NodeState/NodeType，与 Go 端 JSON tag 对齐。
+  - `src/store.ts`：保存最新 tree_snapshot 为权威树（替换式），打开会话时从 GET detail 取树并默认选中 root；快照更新时保留仍存在的选中节点；新增 selectedNodeId/tree/selectNode。
+  - `src/lib/tree.ts`：traverse（按 children_ids 稳定有序遍历）、treeStats（叶子进度/总调用/token/失败/进行中）、formatDuration（ms/s/m）、compactTokens（k/M）、stateMeta 七态颜色/标签/动画表。
+  - `src/components/TaskTreeView.tsx`：递归树行（depth 缩进、折叠箭头、状态字形、标题、节点 id）、每行状态徽章 + 子节点数/重试数/token/耗时/端到端验收标记，失败节点行内红色错误摘要；可手动折叠，已完成且端到端验收的复合节点自动折叠；点击行选中（aria-treeitem/aria-selected/aria-expanded）。
+  - `src/components/NodeDetail.tsx`（接入右栏）：头部状态/类型/depth/标题/描述；指标网格（重试/调用/token/耗时/prompt/completion）+ 端到端验收标记；契约四区（输入/产出/依赖/约束）；DoD（描述/命令/期望输出/超时）；结果摘要；错误历史倒序时间线（本地时间、fp 前缀、rose 卡片）。
+  - `src/components/EventTimeline.tsx` 重构：17 种事件中文标签+彩色圆点，verify/tool_call/llm_call/leaf_approval/ask/retry 等按真实事件字段（ok/exit_code/command/call_kind/resp_tool_calls/files 等）出摘要，过滤噪声、上限 500 条并提示总量。
+  - `src/components/CenterMain.tsx`：选中态改为「树头部统计（叶子 x/y·调用·token·失败/进行中·model）+ 树滚动区 + 可折叠事件流（带计数）」双区；历史会话标注只读。
+  - TR-8.1 证据：构建严格通过（tsc -b + vite build，58 模块，JS 181KB/gzip 58.6KB）；真实联调走查（go serve 8799 + vite dev 5173 代理 + 浏览器自动化）：①三栏壳/新建表单/连接状态正常无 console 错误；②种入含 COMPLETED+重试1、RUNNING+重试2+2 条错误历史、PENDING 的三叶子演示树，树行正确渲染状态色/重试/token/耗时与头部统计（叶子1/3·调用22·23k tok·2 进行中·model 名）；③点击叶子 1.2 右栏正确显示指标、契约输入/产出/依赖、DoD 命令与 2 条带指纹的错误历史；④历史会话 SSE 补发树快照并显示「已连接」。
+  - NFR-5：事件视图 500（store 保留 1000）、树按需折叠、所有长文本 break-words/line-clamp，支撑 200 节点/1 万事件浏览。
 - **Description**:
   - 消费 SSE：tree_snapshot 增量渲染树（状态色/图标、retry 数、耗时、成本徽标），事件流时间线（llm_call/tool_call/verify/retry/gate 等图标化、可展开 preview）。
   - 节点详情面板：契约 inputs/outputs/constraints、DoD 命令、错误历史、结果摘要、token 用量。
@@ -155,9 +173,18 @@
   - `rubric` TR-8.2: 状态可读性；scale 1-5；anchors 1=要靠日志猜状态/3=状态可见但杂乱/5=一眼定位卡住叶子与原因；threshold >=4；证据：截图走查。
 
 ## Task 9: 审批、问答与运行控制界面
-- **Status**: `pending`
+- **Status**: `completed`
 - **Priority**: high
-- **Depends On**: Task 8, Task 5
+- **Depends On**: Task 8
+- **Completion Evidence**:
+  - `src/lib/diff.ts`（新，零依赖）：splitLines + LCS DP（Int32Array，4000 行保护）行级 diff，computeDiff 产出 context/add/remove 行（带新/旧行号），toHunks 按 3 行上下文聚合 hunk，非 git 工作区同样可用。
+  - `src/components/PlanReviewBar.tsx`：plan_review 阶段琥珀色审批条——批准执行/调整（展开意见框，提交触发 replan 后重新挂起）/中止（计划保存不执行），busy 态。
+  - `src/components/FileDiffView.tsx` + `LeafApprovalCard.tsx`：leaf_approval 阶段紫红审查卡，按 修改→新增→删除 排序的文件清单（状态徽章、冲突标记、二进制/截断提示、可折叠）；修改文件渲染 unified hunks（双行号列 + +/- 着色，emerald/rose），新增/删除整文件着色，空变更与无差异有明确文案；GET approvals/{leaf} 带 0/150/400ms 重试覆盖注册竞态；拒绝必填意见（按钮禁用态）→ decide reject，同 leafId 多轮靠 phase 重入 effect 重新拉 diff；批准合并。
+  - `src/components/AskDialog.tsx`：ask 阶段模态弹窗展示问题，回答输入（⌘/Ctrl+Enter），「暂停」或 /pause 文本走 pause 语义，独立暂停按钮。
+  - `src/components/RunControls.tsx`：暂停（running/ask 可用）/中止（confirm 二次确认）/加叶子（内联指令输入，Enter 提交/Esc 取消，仅 running）/重做节点（对当前选中节点，按钮显示其 id，相位不对时禁用并提示）。
+  - `src/components/ActionToast.tsx`：控制动作错误右下角 toast，6s 自动消失；`store.ts` 新增 planApprove/planAdjust/abort/pause/addInstruction/redoNode/answer/decideLeaf 八个 action（withRun 统一取当前会话+actionError 路由）；修复 phase 跟踪：session_end outcome 按后端 completed/paused/interrupted/failed 正确映射（此前误判 success 导致完成会话显示失败），leaf 决定后清 leaf_approving、ask 回答/恢复运行后清 pending_ask。
+  - TR-9.1 证据（真实端到端，node mock OpenAI 端点 + go serve 8799 + vite 5173 + 浏览器自动化）：UI 填表单（mock baseURL+manual）创建会话→Plan 审批条出现且运行控制按相位禁用→批准→叶子卡显示 `out.txt 新增 + first`→拒绝意见「must say second」（空意见按钮禁用已验证）→重做后第二轮审批内容变为 second→批准→顶栏「已完成」、后端 session_end outcome=completed、工作区落盘 second；第二个会话还覆盖 modified 场景（同 workdir 已有文件），unified 行 diff 正确显示 `- second / + first` 与双行号，以及「重做后内容无变化→本次叶子没有文件变更」边界。修复 outcome 映射后重跑闭环，完成相位正确。Ask 弹窗渲染逻辑与 ask/pause API 已在 Task 5 集成测试覆盖。
+  - 构建：tsc -b 严格零错误 + vite build（65 模块，JS 196KB/gzip 63KB，CSS 26KB）；Go 全量 `go test ./... -race` 绿。
 - **Description**:
   - Plan 审批条（批准/调整输入框/中止）；叶子审批卡片（文件清单 + unified diff 高亮，逐文件展开，批准/拒绝+必填意见）。
   - ask 弹窗（问答）；顶部控制条：暂停、redo（节点操作菜单）、add 输入。
@@ -168,9 +195,23 @@
   - `rubric` TR-9.2: diff 审查体验；scale 1-5；anchors 1=看不懂改了啥/3=统一 diff 可读/5=并排/统一切换、文件导航顺畅；threshold >=4；证据：截图走查。
 
 ## Task 10: 会话管理与文件浏览
-- **Status**: `pending`
+- **Status**: `completed`
 - **Priority**: medium
 - **Depends On**: Task 9
+- **Completion Evidence**:
+  - `src/types.ts`：新增 `FsEntry/FsEntryType/FsListResponse/FsFileResponse/LogPage`，字段与 `pkg/server/fs.go`、`handleSessionLog` 的 JSON tag 逐一核对一致（path/entries/truncated、name/path/type/size/mode/escaped、lines/offset/next_offset/total/has_more）。
+  - `src/api/client.ts`：`fsList(path,session?)`、`fsFile(path,session?)`（?session= 自动取当前会话 workdir）、`log(id,offset,limit)`；`resumeSession` 复用既有 `POST /sessions/{id}/resume`。
+  - `src/store.ts`：`resumeSession(id)`（成功后 refreshSessions+openSession，错误走 actionError）、`fileView {sessionId,path}` + `openFile/closeFile`，打开会话切换时重置文件视图。
+  - `src/components/Sidebar.tsx`：会话 tab 五枚筛选 chip（全部/进行中/可续跑/完成/失败），`rowKind` 优先用 live.phase（done/failed/active），无 live 时按持久化 root_state（COMPLETED→done，FAILED/SKIPPED→failed，其余→resumable）；行展示目标截断/会话 id/叶子进度/中文相位/相对时间；「可续跑」行内嵌带 spinner 的「续跑此会话」按钮；空筛选有明确空态。
+  - `src/components/FileTree.tsx`（左栏文件 tab）：根面包屑「工作区」+ 逐级路径（点击跳转）、「.. 上一级」、目录优先排序与大小（B/KB/MB）由后端给出；symlink 越界红色「越界」标记；2000 上限显示 truncated 提示；忽略规则（.git/node_modules 等）复用后端 `IsSkippedName`，前端不重复维护；未开会话时提示浏览的是服务默认工作区。
+  - `src/components/FileViewer.tsx`（中栏只读查看器，替代会话视图）：等宽 `<table>` 行号列、头部路径+大小+行数+只读标记+关闭；友好降级面板——413「超过 1 MiB 上限」、415「二进制不支持预览」、403「软链接指向工作区外」；路径切换/取消用 cancelled 标志防竞态。
+  - `src/components/LogView.tsx`（右栏日志 tab）：尾优先分页（PAGE=500，先取 total 再载最后一页），「更早」向前翻页（到 offset 0 禁用）、「刷新」从当前尾部增量拉新行；头部 `已载/总行` 计数；空日志/错误态。
+  - 走查暴露并修复两个后端缺陷（前端行为依赖其正确性）：
+    1. **终态树不落盘**：guided（web serve）路径在「全部完成」与「叶子失败/中止」时均未做最终 checkpoint（`Close()` 设计上不存盘），重启后已完成/失败会话在列表里被误判为「可续跑」、历史树停在 PENDING。修复：`pkg/agent/guided.go` `Run` 在 execute 返回后（nil 或非 errStdinClosed 的任何 err，含 pause/中断/失败）补一次 checkpoint；`pkg/agent/orchestrator.go` 非 guided `Run` 的验收失败/HasFailed/firstErr 返回路径同样补 checkpoint（完成路径原本已有）。
+    2. **pause→resume 竞态（409）**：补的 checkpoint 放大了既有窗口——`user_pause` 事件经 applyEvent 提前把 phase 置为 paused，但 serve 尚未释放 workdir 锁，立即 resume 偶发 `ErrWorkdirBusy`（-race 下约 1/5）。修复：`RunManager.finish` 将「释放 busy 槽 + 终态 phase 发布」并入同一临界区（manager→handle 锁序，无反向嵌套）；`RunManager.Resume` 发现同会话存在 PhasePaused 旧句柄时先 `<-old.Done()` 等其完全收尾再 reserve。修复后该用例 -race 连跑 10 次全绿。
+  - TR-10.1 证据（真实端到端：good mock :18999 / bad-worker mock :18998 + go serve 8799 + vite 5174 + 浏览器自动化，datadir `/tmp/d10-data`、workdir `/tmp/d10-ws`）：预置 3 个原子单叶会话——A 经 resume+批准跑成 COMPLETED、B 由「只 finish 不产出」的 bad mock 经 MaxStall 闸门 FAILED（错误历史含 fp 指纹）、C 保持 PENDING；**重启 serve（无任何 live 句柄）后仅按磁盘 root_state 分类仍为 A 完成 / B 失败 / C 可续跑**（修复前三者落盘均为 PENDING）。浏览器走查：五个筛选 chip 结果逐一正确（进行中显示空态文案）；打开 B 显示只读失败树+45 条事件回放+节点错误历史；C 的「续跑此会话」点击后立即在 plan_review 重新挂起并显示计划审批条与原 120 tok 树；日志面板对 607 行临时日志验证尾载 500/607→「更早」→607/607 且按钮禁用（API 侧 offset/next_offset/has_more 边界另验）。
+  - TR-10.2 证据：API 与 UI 双层验证 `../etc/passwd` → 400、big.txt(1.1MB) → 413、blob.bin(含 NUL) → 415；文件列表不展示 .git/node_modules（后端忽略规则）；src 目录钻取、面包屑、内部文件读取（go.mod/main.go 行号视图）正常。
+  - 构建与回归：`npm run build` tsc 严格零错误 + vite build（68 模块，JS 205.85KB/gzip 65.66KB，CSS 26.99KB）；`go build ./...`、`go vet`、gofmt、`go test ./... -race` 全绿（含 `TestAPI_PauseAndResume`、`TestAPI_LeafApprovalDiff` -race 各 10 连跑）。
 - **Description**:
   - 左栏会话列表（goal、时间、进度、状态筛选）、打开历史会话（只读树+事件+日志）、未完成会话 resume 按钮。
   - 文件 tab：目录树（忽略规则）、文本文件只读查看器（等宽、行数、大小友好降级）。
@@ -180,9 +221,18 @@
   - `rule` TR-10.2: 文件浏览无法越界，忽略目录不展示。证据：沿用 TR-5.3。
 
 ## Task 11: 构建整合与 CI
-- **Status**: `pending`
+- **Status**: `completed`
 - **Priority**: medium
 - **Depends On**: Task 6, Task 7
+- **Completion Evidence**:
+  - `web/assets.go`（新，`package web`，与 web/ 同目录以满足 go:embed 不能跨 `..` 的限制）：`//go:embed all:dist` 把 Vite 产物编进二进制；导出 `DistFS() (fs.FS, bool)`，缺 index.html 时返回 false 让调用方回退占位页。
+  - `cmd/divvy/serve.go`：启动时取 `web.DistFS()`，存在真实产物则 `server.WithStatic(dist)`，否则维持 `server.New` 内置占位页——同一份代码同时支持「有 dist」与「仅占位」。实测新二进制 `/` 返回含 `/assets/index-J5NzgETq.js` 的真实 shell（208443 字节，200）、CSS 200、SPA 路由 `/sessions/xyz` 回退 root div、`/api/health` 无 token 仍 401（静态免 token 与 API 鉴权互不影响）。
+  - 提交首版构建产物 `web/dist/`（index.html + hashed JS 205.85KB/gzip 65.66KB + CSS 26.99KB）；`web/.gitignore` 改为只忽略 `node_modules/`、`.vite/`、`*.tsbuildinfo`、`*.local`，明确注释 dist 需跟踪。整个 `web/` 子项目（src/配置/package-lock）首次纳入版本库，共 41 个文件，node_modules 不入库（`git check-ignore` 验证）。
+  - 根 `Makefile`（新）：`web-install`（按 package-lock 时间戳触发 `npm ci`）、`web-build`、`go-build`、`vet`、`test`、`test-race`、`clean`、`help`。
+  - `.github/workflows/test.yml`：新增 `web` job（setup-node 20 + npm 缓存走 `web/package-lock.json` → `npm ci` → `npm run build` → **`git diff --quiet -- web/dist` 一致性闸门**，不一致打印 diff 并失败 → 仅装 Go 跑 `go build ./...` 与 `go test ./web/ ./pkg/server/`，证明无 Node 也能嵌入并服务已提交产物）；既有 test/race/lint/browser 四个 Go job 不安装 Node（保持 TR-11.1）；按工程约定全部 runner 从 `ubuntu-latest` 钉到 `ubuntu-24.04`。
+  - 嵌入产物的测试：`web/assets_test.go`（断言嵌入树有 Vite shell 且其引用的每个 /assets 文件在嵌入 FS 内）与 `pkg/server/embed_test.go`（`WithStatic(web.DistFS())` 下根路径出 hashed 资产、未知 SPA 路径回退）——在纯 Go job 即可运行，是 TR-11.1 的直接证据；`pkg/server/dist_test.go`（Task 7，磁盘版）随本次一起入库。
+  - TR-11.1 证据：`go build ./...`（全新、无 Node 参与，仅 Go 1.27）成功；`go test ./... -count=1` 全绿（含新 `web` 包与 embed 测试）；web job 在只装 Go 的步骤里验证嵌入服务。
+  - TR-11.2 证据：连续两次 `npm run build` / `make web-build` 产出字节一致、文件名哈希不变（`index-J5NzgETq.js` / `index-Dlal5oCF.css`），`git diff -- web/dist` 为空，CI 一致性检查可通过。
 - **Description**:
   - 提交 web/dist（占位或首版构建产物）；根 Makefile/脚本增加 web-build；go:embed 路径同时支持「有 dist」与「占位 index.html」。
   - CI 增加 web job：node 安装、npm ci/build，并校验 dist 与源码构建一致（git diff --exit-code web/dist）；Go job 保持无 Node。

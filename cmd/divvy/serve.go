@@ -12,6 +12,7 @@ import (
 
 	"github.com/esrrhs/divvy/pkg/agent"
 	"github.com/esrrhs/divvy/pkg/server"
+	webui "github.com/esrrhs/divvy/web"
 )
 
 // serveShutdownGrace bounds both HTTP connection draining and the wait for
@@ -27,12 +28,18 @@ func runServe(cfg agent.Config, log *agent.Logger, port int, noOpen bool) error 
 	defer stop()
 
 	mgr := agent.NewRunManagerWithContext(ctx)
-	srv, err := server.New(mgr, cfg.DataDir,
+	opts := []server.Option{
 		server.WithWorkdir(cfg.WorkDir),
 		server.WithLogger(func(format string, args ...any) {
 			log.Warnf(format, args...)
 		}),
-	)
+	}
+	// Serve the committed/built UI when it is embedded; otherwise New falls
+	// back to its built-in placeholder page (Go-only development builds).
+	if dist, ok := webui.DistFS(); ok {
+		opts = append(opts, server.WithStatic(dist))
+	}
+	srv, err := server.New(mgr, cfg.DataDir, opts...)
 	if err != nil {
 		return err
 	}

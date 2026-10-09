@@ -1,0 +1,9 @@
+# Dependencies and caches are machine-local; never committed.
+node_modules/
+.vite/
+*.tsbuildinfo
+*.local
+
+# dist/ IS committed: it is embedded into the Go binary so a Go-only
+# checkout serves the real UI without Node. Rebuild with `make web-build`
+# and commit the result (the web CI job enforces dist/source consistency).
