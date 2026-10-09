@@ -483,7 +483,7 @@ func decodeBody(r *http.Request, v any) error {
 	if r.Body == nil {
 		return errors.New("request body is required")
 	}
-	defer r.Body.Close()
+	defer func() { _ = r.Body.Close() }()
 	dec := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
 	// Unknown fields are ignored so a newer frontend stays compatible.
 	if err := dec.Decode(v); err != nil {

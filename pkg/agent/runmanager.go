@@ -464,9 +464,13 @@ func (h *RunHandle) applyEvent(ev map[string]any) {
 			h.phase = PhasePlanReview
 		}
 	case "leaf_approval":
+		// Do NOT derive the waiting phase from the "pending" event: the
+		// orchestrator records that event immediately before invoking the
+		// approval hook, so observers could see leaf_approval before the
+		// review payload is registered (GET approvals/{id} then 404s).
+		// handleLeafApproval sets PhaseLeafApproval atomically with the map
+		// registration; the event only notifies SSE clients.
 		switch phase, _ := ev["phase"].(string); phase {
-		case "pending":
-			h.phase = PhaseLeafApproval
 		case "approved", "rejected":
 			h.phase = PhaseRunning
 		}
@@ -673,7 +677,7 @@ func (h *RunHandle) submitAt(want RunPhase, line string, allowAsk bool) error {
 	if p.Terminal() {
 		return ErrRunFinished
 	}
-	if p != want && !(allowAsk && p == PhaseAsk) {
+	if p != want && (!allowAsk || p != PhaseAsk) {
 		return fmt.Errorf("%w: currently %s, need %s", ErrWrongPhase, p, want)
 	}
 	return h.io.Submit(h.ctx, line)

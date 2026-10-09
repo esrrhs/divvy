@@ -162,17 +162,14 @@ func (r *EventRecorder) Record(kind, nodeID string, fields map[string]any) {
 	for k, v := range fields {
 		ev[k] = v
 	}
-	data, err := json.Marshal(ev)
-	if err != nil {
-		return
-	}
 	// Assign the sequence and persist before fan-out while holding the same
 	// lock: a subscriber that reconnects can trust every seq on disk and
 	// never observe an event number the file does not contain.
 	r.mu.Lock()
 	r.seq++
 	ev["seq"] = r.seq
-	if data, err = json.Marshal(ev); err != nil {
+	data, err := json.Marshal(ev)
+	if err != nil {
 		r.mu.Unlock()
 		return
 	}

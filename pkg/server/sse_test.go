@@ -177,7 +177,7 @@ func TestSSE_ReplayLiveHeartbeatAndReconnect(t *testing.T) {
 	resp1, r1 := open("")
 	sawReview, sawSnapshot, sawHeartbeat := false, false, false
 	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) && !(sawReview && sawSnapshot && sawHeartbeat) {
+	for time.Now().Before(deadline) && (!sawReview || !sawSnapshot || !sawHeartbeat) {
 		f := nextFrame(t, r1, time.Second)
 		if f.comment != "" {
 			sawHeartbeat = true

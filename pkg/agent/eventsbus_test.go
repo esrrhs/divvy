@@ -181,13 +181,11 @@ func TestTreeBroadcaster_CoalescesRapidMarks(t *testing.T) {
 	}()
 	<-burstDone
 
-	snapshots := 0
 waitFirst:
 	for {
 		select {
 		case ev := <-ch:
 			if ev["kind"] == "tree_snapshot" {
-				snapshots++
 				break waitFirst
 			}
 		case <-time.After(time.Second):

@@ -132,7 +132,7 @@ func (s *Server) replayEvents(w http.ResponseWriter, f http.Flusher, path string
 	if err != nil {
 		return afterSeq
 	}
-	var maxSeq int64 = afterSeq
+	maxSeq := afterSeq
 	for _, line := range lines {
 		var head struct {
 			Seq int64 `json:"seq"`
@@ -201,7 +201,7 @@ func tailLines(path string, n int) ([][]byte, error) {
 		}
 		return nil, err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	ring := make([][]byte, 0, n)
 	sc := bufio.NewScanner(file)
