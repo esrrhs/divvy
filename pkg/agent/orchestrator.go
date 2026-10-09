@@ -391,6 +391,8 @@ func (o *Orchestrator) Run(ctx context.Context) (runErr error) {
 					_ = o.checkpoint()
 					return ctx.Err()
 				}
+				// Persist the terminal (failed) tree for the non-ctx path too.
+				_ = o.checkpoint()
 				return err
 			}
 			_ = o.checkpoint()
@@ -408,6 +410,10 @@ func (o *Orchestrator) Run(ctx context.Context) (runErr error) {
 			wg.Wait()
 			o.printTree()
 			o.logUsage()
+			// The failed node states live only in memory until checkpointed;
+			// without this save the session would reopen as PENDING and be
+			// misclassified as resumable instead of failed.
+			_ = o.checkpoint()
 			msg := ""
 			if root, ok := o.tree.CloneNode(o.tree.RootID); ok {
 				msg = root.ErrorMsg
@@ -419,6 +425,7 @@ func (o *Orchestrator) Run(ctx context.Context) (runErr error) {
 		busy := len(inFlight)
 		mu.Unlock()
 		if err != nil && busy == 0 {
+			_ = o.checkpoint()
 			return err
 		}
 

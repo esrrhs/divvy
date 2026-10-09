@@ -125,10 +125,19 @@ func (g *Guider) Run(ctx context.Context) (runErr error) {
 	g.io.Printf("plan approved — executing\n")
 	if err := g.execute(ctx); err != nil {
 		if err == errStdinClosed {
+			// The EOF paths saved the plan/progress themselves.
 			return nil
 		}
+		// Persist the terminal tree (root/leaf FAILED, paused or interrupted
+		// progress): execute() returns on the first terminal event without a
+		// final checkpoint, and Close() intentionally does not save. Without
+		// this, a web/guided run that finished left only stale PENDING state
+		// on disk, so history and the session filters misclassified it.
+		_ = g.o.checkpoint()
 		return err
 	}
+	// Make the completed tree durable for the same reason.
+	_ = g.o.checkpoint()
 	return nil
 }
 

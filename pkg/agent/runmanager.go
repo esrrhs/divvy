@@ -156,6 +156,13 @@ func (m *RunManager) Resume(cfg Config, client llm.Client, log *Logger) (*RunHan
 	if err != nil {
 		return nil, err
 	}
+	// A UI pause publishes PhasePaused optimistically (from the user_pause
+	// event) before serve() has finished unwinding the worker and releasing
+	// the workdir. A resume posted in that window would otherwise lose the
+	// race with ErrWorkdirBusy; wait for the prior handle to fully settle.
+	if old := m.Get(o.SessionID()); old != nil && old.Phase() == PhasePaused {
+		<-old.Done()
+	}
 	abs, err := filepath.Abs(o.sandbox.Root)
 	if err != nil {
 		return nil, fmt.Errorf("resolve workdir: %w", err)
@@ -389,26 +396,42 @@ func (h *RunHandle) serve() {
 		_ = h.o.checkpoint()
 	}
 
-	h.mu.Lock()
-	h.runErr = err
-	switch {
-	case err == nil:
-		h.phase = PhaseDone
-	case errors.Is(err, ErrPaused):
-		h.phase = PhasePaused
-	case errors.Is(err, context.Canceled) && !h.aborted:
-		// Process-level interrupt: stopped but fully resumable.
-		h.phase = PhasePaused
-	default:
-		h.phase = PhaseFailed
-	}
-	h.pendingAsk = ""
-	h.leafApprovals = make(map[string]*pendingApproval)
-	h.mu.Unlock()
+	// Free the workdir slot and publish the terminal phase in one critical
+	// section: phase is what waiters (UI/SSE, tests) poll, so a terminal
+	// phase must imply the workdir is bookable again. Releasing after the
+	// phase left a window where a paused run looked resumable but Resume
+	// still got ErrWorkdirBusy. Lock order is manager -> handle; no handle
+	// method ever takes the manager lock, so the nesting is deadlock-free.
+	h.mgr.finish(h, func() {
+		h.runErr = err
+		switch {
+		case err == nil:
+			h.phase = PhaseDone
+		case errors.Is(err, ErrPaused):
+			h.phase = PhasePaused
+		case errors.Is(err, context.Canceled) && !h.aborted:
+			// Process-level interrupt: stopped but fully resumable.
+			h.phase = PhasePaused
+		default:
+			h.phase = PhaseFailed
+		}
+		h.pendingAsk = ""
+		h.leafApprovals = make(map[string]*pendingApproval)
+	})
 
-	h.mgr.release(h.workdir)
 	h.o.Close()
 	close(h.done)
+}
+
+// finish releases the workdir reservation and applies the terminal phase
+// transition atomically with respect to reserve().
+func (m *RunManager) finish(h *RunHandle, setPhase func()) {
+	m.mu.Lock()
+	delete(m.busy, h.workdir)
+	h.mu.Lock()
+	setPhase()
+	h.mu.Unlock()
+	m.mu.Unlock()
 }
 
 // applyEvent tracks the phase from the persisted event stream, so the UI
