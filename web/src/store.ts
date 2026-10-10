@@ -100,10 +100,35 @@ export const useStore = create<AppState>((set, get) => ({
     get().disconnect()
     try {
       const detail = await api.getSession(id)
-      set({
-        live: detail.live ?? null,
-        tree: (detail.tree as TaskTree | null) ?? null,
-        selectedNodeId: (detail.tree as TaskTree | null)?.root_id ?? null,
+      // currentId flips before this await, so the SSE can already have
+      // delivered events newer than the detail snapshot (e.g. plan_review
+      // pending while the detail read still says planning); blindly
+      // overwriting would strand the UI in the older phase with no further
+      // phase event coming. Reconcile: never regress the phase, and keep an
+      // SSE-delivered tree (any tree_snapshot in the just-reset view is for
+      // this session and at least as fresh as the snapshot).
+      const detailTree = (detail.tree as TaskTree | null) ?? null
+      set((s) => {
+        let live = detail.live ?? null
+        const sseLive = s.live
+        if (
+          live &&
+          sseLive?.session_id === id &&
+          phaseRank(sseLive.phase) >= phaseRank(live.phase)
+        ) {
+          live = sseLive
+        } else if (!live && sseLive?.session_id === id) {
+          live = sseLive
+        }
+
+        let tree = detailTree
+        let selectedNodeId = detailTree?.root_id ?? null
+        const sseTreeFresh = s.events.some((e) => e.kind === 'tree_snapshot')
+        if (sseTreeFresh && s.tree) {
+          tree = s.tree
+          selectedNodeId = s.selectedNodeId && s.selectedNodeId in s.tree.nodes ? s.selectedNodeId : s.tree.root_id
+        }
+        return { live, tree, selectedNodeId }
       })
     } catch (e) {
       // A historical (finished, non-live) session has no live object; that
@@ -228,6 +253,28 @@ async function withRun(
   } catch (e) {
     set({ actionError: errorText(e) })
     return false
+  }
+}
+
+// phaseRank orders phases along the run lifecycle for reconciling the GET
+// detail snapshot against SSE-delivered state: a later snapshot must never
+// regress a phase the event stream has already reached. Review rounds after
+// execution rank above running (adjust/replan revisits plan_review), and
+// terminal phases rank highest.
+function phaseRank(p: RunPhase): number {
+  switch (p) {
+    case 'planning':
+      return 0
+    case 'running':
+      return 1
+    case 'plan_review':
+      return 3
+    case 'leaf_approval':
+      return 4
+    case 'ask':
+      return 5
+    default: // paused / done / failed
+      return 6
   }
 }
 

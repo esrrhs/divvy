@@ -220,11 +220,18 @@ func (s *Server) handleFSFile(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	content := string(data)
+	if sid := r.URL.Query().Get("session"); sid != "" {
+		// P2-3: mask like SSE when the file content echoes a secret.
+		if lh := s.mgr.Get(sid); lh != nil {
+			content = Redact(content, lh.SecretValues()...)
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"path":    filepath.ToSlash(rel),
 		"size":    len(data),
 		"mode":    uint32(info.Mode().Perm()),
-		"content": string(data),
+		"content": content,
 	})
 }
 

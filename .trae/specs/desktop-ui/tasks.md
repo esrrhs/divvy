@@ -73,7 +73,7 @@
   - 新包 `pkg/server`（仅标准库）：`server.go` Server/New（crypto/rand 24 字节 URL-safe token）、`Start(port)` 只绑 `127.0.0.1`、返回带 token 的访问 URL 与实际 Addr；中间件链 hostGuard→tokenGuard：Host 白名单 localhost/127.0.0.1/[::1]（含端口形态，其余 403，防 DNS rebinding），`/api/` 校验 Bearer/query token（constant-time 比较，失败 401+WWW-Authenticate），静态资源免 token；`/api/health`。
   - `sse.go`：GET `/api/sessions/{id}/events`；先订阅再补发 → 无缝隙；tail 200 条 JSONL（环形缓冲、单行上限 16MB）+ 订阅后权威 tree_snapshot；实时 fan-out 按 `seq` 去重；支持 `Last-Event-ID` 断点续传（SSE `id:` 即 seq）；15s `: ping` 心跳（可 Option 覆盖）；历史会话（非 live）读盘补发后仅心跳；未知会话 404。
   - `assets.go` + `placeholder/index.html`：go:embed 占位深色提示页，无 Node 可编译；`WithStatic(fs.FS)` 供 Task 11 注入真实 dist；未知路径 SPA 回退 index.html。
-  - `redact.go`：Redact/RedactBytes（出站 SSE 按 live handle 的 SecretValues 即内存 apiKey 逐帧掩码）、MaskSecret（启动/状态行）。
+  - `redact.go`：Redact/RedactBytes（出站 SSE 按 live handle 的 SecretValues 即内存 apiKey 逐帧掩码）。
   - `pkg/agent/events.go`：EventRecorder 新增单调 `seq`（落盘与 fan-out 同一把锁内赋值，SSE 补发/实时去重与 Last-Event-ID 的基础）；RunHandle 新增 SubscribeEvents、SecretValues 访问器。
   - 测试（11 个，httptest）：TR-4.1 无/错 token 401、Bearer/query 200、恶意 Host 403、loopback 形态 200、占位页免 token、Start 实测 127.0.0.1 绑定与 token URL；TR-4.2 脚本跑批：plan_review 补发 + tree_snapshot + 心跳 → approve 后实时 state_change/tree_snapshot → 断线重连补发恢复 → Last-Event-ID 只收更新事件；TR-4.3 哨兵 apiKey 全 DataDir 落盘扫描 + SSE 帧双重断言无明文；`go test ./... -race`（pkg/server 连跑 3 轮）、vet、gofmt 全绿。
 - **Description**:
@@ -267,12 +267,27 @@
   - `rule` TR-12.2: 端口/token 解析失败时有明确错误提示，不留僵尸进程。证据：故障注入手工验证。
 
 ## Task 13: 端到端走查与 Review 修复
-- **Status**: `pending`
+- **Status**: `completed`
 - **Priority**: high
 - **Depends On**: Task 10, Task 12
 - **Description**:
   - 全量 `go test ./... -race`、gofmt/vet、golangci-lint；npm build；浏览器与 Tauri 双形态走查全部 AC；独立 Review（fresh context）并按 review.md 修复。
-- **Acceptance Criteria Addressed**: AC-1~AC-11
+- **Completion Evidence**:
+  1. 自动化闸门全绿：`go build/vet ./...`、`gofmt` clean、`golangci-lint run` 0 issues、`go test ./... -race -count=1` 全包通过；`cd web && npm run build`（tsc 严格 + vite）；`cd desktop && cargo fmt --check`、`CARGO_TARGET_DIR=<local> cargo test`（3 个 sidecar 集成测试通过；SMB 卷继续用本地 target 的既有约定）。
+  2. 浏览器形态端到端走查（serve 于 127.0.0.1，OpenAI 兼容 mock 叶子，截图 d13-01~d13-15）：S1 自动模式跑成（AC-2/3 批准）；S2 manual：计划「调整」意见触发 replan → 批准 → out.txt unified diff（-line1/-line2/+first）→「拒绝」意见 must say second → 叶子重做（retry 事件、重试 1）→ 新 diff +second → 批准合并，工作区 out.txt=second（AC-3/4）；S3 计划审批「中止」→ failed: plan aborted（AC-3 abort）；S4 AskDialog 问答后完成（AC-7）；S6 bad mock 经停滞闸门 FAILED（失败树+错误指纹，51 事件）；五个筛选 chip 逐一验证（完成 4/失败 2/进行中·可续跑空态）；文件 tab 目录钻取 + 只读行号查看器；日志 tab 68/68 行；安全边界 curl：`../`/绝对路径 400、>1MiB 413、NUL 二进制 415（AC-6）；哨兵 key 全 datadir grep 无结果（AC-11 字面口径）。
+  3. 独立 Review（fresh context，未参与开发）：报告见 [review.md](review.md)。结论无 P0；发现 1 个 P1（环境变量 apiKey 可经叶子 `echo $OPENAI_API_KEY`/`printenv` 落盘，AC-11 weak）+ 8 项 P2；TR-13.2 评分 4/5。
+  4. 按 Review 修复并复验：
+     - **P1-1**：① `Sandbox.HideEnv/HiddenEnv`（pkg/tools/sandbox.go）工具子进程 env 过滤；RunManager 的 Start/Resume 经 `scrubToolSecrets` 剔除 OPENAI/LLM_API_KEY 及任何值等于 cfg.APIKey 的自定义变量；隔离镜像沙箱继承清洗；② EventRecorder 持有 secrets，Record 落盘与 fan-out 前递归 scrub（string/嵌套 map/slice/key/RawMessage），openSinks 注册 cfg.APIKey；③ 回归测试 `TestAPI_ToolSubprocessEnvScrubbed`（echo+printenv，events 与 logs 双扫无明文）、`TestEventRecorder_ScrubsSecretsBeforePersist`。
+     - P2-1：`Resume` 在 Load 后所有错误路径 `o.Close()`，不再泄漏句柄。
+     - P2-2：删除死代码 MaskSecret 及其单测。
+     - P2-3：审批载荷/fs file/日志分页三个非 SSE 出站路径统一 `Redact/RedactBytes`。
+     - P2-4：openSession 无 live 时补 `session_id === id` 校验。
+     - P2-5：NewEventRecorder 打开时 `trimPartialLine` 截掉末尾半写行，配合 seq 延续消除残行复用。
+     - P2-6：sidecar 以 `process_group(0)` 独立进程组，SIGINT/SIGKILL 按组（-pid）投递；Windows 路径注明无 checkpoint 语义并即时结束。
+     - P2-7：setup 在 URL 解析/窗口构建失败时显式 `SidecarState.shutdown()` 后再返回；tauri.conf 增加 dev/release 双 CSP（connect-src self + loopback/本地 vite ws）。
+     - P2-8：新增 HTTP 正向 `TestAPI_AskQuestionPositive`（ask→POST answer→完成，ask_pending 事件断言）。
+     - 修复后全量回归（-race 全包、golangci-lint 0 issues、cargo 3 测试）全绿。
+- **Acceptance Criteria Addressed**: AC-1~AC-11（AC-11 经 P1-1 修复后由 weak 转 pass）
 - **Test Requirements**:
-  - `rule` TR-13.1: 全部 AC 具备独立证据（测试/截图/走查记录），CI 全绿。证据：review.md。
-  - `rubric` TR-13.2: 整体完成度；scale 1-5；anchors 1=仅后端可用/3=主路径可用但有断点/5=浏览器与 Tauri 双形态主流程顺滑；threshold >=4；证据：独立 Review 评分。
+  - `rule` TR-13.1: 全部 AC 具备独立证据（测试/截图/走查记录），CI 全绿。证据：review.md 与上述 1~4 项。
+  - `rubric` TR-13.2: 整体完成度；scale 1-5；anchors 1=仅后端可用/3=主路径可用但有断点/5=浏览器与 Tauri 双形态主流程顺滑；threshold >=4；独立 Review 评分 4/5（达标）。

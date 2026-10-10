@@ -60,7 +60,23 @@ type Sandbox struct {
 	// lease, so repeated browser tool calls in one leaf do not re-acquire.
 	// RunWorker defers ReleaseBrowser; isolated mirrors get a fresh flag.
 	browserHeld bool
+
+	// hiddenEnv names environment variables withheld from tool subprocesses.
+	// The web serve path hides LLM credentials so a leaf's `echo
+	// $OPENAI_API_KEY`/`printenv` cannot read the key into tool output that
+	// gets persisted to the event file. Empty makes subprocesses inherit the
+	// full environment (CLI behavior; RunManager never runs in CLI mode).
+	hiddenEnv []string
 }
+
+// HideEnv withholds the named environment variables from tool subprocesses.
+func (s *Sandbox) HideEnv(keys ...string) {
+	s.hiddenEnv = append(s.hiddenEnv, keys...)
+}
+
+// HiddenEnv returns the env keys withheld from tool subprocesses, so isolated
+// mirror sandboxes inherit the same scrubbing.
+func (s *Sandbox) HiddenEnv() []string { return s.hiddenEnv }
 
 // acquireBrowserLease takes exclusive leaf-level ownership of the shared
 // browser tab on first use. Browser multi-step flows (navigate → click →
@@ -588,6 +604,21 @@ func (s *Sandbox) RunBash(ctx context.Context, command string, timeout time.Dura
 
 	cmd := exec.CommandContext(ctx, "sh", "-c", command)
 	cmd.Dir = s.Root
+	if len(s.hiddenEnv) > 0 {
+		drop := make(map[string]bool, len(s.hiddenEnv))
+		for _, k := range s.hiddenEnv {
+			drop[k] = true
+		}
+		env := os.Environ()
+		filtered := make([]string, 0, len(env))
+		for _, kv := range env {
+			if i := strings.IndexByte(kv, '='); i >= 0 && drop[kv[:i]] {
+				continue
+			}
+			filtered = append(filtered, kv)
+		}
+		cmd.Env = filtered
+	}
 	// Run the shell in its own process group so a timeout can kill the whole
 	// group, including background children (e.g. a started server). Killing
 	// only sh leaves such children alive and sh waits on them forever, which

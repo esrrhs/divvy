@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -422,6 +424,249 @@ func TestAPI_LeafApprovalDiff(t *testing.T) {
 	if got, err := os.ReadFile(filepath.Join(work, "out.txt")); err != nil || string(got) != "second" {
 		t.Fatalf("workdir must hold approved re-done content: %q %v", got, err)
 	}
+}
+
+// TestAPI_ResumeSSESeqNoCollision verifies the SSE boundary across a
+// pause → shutdown → resume cycle: the resumed run reuses the session's
+// JSONL file, so its event seqs must continue the earlier run's (unique,
+// strictly larger). A reset counter would make the replay/live stream
+// carry duplicate seqs and the new plan_review pending event would be
+// dropped client-side, stranding the UI in the old terminal phase.
+func TestAPI_ResumeSSESeqNoCollision(t *testing.T) {
+	work, data := t.TempDir(), t.TempDir()
+	gate := make(chan struct{})
+	mgr := agent.NewRunManager()
+	s, err := New(mgr, data, WithToken("test-token"),
+		WithHeartbeat(50*time.Millisecond), WithWorkdir(work),
+		WithClientFactory(func(agent.Config) llm.Client { return gatedScript(gate) }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+
+	cfg := srvCfg(work, data, "api_resume_sse")
+	cfg.Goal = "resume sse seq test"
+	h, err := mgr.Start(cfg, gatedScript(gate), agent.SilentLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitRunPhase(t, h, agent.PhasePlanReview)
+	id := h.SessionID()
+	apiDo(t, http.MethodPost, apiBase(ts)+"/sessions/"+id+"/plan/approve?token=test-token", map[string]any{})
+	waitLivePhase(t, ts, id, string(agent.PhaseRunning))
+	apiDo(t, http.MethodPost, apiBase(ts)+"/sessions/"+id+"/pause?token=test-token", map[string]any{})
+	waitLivePhase(t, ts, id, string(agent.PhasePaused))
+	close(gate)
+
+	preMax := maxPersistedSeq(t, filepath.Join(data, "events", id+".jsonl"))
+
+	apiDo(t, http.MethodPost, apiBase(ts)+"/sessions/"+id+"/resume?token=test-token",
+		map[string]any{"model": cfg.Model})
+	waitLivePhase(t, ts, id, string(agent.PhasePlanReview))
+
+	req, err := http.NewRequest(http.MethodGet,
+		apiBase(ts)+"/sessions/"+id+"/events?token=test-token", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	seen := make(map[int64]bool)
+	var curID int64 = -1
+	var pendingSeq int64
+	sc := bufio.NewScanner(resp.Body)
+	sc.Buffer(make([]byte, 0, 64*1024), sseEventMaxLine)
+	deadline := time.Now().Add(5 * time.Second)
+	for pendingSeq == 0 && time.Now().Before(deadline) {
+		if !sc.Scan() {
+			time.Sleep(5 * time.Millisecond)
+			continue
+		}
+		line := sc.Text()
+		switch {
+		case line == "":
+			curID = -1 // id-less messages (authoritative tree snapshot) reuse no id
+		case strings.HasPrefix(line, "id:"):
+			v, perr := strconv.ParseInt(strings.TrimSpace(strings.TrimPrefix(line, "id:")), 10, 64)
+			if perr == nil {
+				curID = v
+			}
+		case strings.HasPrefix(line, "data:"):
+			var ev struct {
+				Kind  string `json:"kind"`
+				Phase string `json:"phase"`
+			}
+			_ = json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(line, "data:"))), &ev)
+			if curID > 0 {
+				if seen[curID] {
+					t.Fatalf("duplicate seq %d in SSE replay/live", curID)
+				}
+				seen[curID] = true
+			}
+			// The resumed run's pending event: seq beyond the pre-resume
+			// history (a pending in the replay tail belongs to the old run).
+			if curID > preMax && ev.Kind == "plan_review" && ev.Phase == "pending" {
+				pendingSeq = curID
+			}
+		}
+	}
+	if pendingSeq == 0 {
+		t.Fatal("resumed run's plan_review pending event never observed over SSE")
+	}
+	if pendingSeq <= preMax {
+		t.Fatalf("resumed pending seq %d must exceed pre-resume max %d", pendingSeq, preMax)
+	}
+}
+
+// TestAPI_AskQuestionPositive covers AC-7 over HTTP (P2-8): a leaf whose
+// first worker step is an ask parks the run; POST answer unblocks it and the
+// run completes, with ask_pending/ask events persisted.
+func TestAPI_AskQuestionPositive(t *testing.T) {
+	work, data := t.TempDir(), t.TempDir()
+	ts := apiServerWithClient(t, work, data, func(agent.Config) llm.Client {
+		return &llm.ScriptedClient{
+			Handle: func(ctx context.Context, req llm.Request) (*llm.Response, error) {
+				sys := ""
+				if len(req.Messages) > 0 {
+					sys = req.Messages[0].Content
+				}
+				if strings.Contains(sys, "You are a software architect for a weak coding model.") {
+					return &llm.Response{Content: srvAtomicPlan}, nil
+				}
+				answered, sawWrite := false, false
+				for _, m := range req.Messages {
+					if m.Role != llm.RoleUser {
+						continue
+					}
+					if strings.Contains(m.Content, "ANSWER-99") {
+						answered = true
+					}
+					if strings.Contains(m.Content, "Tool write_file result") {
+						sawWrite = true
+					}
+				}
+				switch {
+				case !answered:
+					return &llm.Response{Content: `{"action":"ask","args":{"question":"what file?"}}`}, nil
+				case !sawWrite:
+					return &llm.Response{Content: `{"action":"write_file","args":{"path":"out.txt","content":"ok"}}`}, nil
+				default:
+					return &llm.Response{Content: `{"action":"finish","args":{"summary":"done"}}`}, nil
+				}
+			},
+		}
+	})
+
+	id, _ := createSimpleSession(t, ts, map[string]any{"goal": "ask positive check"})
+	waitLivePhase(t, ts, id, string(agent.PhasePlanReview))
+	apiDo(t, http.MethodPost, apiBase(ts)+"/sessions/"+id+"/plan/approve?token=test-token", map[string]any{})
+	waitLivePhase(t, ts, id, string(agent.PhaseAsk))
+
+	status, _ := apiDo(t, http.MethodPost, apiBase(ts)+"/sessions/"+id+"/answer?token=test-token",
+		map[string]any{"text": "ANSWER-99 please create out.txt"})
+	if status != http.StatusOK {
+		t.Fatalf("answer: %d", status)
+	}
+	waitLivePhase(t, ts, id, string(agent.PhaseDone))
+	if _, err := os.Stat(filepath.Join(work, "out.txt")); err != nil {
+		t.Fatalf("leaf did not finish after answer: %v", err)
+	}
+	summary, err := agent.SummarizeEvents(filepath.Join(data, "events", id+".jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Counts["ask_pending"] == 0 {
+		t.Fatal("no ask_pending event persisted")
+	}
+}
+
+// TestAPI_ToolSubprocessEnvScrubbed covers P1-1/NFR-1: the LLM key
+// inherited from serve's environment must be hidden from leaf tool
+// subprocesses (echo/printenv), and no event/log on disk may contain it.
+// This is the scenario the independent reviewer proved leaked before the
+// fix (review.md P1-1).
+func TestAPI_ToolSubprocessEnvScrubbed(t *testing.T) {
+	secret := "sk-env-secret-9f8e7d6c5b4a"
+	t.Setenv("OPENAI_API_KEY", secret)
+
+	work, data := t.TempDir(), t.TempDir()
+	ts := apiServerWithClient(t, work, data, func(agent.Config) llm.Client {
+		return &llm.ScriptedClient{
+			Handle: func(ctx context.Context, req llm.Request) (*llm.Response, error) {
+				sys := ""
+				if len(req.Messages) > 0 {
+					sys = req.Messages[0].Content
+				}
+				if strings.Contains(sys, "You are a software architect for a weak coding model.") {
+					return &llm.Response{Content: srvAtomicPlan}, nil
+				}
+				sawBash, sawWrite := false, false
+				for _, m := range req.Messages {
+					if m.Role != llm.RoleUser {
+						continue
+					}
+					if strings.Contains(m.Content, "Tool run_bash result") {
+						sawBash = true
+					}
+					if strings.Contains(m.Content, "Tool write_file result") {
+						sawWrite = true
+					}
+				}
+				switch {
+				case !sawBash:
+					return &llm.Response{Content: `{"action":"run_bash","args":{"command":"echo k=$OPENAI_API_KEY; printenv OPENAI_API_KEY || true"}}`}, nil
+				case !sawWrite:
+					return &llm.Response{Content: `{"action":"write_file","args":{"path":"out.txt","content":"ok"}}`}, nil
+				default:
+					return &llm.Response{Content: `{"action":"finish","args":{"summary":"done"}}`}, nil
+				}
+			},
+		}
+	})
+
+	id, _ := createSimpleSession(t, ts, map[string]any{"goal": "env scrub check"})
+	waitLivePhase(t, ts, id, string(agent.PhasePlanReview))
+	apiDo(t, http.MethodPost, apiBase(ts)+"/sessions/"+id+"/plan/approve?token=test-token", map[string]any{})
+	waitLivePhase(t, ts, id, string(agent.PhaseDone))
+
+	for _, dir := range []string{filepath.Join(data, "events"), filepath.Join(data, "logs")} {
+		filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return nil
+			}
+			raw, rerr := os.ReadFile(p)
+			if rerr != nil {
+				t.Fatal(rerr)
+			}
+			if bytes.Contains(raw, []byte(secret)) {
+				t.Fatalf("secret leaked into %s", p)
+			}
+			return nil
+		})
+	}
+}
+
+func maxPersistedSeq(t *testing.T, path string) int64 {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var maxSeq int64
+	for _, line := range strings.Split(string(raw), "\n") {
+		var head struct {
+			Seq int64 `json:"seq"`
+		}
+		if json.Unmarshal([]byte(line), &head) == nil && head.Seq > maxSeq {
+			maxSeq = head.Seq
+		}
+	}
+	return maxSeq
 }
 
 // approvalHTTPScript writes "first" until the rejection comment is fed

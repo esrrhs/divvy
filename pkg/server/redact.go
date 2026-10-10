@@ -26,16 +26,3 @@ func RedactBytes(data []byte, secrets ...string) []byte {
 	}
 	return []byte(Redact(string(data), secrets...))
 }
-
-// MaskSecret renders a secret for human-facing status lines (e.g. startup
-// logs): a short prefix/suffix stays recognizable, the middle is gone.
-func MaskSecret(secret string) string {
-	secret = strings.TrimSpace(secret)
-	if len(secret) < 8 {
-		return "****"
-	}
-	if len(secret) <= 12 {
-		return secret[:2] + "****"
-	}
-	return secret[:4] + "****" + secret[len(secret)-4:]
-}

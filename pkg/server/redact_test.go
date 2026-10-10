@@ -36,13 +36,3 @@ func TestRedactIgnoresShortValues(t *testing.T) {
 		t.Fatalf("short values must be ignored, got %q", got)
 	}
 }
-
-func TestMaskSecret(t *testing.T) {
-	if got := MaskSecret("sk-abcd1234-EFGH"); !strings.HasPrefix(got, "sk-a") ||
-		!strings.HasSuffix(got, "EFGH") || !strings.Contains(got, "****") {
-		t.Fatalf("mask form wrong: %q", got)
-	}
-	if got := MaskSecret("short"); got != "****" {
-		t.Fatalf("short secret must fully mask, got %q", got)
-	}
-}

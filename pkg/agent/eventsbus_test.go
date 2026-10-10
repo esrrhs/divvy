@@ -1,7 +1,9 @@
 package agent
 
 import (
+	"bytes"
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -116,6 +118,78 @@ func TestEventRecorder_CloseUnsubscribes(t *testing.T) {
 	}
 	if rec.SubscriberCount() != 0 {
 		t.Fatal("Close must detach subscribers")
+	}
+}
+
+func TestEventRecorder_ScrubsSecretsBeforePersist(t *testing.T) {
+	secret := "sk-leaf-secret-1234abcd"
+	path := filepath.Join(t.TempDir(), "events.jsonl")
+	rec, err := NewEventRecorder(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec.AddSecret(secret)
+	ch, cancel := rec.Subscribe()
+	defer cancel()
+	// Secret echoes through a field that surfaces tool output, nested in a
+	// slice, and in a RawMessage payload: every copy must be masked both on
+	// disk and in the fan-out.
+	rec.Record("tool_call", "root", map[string]any{
+		"output_preview": "result: " + secret,
+		"nested":         []any{map[string]any{"q": secret}},
+	})
+	select {
+	case ev := <-ch:
+		raw, _ := json.Marshal(ev)
+		if bytes.Contains(raw, []byte(secret)) {
+			t.Fatalf("secret survived fan-out: %s", raw)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no event received")
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatal(err)
+	}
+	onDisk, _ := os.ReadFile(path)
+	if bytes.Contains(onDisk, []byte(secret)) {
+		t.Fatalf("secret survived on disk: %s", onDisk)
+	}
+	if !bytes.Contains(onDisk, []byte(secretMask)) {
+		t.Fatal("redaction marker missing on disk")
+	}
+}
+
+func TestEventRecorder_SeqContinuesAcrossOpen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.jsonl")
+	rec, err := NewEventRecorder(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		rec.Record("test", "", map[string]any{"i": i})
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A resumed run reopens the same file: numbering continues at 6 rather
+	// than restarting, which is what SSE dedup/Last-Event-ID correctness
+	// hinges on.
+	rec2, err := NewEventRecorder(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rec2.Close()
+	ch, cancel := rec2.Subscribe()
+	defer cancel()
+	rec2.Record("test", "", map[string]any{"i": 6})
+	select {
+	case ev := <-ch:
+		if ev["seq"] != int64(6) {
+			t.Fatalf("want seq 6 after reopen, got %v", ev["seq"])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no event received")
 	}
 }
 

@@ -352,12 +352,23 @@ func (s *Server) handleGetApproval(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	payload := map[string]any{
 		"session_id": h.SessionID(),
 		"node_id":    req.NodeID,
 		"title":      req.Title,
 		"changes":    req.Changes,
-	})
+	}
+	data, merr := json.Marshal(payload)
+	if merr != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": merr.Error()})
+		return
+	}
+	// P2-3: a diff whose Old/NewContent echoes a secret must be masked like
+	// the SSE path (defense in depth; upstream recorders already scrub).
+	data = RedactBytes(data, h.SecretValues()...)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
 }
 
 func (s *Server) handleDecideApproval(w http.ResponseWriter, r *http.Request) {
@@ -422,13 +433,17 @@ func (s *Server) handleSessionLog(w http.ResponseWriter, r *http.Request) {
 	}
 	defer f.Close()
 
+	var secrets []string
+	if lh := s.mgr.Get(id); lh != nil {
+		secrets = lh.SecretValues()
+	}
 	lines := make([]string, 0, limit)
 	total := 0
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	for sc.Scan() {
 		if total >= offset && len(lines) < limit {
-			lines = append(lines, sc.Text())
+			lines = append(lines, Redact(sc.Text(), secrets...))
 		}
 		total++
 	}

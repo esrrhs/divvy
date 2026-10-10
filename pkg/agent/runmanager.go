@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -141,6 +142,7 @@ func (m *RunManager) Start(cfg Config, client llm.Client, log *Logger) (*RunHand
 		m.release(abs)
 		return nil, err
 	}
+	scrubToolSecrets(o)
 	h, err := m.attach(o, abs)
 	if err != nil {
 		m.release(abs)
@@ -150,29 +152,38 @@ func (m *RunManager) Start(cfg Config, client llm.Client, log *Logger) (*RunHand
 
 // Resume continues a saved guided session through the same manager.
 func (m *RunManager) Resume(cfg Config, client llm.Client, log *Logger) (*RunHandle, error) {
+	// Wait for a paused prior handle BEFORE Load: Load opens the event file
+	// and continues numbering from its highest seq, while a UI pause sets
+	// PhasePaused optimistically (user_pause event) before serve() writes
+	// its terminal checkpoint/session_end events. Loading in that window
+	// would resume the counter too early and collide with the events the
+	// old handle is about to append (it also closed the original
+	// ErrWorkdirBusy race, since the old handle releases its slot later).
+	if sid := strings.TrimSpace(cfg.SessionID); sid != "" {
+		if old := m.Get(sid); old != nil && old.Phase() == PhasePaused {
+			<-old.Done()
+		}
+	}
 	// Load has no side effects outside storage and may discover the workdir
 	// from the saved tree; the sandbox root it builds is already absolute.
 	o, err := Load(cfg, client, log)
 	if err != nil {
 		return nil, err
 	}
-	// A UI pause publishes PhasePaused optimistically (from the user_pause
-	// event) before serve() has finished unwinding the worker and releasing
-	// the workdir. A resume posted in that window would otherwise lose the
-	// race with ErrWorkdirBusy; wait for the prior handle to fully settle.
-	if old := m.Get(o.SessionID()); old != nil && old.Phase() == PhasePaused {
-		<-old.Done()
-	}
+	scrubToolSecrets(o)
 	abs, err := filepath.Abs(o.sandbox.Root)
 	if err != nil {
+		o.Close() // P2-1: Load already opened the event file
 		return nil, fmt.Errorf("resolve workdir: %w", err)
 	}
 	if wd := strings.TrimSpace(cfg.WorkDir); wd != "" && wd != "." {
 		if configured, ferr := filepath.Abs(wd); ferr == nil && configured != abs {
+			o.Close()
 			return nil, fmt.Errorf("configured workdir %s does not match saved session workdir %s", configured, abs)
 		}
 	}
 	if err := m.reserve(abs, o.SessionID()); err != nil {
+		o.Close()
 		return nil, err
 	}
 	h, err := m.attach(o, abs)
@@ -180,6 +191,26 @@ func (m *RunManager) Resume(cfg Config, client llm.Client, log *Logger) (*RunHan
 		m.release(abs)
 	}
 	return h, err
+}
+
+// scrubToolSecrets hides LLM credentials from tool subprocesses in the
+// web/serve path: worker bash must not be able to `echo $OPENAI_API_KEY` or
+// `printenv` and pull the key into persisted tool output (NFR-1/AC-11). CLI
+// modes never go through RunManager, so they inherit the environment as
+// before (NFR-3).
+func scrubToolSecrets(o *Orchestrator) {
+	keys := []string{"OPENAI_API_KEY", "LLM_API_KEY"}
+	if k := strings.TrimSpace(o.cfg.APIKey); k != "" {
+		// Custom-named exports (e.g. MY_KEY=...) still carry the live key;
+		// match by value so those are hidden too.
+		for _, kv := range os.Environ() {
+			name, val, ok := strings.Cut(kv, "=")
+			if ok && val == k {
+				keys = append(keys, name)
+			}
+		}
+	}
+	o.sandbox.HideEnv(keys...)
 }
 
 // reserve marks a workdir as launching-or-live. sessionID is the resuming
@@ -627,13 +658,21 @@ func (h *RunHandle) DecideLeaf(nodeID string, approved bool, comment string) err
 		return fmt.Errorf("%w: no leaf is awaiting approval", ErrWrongPhase)
 	}
 	pa, ok := h.leafApprovals[nodeID]
-	h.mu.Unlock()
 	if !ok {
+		h.mu.Unlock()
 		return fmt.Errorf("%w: leaf %s is not awaiting approval", ErrWrongPhase, nodeID)
 	}
 	if !approved && comment == "" {
+		h.mu.Unlock()
 		return fmt.Errorf("rejection comment is required")
 	}
+	// Leave the waiting phase before signaling the parked hook: the hook's
+	// cleanup deletes the map entry on wake, so leaving the phase change to
+	// that (or to the applyEvent path) opens a window where phase still
+	// reads leaf_approval while GET approvals/{id} already 404s. Mirrors
+	// Answer(), which flips back to running together with the submission.
+	h.phase = PhaseRunning
+	h.mu.Unlock()
 	select {
 	case pa.ch <- LeafApprovalDecision{Approved: approved, Comment: comment}:
 		return nil

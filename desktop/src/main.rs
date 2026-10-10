@@ -41,15 +41,25 @@ fn main() {
             } else {
                 launched.url
             };
-            let url = url::Url::parse(&win_url)
-                .map_err(|e| fatal(&format!("无法解析后端访问地址 {win_url}: {e}")))?;
+            let url = match url::Url::parse(&win_url) {
+                Ok(u) => u,
+                Err(e) => {
+                    // Sidecar already launched: stop it before aborting so
+                    // setup failure cannot orphan the process.
+                    app.state::<SidecarState>().shutdown();
+                    return Err(fatal(&format!("无法解析后端访问地址 {win_url}: {e}")));
+                }
+            };
 
-            WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url))
+            if let Err(e) = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url))
                 .title("divvy")
                 .inner_size(1280.0, 820.0)
                 .min_inner_size(960.0, 600.0)
                 .build()
-                .map_err(|e| fatal(&format!("创建窗口失败：{e}")))?;
+            {
+                app.state::<SidecarState>().shutdown();
+                return Err(fatal(&format!("创建窗口失败：{e}")));
+            }
 
             Ok(())
         })

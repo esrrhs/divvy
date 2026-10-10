@@ -22,7 +22,10 @@
   "app": {
     "windows": [],
     "security": {
-      "csp": null
+      "csp": {
+        "dev": "default-src 'self'; connect-src 'self' ws://localhost:5173 http://127.0.0.1:*; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:",
+        "release": "default-src 'self'; connect-src 'self' http://127.0.0.1:*; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:"
+      }
     }
   },
   "bundle": {

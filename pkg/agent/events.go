@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -33,6 +35,65 @@ type EventRecorder struct {
 	subMu sync.Mutex
 	subs  map[int]*eventSubscription
 	subID int
+
+	// secrets scrubbed from every event before it is persisted (and before
+	// fan-out): defense in depth on top of the tool subprocess env scrub —
+	// any event field echoing tool output (output_preview, messages) is
+	// guaranteed clean on disk.
+	secrets []string
+}
+
+// secretMask is the replacement persisted/fanned out in place of a secret.
+const secretMask = "***REDACTED***"
+
+// AddSecret registers a credential value that must never appear in an event
+// on disk or in a fan-out payload. Values under 4 chars are ignored so short
+// placeholders cannot wipe single characters.
+func (r *EventRecorder) AddSecret(v string) {
+	if r == nil {
+		return
+	}
+	v = strings.TrimSpace(v)
+	if len(v) < 4 {
+		return
+	}
+	r.mu.Lock()
+	r.secrets = append(r.secrets, v)
+	r.mu.Unlock()
+}
+
+// scrubSecrets recursively replaces registered secret values inside an event
+// (strings, nested maps/slices, map keys, and RawMessage bytes) before
+// persistence, returning the cleaned value.
+func scrubSecrets(v any, secrets []string) any {
+	switch t := v.(type) {
+	case string:
+		for _, s := range secrets {
+			t = strings.ReplaceAll(t, s, secretMask)
+		}
+		return t
+	case map[string]any:
+		for k, val := range t {
+			nk := scrubSecrets(k, secrets).(string)
+			nv := scrubSecrets(val, secrets)
+			if nk != k {
+				delete(t, k)
+			}
+			t[nk] = nv
+		}
+		return t
+	case []any:
+		for i, val := range t {
+			t[i] = scrubSecrets(val, secrets)
+		}
+		return t
+	case []byte: // json.RawMessage payloads (embedded tree snapshots)
+		for _, s := range secrets {
+			t = bytes.ReplaceAll(t, []byte(s), []byte(secretMask))
+		}
+		return t
+	}
+	return v
 }
 
 // eventBuffer is the per-subscriber channel capacity.
@@ -123,11 +184,91 @@ func NewEventRecorder(path string) (*EventRecorder, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return nil, err
 	}
+	// Drop a half-written final line (crash mid-write): it is unreadable
+	// JSON and keeping it would make the next event reuse its seq, leaving a
+	// torn duplicate line in the file.
+	trimPartialLine(path)
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
 		return nil, err
 	}
-	return &EventRecorder{f: f}, nil
+	// A resumed run opens a file earlier runs wrote. Continue numbering from
+	// the highest seq on disk instead of restarting at 1: SSE consumers use
+	// seq both for replay/live de-duplication and Last-Event-ID resumes, so a
+	// restarted counter would make the new run's events collide with earlier
+	// runs' events (dropped as duplicates, stale terminal state winning).
+	return &EventRecorder{f: f, seq: highestEventSeq(path)}, nil
+}
+
+// partialLineTail bounds how much of a file is inspected for a torn end.
+const partialLineTail = 64 * 1024
+
+// trimPartialLine truncates a file whose final line is not newline-terminated
+// back to the end of the last complete line. No-op for empty/complete files.
+func trimPartialLine(path string) {
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return
+	}
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil || info.Size() == 0 {
+		return
+	}
+	size := info.Size()
+	start := int64(0)
+	if size > partialLineTail {
+		start = size - partialLineTail
+	}
+	buf := make([]byte, size-start)
+	if _, err := f.ReadAt(buf, start); err != nil {
+		return
+	}
+	if buf[len(buf)-1] == '\n' {
+		return
+	}
+	idx := bytes.LastIndexByte(buf, '\n')
+	if idx < 0 {
+		_ = f.Truncate(0)
+		return
+	}
+	_ = f.Truncate(start + int64(idx) + 1)
+}
+
+// eventSeqTail bounds how much of a possibly large JSONL file is scanned to
+// resume the sequence. Events are clipped to a few KB, so 1 MiB always covers
+// many events; if the file is smaller it is read in full.
+const eventSeqTail = 1 << 20
+
+func highestEventSeq(path string) int64 {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0
+	}
+	defer func() { _ = f.Close() }()
+	var start int64
+	if info, err := f.Stat(); err == nil && info.Size() > eventSeqTail {
+		start = info.Size() - eventSeqTail
+	}
+	if _, err := f.Seek(start, 0); err != nil {
+		return 0
+	}
+	sc := bufio.NewScanner(f)
+	// Tree snapshot lines can be large; mirror the SSE replay ceiling.
+	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	var highest int64
+	for sc.Scan() {
+		var head struct {
+			Seq int64 `json:"seq"`
+		}
+		if err := json.Unmarshal(sc.Bytes(), &head); err != nil {
+			continue // tolerate a torn final line
+		}
+		if head.Seq > highest {
+			highest = head.Seq
+		}
+	}
+	return highest
 }
 
 // Close flips the underlying file and detaches all subscribers.
@@ -166,6 +307,9 @@ func (r *EventRecorder) Record(kind, nodeID string, fields map[string]any) {
 	// lock: a subscriber that reconnects can trust every seq on disk and
 	// never observe an event number the file does not contain.
 	r.mu.Lock()
+	if len(r.secrets) > 0 {
+		ev = scrubSecrets(ev, r.secrets).(map[string]any)
+	}
 	r.seq++
 	ev["seq"] = r.seq
 	data, err := json.Marshal(ev)

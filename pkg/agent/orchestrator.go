@@ -137,6 +137,10 @@ func (o *Orchestrator) openSinks() {
 	evPath := filepath.Join(o.cfg.DataDir, "events", o.tree.ID+".jsonl")
 	if rec, err := NewEventRecorder(evPath); err == nil {
 		o.events = rec
+		// Scrub the live credential from any event field before it is
+		// persisted (tool output previews, messages): the on-disk secrecy
+		// invariant must not depend on every call site remembering to mask.
+		rec.AddSecret(o.cfg.APIKey)
 		o.treeBC = newTreeBroadcaster(o)
 		o.treeBC.start()
 	} else {
@@ -889,6 +893,7 @@ func (o *Orchestrator) newLeafMirror() (*tools.Mirror, *tools.Sandbox, error) {
 	}
 	sb.Web = o.sandbox.Web
 	sb.Browser = o.sandbox.Browser
+	sb.HideEnv(o.sandbox.HiddenEnv()...)
 	o.log.Infof("isolated workspace: %s", tools.TrimPath(sb.Root))
 	return mirror, sb, nil
 }

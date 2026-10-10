@@ -159,7 +159,8 @@ pub(crate) fn launch_sidecar(
     workdir: &Path,
     datadir: &Path,
 ) -> Result<Launched, String> {
-    let mut child = Command::new(bin)
+    let mut command = Command::new(bin);
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -172,7 +173,16 @@ pub(crate) fn launch_sidecar(
         ])
         .arg(workdir)
         .args(["-datadir"])
-        .arg(datadir)
+        .arg(datadir);
+    // Run the sidecar in its OWN process group so shutdown signals target
+    // it (negative pid) without ever reaching the Tauri app's group, and a
+    // forced kill covers every process the Go server forked into its group.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
         .spawn()
         .map_err(|e| format!("无法启动后端程序 {}：{e}", bin.display()))?;
 
@@ -245,11 +255,22 @@ fn parse_token(url: &str) -> Option<String> {
 
 impl SidecarProc {
     fn graceful_shutdown(&self) {
-        // Unix: ask for graceful shutdown so the Go server checkpoints.
-        // Windows: std::process::kill is TerminateProcess (no signal there).
+        // Unix: ask for graceful shutdown (whole group) so the Go server
+        // checkpoints running sessions.
         #[cfg(unix)]
         unsafe {
-            libc::kill(self.pid as i32, libc::SIGINT);
+            // Negative pid targets the sidecar's own process group.
+            libc::kill(-(self.pid as i32), libc::SIGINT);
+        }
+        // Windows has no SIGINT: std::process::kill is TerminateProcess, so
+        // there is no checkpoint path; the grace wait below is skipped by
+        // starting the kill immediately (Windows is not a supported target
+        // in this release, see spec Non-Goals).
+        #[cfg(windows)]
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.start_kill();
+            let _ = child.wait();
+            return;
         }
 
         let deadline = Instant::now() + SHUTDOWN_GRACE;
@@ -267,17 +288,24 @@ impl SidecarProc {
             }
         }
 
-        eprintln!("[shell] sidecar did not exit in grace; force killing");
-        #[cfg(windows)]
-        let _ = child.start_kill();
-        #[cfg(not(windows))]
-        let _ = child.kill();
+        eprintln!("[shell] sidecar did not exit in grace; force killing group");
+        #[cfg(unix)]
+        unsafe {
+            // Kill the whole group: a leaf tool that missed the Go server's
+            // own cleanup must not be reparented to launchd as an orphan.
+            libc::kill(-(self.pid as i32), libc::SIGKILL);
+        }
         let _ = child.wait();
     }
 
     /// Force-stop after a failed startup (no window will be shown).
     fn kill_now(&self) {
         if let Ok(mut child) = self.child.lock() {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(-(self.pid as i32), libc::SIGKILL);
+            }
+            #[cfg(not(unix))]
             let _ = child.kill();
             let _ = child.wait();
         }
