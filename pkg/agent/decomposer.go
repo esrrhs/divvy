@@ -29,9 +29,16 @@ type decomposeChild struct {
 }
 
 func (o *Orchestrator) decompose(ctx context.Context, node *models.TaskNode) error {
-	if node.Depth >= o.cfg.MaxDepth {
+	planRepair := strings.Contains(node.ErrorMsg, planRepairMarker)
+	if node.Depth >= o.cfg.MaxDepth && !planRepair {
 		o.log.Warnf("max depth %d reached, forcing %s to leaf", o.cfg.MaxDepth, node.ID)
 		return o.forceLeaf(node)
+	}
+	// At MaxDepth a plan-repair must stay atomic: we rewrite contract/DoD,
+	// we do not grow the tree. The prompt below forces is_atomic=true.
+	forceAtomic := planRepair && node.Depth >= o.cfg.MaxDepth
+	if forceAtomic {
+		o.log.Warnf("max depth %d: atomic plan-repair for %s", o.cfg.MaxDepth, node.ID)
 	}
 
 	if err := o.sched.UpdateNodeState(node.ID, models.TaskStateDecomposing, ""); err != nil {
@@ -39,6 +46,10 @@ func (o *Orchestrator) decompose(ctx context.Context, node *models.TaskNode) err
 	}
 
 	user := o.decomposeUserPrompt(node)
+	if forceAtomic {
+		user += "\n\nHARD REQUIREMENT: set is_atomic=true with an empty subtasks array. " +
+			"Rewrite contract+dod for THIS task only. Fix any unsatisfiable expected_output."
+	}
 	base := []llm.Message{
 		{Role: llm.RoleSystem, Content: decomposerSystem},
 		{Role: llm.RoleUser, Content: user},
@@ -78,10 +89,16 @@ func (o *Orchestrator) decompose(ctx context.Context, node *models.TaskNode) err
 			var parsed decomposeResult
 			if err := llm.UnmarshalFlexible(resp.Content, &parsed); err != nil {
 				lastErr = err
-			} else if err := o.applyDecompose(node, parsed); err != nil {
-				lastErr = err
 			} else {
-				return nil
+				if forceAtomic {
+					parsed.IsAtomic = true
+					parsed.Subtasks = nil
+				}
+				if err := o.applyDecompose(node, parsed); err != nil {
+					lastErr = err
+				} else {
+					return nil
+				}
 			}
 		}
 
@@ -105,7 +122,13 @@ func (o *Orchestrator) decomposeUserPrompt(node *models.TaskNode) string {
 	b.WriteString("\nExisting DoD:\n")
 	b.WriteString(formatDoD(node.DoD))
 	if node.ErrorMsg != "" {
-		fmt.Fprintf(&b, "\nPrevious failure (you MUST split smaller and address this):\n%s\n", truncate(node.ErrorMsg, 2500))
+		if strings.Contains(node.ErrorMsg, planRepairMarker) {
+			fmt.Fprintf(&b, "\nPrevious failure — DIAGNOSE THE PLAN FIRST (DoD/contract may be wrong; "+
+				"prefer is_atomic=true and fix expected_output/commands before splitting further):\n%s\n",
+				truncate(node.ErrorMsg, 2500))
+		} else {
+			fmt.Fprintf(&b, "\nPrevious failure (you MUST split smaller and address this):\n%s\n", truncate(node.ErrorMsg, 2500))
+		}
 	}
 	if node.ParentID != "" {
 		if p, ok := o.tree.CloneNode(node.ParentID); ok {

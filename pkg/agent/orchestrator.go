@@ -1034,10 +1034,21 @@ func (o *Orchestrator) handleLeafFailure(leaf *models.TaskNode, errMsg string) e
 	if ok {
 		leaf = live
 	}
-	if leaf.DecomposeCount >= o.cfg.MaxRedecompose || leaf.Depth >= o.cfg.MaxDepth {
+	diagnosis := diagnoseDecompositionFailure(leaf, errMsg)
+	o.log.Warnf("%s plan diagnosis: %s", leaf.ID, diagnosis.Summary)
+
+	// Plan defects (especially an expected_output the command never prints)
+	// can be repaired in place even at MaxDepth: we re-decompose as atomic
+	// with a corrected DoD rather than trying to go deeper. Pure "too big"
+	// failures still need remaining depth to split.
+	budgetLeft := leaf.DecomposeCount < o.cfg.MaxRedecompose
+	canSplit := budgetLeft && leaf.Depth < o.cfg.MaxDepth
+	canRepair := budgetLeft && diagnosis.IsPlanDefect()
+	if !canSplit && !canRepair {
 		o.log.Errorf("giving up on %s", leaf.ID)
 		o.events.Record("leaf_giveup", leaf.ID, map[string]any{
-			"reason": clip(errMsg, evReasonChars),
+			"reason":    clip(errMsg, evReasonChars),
+			"diagnosis": clip(diagnosis.Summary, evReasonChars),
 		})
 		if err := o.sched.UpdateNodeState(leaf.ID, models.TaskStateFailed, errMsg); err != nil {
 			return err
@@ -1048,19 +1059,29 @@ func (o *Orchestrator) handleLeafFailure(leaf *models.TaskNode, errMsg string) e
 		return nil
 	}
 
-	o.log.Warnf("re-splitting failed leaf %s", leaf.ID)
+	kind := "resplit"
+	if diagnosis.IsPlanDefect() {
+		kind = "plan_repair"
+		o.log.Warnf("re-planning failed leaf %s (decomposition defect)", leaf.ID)
+	} else {
+		o.log.Warnf("re-splitting failed leaf %s", leaf.ID)
+	}
 	o.events.Record("leaf_resplit", leaf.ID, map[string]any{
-		"reason": clip(errMsg, evReasonChars),
+		"reason":    clip(errMsg, evReasonChars),
+		"kind":      kind,
+		"diagnosis": clip(diagnosis.Summary, evReasonChars),
 	})
 	err := o.tree.UpdateNode(leaf.ID, func(n *models.TaskNode) error {
 		n.Type = models.NodeTypeCompound
 		n.State = models.TaskStatePending
 		n.DecomposeCount++
 		n.RetryCount = 0
-		n.ErrorMsg = errMsg
+		// Fresh stall window after a plan change: the old identical failures
+		// were against a DoD that may no longer apply.
+		n.ErrorHistory = nil
+		n.ErrorMsg = diagnosis.Constraint + "\n\n" + truncate(errMsg, 1500)
 		n.ChildrenIDs = n.ChildrenIDs[:0]
-		n.Contract.Constraints = append(n.Contract.Constraints,
-			"Previous leaf execution failed; split into smaller tasks. Error: "+truncate(errMsg, 1500))
+		n.Contract.Constraints = append(n.Contract.Constraints, diagnosis.Constraint)
 		return nil
 	})
 	if err != nil {
