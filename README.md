@@ -1,5 +1,11 @@
 # divvy
 
+[<img src="https://img.shields.io/github/license/esrrhs/divvy">](https://github.com/esrrhs/divvy)
+[<img src="https://img.shields.io/github/languages/top/esrrhs/divvy">](https://github.com/esrrhs/divvy)
+[<img src="https://img.shields.io/github/go-mod/go-version/esrrhs/divvy">](https://github.com/esrrhs/divvy)
+[<img src="https://img.shields.io/github/actions/workflow/status/esrrhs/divvy/test.yml?branch=master">](https://github.com/esrrhs/divvy/actions)
+[![codecov](https://codecov.io/gh/esrrhs/divvy/graph/badge.svg)](https://codecov.io/gh/esrrhs/divvy)
+
 *An automated coding agent for small, cheap LLMs: split big goals into contract-driven task trees, execute each leaf in an isolated context, and verify with real builds and tests.*
 
 面向弱模型（小参数、低算力、廉价模型）的自动化编程 Agent。  

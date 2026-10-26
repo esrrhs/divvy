@@ -243,6 +243,14 @@ func bytesTrim(b []byte) string {
 	return s
 }
 
+func (o *Orchestrator) parkInterrupted(id string) {
+	reason := ""
+	if live, ok := o.tree.CloneNode(id); !ok || strings.TrimSpace(live.ErrorMsg) == "" {
+		reason = "interrupted"
+	}
+	_ = o.sched.UpdateNodeState(id, models.TaskStatePending, reason)
+}
+
 func (o *Orchestrator) resetInterrupted() {
 	ids := o.tree.NodeIDsInStates(
 		models.TaskStateRunning,
@@ -267,7 +275,11 @@ func (o *Orchestrator) resetInterrupted() {
 		if live.State == models.TaskStateFailed && live.Type != models.NodeTypeLeaf {
 			continue
 		}
-		_ = o.sched.UpdateNodeState(id, models.TaskStatePending, "interrupted; will retry")
+		reason := ""
+		if strings.TrimSpace(live.ErrorMsg) == "" {
+			reason = "interrupted; will retry"
+		}
+		_ = o.sched.UpdateNodeState(id, models.TaskStatePending, reason)
 	}
 }
 
@@ -458,7 +470,7 @@ func (o *Orchestrator) Run(ctx context.Context) (runErr error) {
 			if started, _ := tryDispatch(n.ID, nil, func(c context.Context) error {
 				if derr := o.decompose(c, n); derr != nil {
 					if c.Err() != nil {
-						_ = o.sched.UpdateNodeState(n.ID, models.TaskStatePending, "interrupted")
+						o.parkInterrupted(n.ID)
 					} else {
 						o.log.Errorf("decompose %s: %v", n.ID, derr)
 						_ = o.sched.UpdateNodeState(n.ID, models.TaskStateFailed, derr.Error())
@@ -551,7 +563,7 @@ func (o *Orchestrator) RunPlan(ctx context.Context) (runErr error) {
 		o.log.Actionf("plan: decompose %s — %s", node.ID, node.Title)
 		if err := o.decompose(ctx, node); err != nil {
 			if ctx.Err() != nil {
-				_ = o.sched.UpdateNodeState(node.ID, models.TaskStatePending, "interrupted")
+				o.parkInterrupted(node.ID)
 				_ = o.checkpoint()
 				return err
 			}
@@ -603,7 +615,7 @@ func (o *Orchestrator) buildPlan(ctx context.Context) error {
 		o.log.Actionf("plan: decompose %s — %s", node.ID, node.Title)
 		if err := o.decompose(ctx, node); err != nil {
 			if ctx.Err() != nil {
-				_ = o.sched.UpdateNodeState(node.ID, models.TaskStatePending, "interrupted")
+				o.parkInterrupted(node.ID)
 				_ = o.checkpoint()
 				return ctx.Err()
 			}
@@ -762,7 +774,7 @@ func (o *Orchestrator) executeLeaf(ctx context.Context, leaf *models.TaskNode) e
 		summary, err := o.runWorker(ctx, sb, leaf, prevErr)
 		if err != nil {
 			if ctx.Err() != nil {
-				_ = o.sched.UpdateNodeState(leaf.ID, models.TaskStatePending, "interrupted")
+				o.parkInterrupted(leaf.ID)
 				return ctx.Err()
 			}
 			prevErr = err.Error()
@@ -782,7 +794,7 @@ func (o *Orchestrator) executeLeaf(ctx context.Context, leaf *models.TaskNode) e
 		}
 		vr := o.verify(ctx, sb, leaf)
 		if ctx.Err() != nil {
-			_ = o.sched.UpdateNodeState(leaf.ID, models.TaskStatePending, "interrupted")
+			o.parkInterrupted(leaf.ID)
 			return ctx.Err()
 		}
 		if vr.OK {
@@ -803,7 +815,7 @@ func (o *Orchestrator) executeLeaf(ctx context.Context, leaf *models.TaskNode) e
 					})
 					if aerr != nil {
 						if ctx.Err() != nil {
-							_ = o.sched.UpdateNodeState(leaf.ID, models.TaskStatePending, "interrupted")
+							o.parkInterrupted(leaf.ID)
 							_ = o.checkpoint()
 							return ctx.Err()
 						}
@@ -995,7 +1007,7 @@ func (o *Orchestrator) retryOrGiveUp(ctx context.Context, leaf *models.TaskNode,
 		"reason":   clip(errMsg, evReasonChars),
 	})
 	if err := waitBackoff(ctx, delay); err != nil {
-		_ = o.sched.UpdateNodeState(leaf.ID, models.TaskStatePending, "interrupted")
+		o.parkInterrupted(leaf.ID)
 		return err
 	}
 	return nil

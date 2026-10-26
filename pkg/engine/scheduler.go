@@ -219,7 +219,9 @@ func (s *Scheduler) UpdateNodeState(nodeID string, newState models.TaskState, er
 
 	oldState := node.State
 	node.State = newState
-	node.ErrorMsg = errorMsg
+	if newState == models.TaskStateCompleted || errorMsg != "" {
+		node.ErrorMsg = errorMsg
+	}
 	node.UpdatedAt = time.Now()
 	// Terminal failure preserves the error permanently (retries are recorded
 	// by the orchestrator before they re-enter PENDING).

@@ -48,7 +48,13 @@ jobs:
         run: go build ./...
 
       - name: Test
-        run: go test ./... -count=1 -v
+        run: go test ./... -count=1 -v -coverprofile=coverage.txt -covermode=atomic
+
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage.txt
 
   # The engine runs leaves concurrently and shares a task tree, a merge lock
   # and a browser across them. -race is the only thing that catches a bad
