@@ -82,16 +82,16 @@ func TestOrchestrator_IsolateRollbackOnFailure(t *testing.T) {
 	cfg.Stream = false
 	cfg.Isolate = true
 	cfg.MaxRetries = 1
-	cfg.MaxRedecompose = 0 // fail the leaf instead of re-splitting it
+	cfg.Parallel = 2
+	cfg.MaxRedecompose = 0 // alpha keeps failing; beta must still be able to merge
 
 	o, err := NewFromGoal(cfg, client, SilentLogger())
 	if err != nil {
 		t.Fatal(err)
 	}
-	runErr := o.Run(context.Background())
-	if runErr == nil || !strings.Contains(runErr.Error(), "root task failed") {
-		t.Fatalf("expected root failure, got %v", runErr)
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
+	defer cancel()
+	_ = o.Run(ctx)
 
 	if _, err := os.Stat(filepath.Join(work, "a.txt")); !os.IsNotExist(err) {
 		t.Fatal("failed leaf's files leaked into the shared workspace")

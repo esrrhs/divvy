@@ -80,10 +80,10 @@ func (o *Orchestrator) stalled(leafID string) (run int, stalled bool) {
 	return run, run >= o.cfg.MaxStall
 }
 
-// handleStall stops retrying a leaf that keeps failing identically and hands
-// it to the normal failure path: re-split into smaller tasks while the
-// decomposition budget allows it, otherwise fail the node. Retrying again
-// would only repeat an attempt that has already proven it does not converge.
+// handleStall stops the current streak of identical failures and hands the
+// leaf to handleLeafFailure: re-split or repair the plan while that budget
+// remains, otherwise clear the stall window and retry the same leaf. A
+// terminal FAILED state would block every dependent and end the run.
 func (o *Orchestrator) handleStall(leaf *models.TaskNode, run int, errMsg string) error {
 	msg := fmt.Sprintf("stalled: the same failure repeated %d times (last: %s)", run, truncate(errMsg, 400))
 	o.log.Errorf("%s %s", leaf.ID, msg)

@@ -79,7 +79,7 @@ NewFromGoal / Load
 | 验收失败 | 新建**隔离上下文**重试，注入诊断块（根因前置）+ 错误前缀，指数退避（上限 30s） |
 | worker 返回错误 | 同上，另记入节点 `ErrorHistory` |
 | 达到 `-max-retries` | `handleLeafFailure`：先诊断拆解/DoD 是否有问题，再转 COMPOUND 重新拆解（受 `-max-redecompose` / `-max-depth` 约束） |
-| 连续 `-max-stall` 次**相同**失败 | 判定原地打转，走同一条 `handleLeafFailure`，并记 `leaf_stall` 事件。若诊断为 DoD 缺陷（如 `expected_output` 与命令输出对不上），即使已到 `-max-depth` 也会做**原地修计划**（强制 atomic 重写 contract/DoD），而不是只会再拆更碎 |
+| 连续 `-max-stall` 次**相同**失败 | 判定原地打转，走同一条 `handleLeafFailure`，并记 `leaf_stall` 事件。若诊断为 DoD 缺陷（如 `expected_output` 与命令输出对不上），即使已到 `-max-depth` 也会做**原地修计划**（强制 atomic 重写 contract/DoD）。重拆预算用尽后叶子回到 `PENDING` 继续重试，不标 `FAILED`，避免整棵树无任务可跑而退出 |
 | 超过 `-max-elapsed` | 直接 FAILED 并说明原因；**不**触发重新拆解（时间不够不代表任务太大，重拆只是重置时钟） |
 | 用完 `-max-steps` 且未调用 `finish` | 判失败（`ErrMaxSteps`），**不送验收**：模型没声称完成，文件可能半截，`review_diff` 自检也还没跑 |
 | 根验收失败 | 回路由给集成叶子，带错误重跑装配 |

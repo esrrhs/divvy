@@ -95,78 +95,35 @@ func TestOrchestrator_StalledThreshold(t *testing.T) {
 	}
 }
 
-// TestOrchestrator_StallStopsInfiniteRetries is the regression test for the
-// unbounded retry loop's second half. MaxElapsed bounds the *slow* leaf; a
-// leaf that fails the same way every time is not slow, it is stuck — with
-// MaxRetries=0 (the default) nothing used to end that loop but the clock.
-func TestOrchestrator_StallStopsInfiniteRetries(t *testing.T) {
-	work := t.TempDir()
-	data := t.TempDir()
-
-	var attempts int64
-	client := &llm.ScriptedClient{
-		Handle: func(ctx context.Context, req llm.Request) (*llm.Response, error) {
-			sys := ""
-			if len(req.Messages) > 0 {
-				sys = req.Messages[0].Content
-			}
-			if strings.Contains(sys, architectMarker) {
-				return &llm.Response{Content: failingLeafPlan}, nil
-			}
-			attempts++
-			// The leaf claims to be done immediately; its DoD can never pass,
-			// so every attempt fails in exactly the same way.
-			return jsonAction("finish", map[string]string{"summary": "tried"}), nil
-		},
-	}
-
+// TestStallWithNoReplanKeepsRetrying: identical failures still raise
+// leaf_stall, but with no replan budget left the leaf stays pending so the
+// run does not exit.
+func TestStallWithNoReplanKeepsRetrying(t *testing.T) {
 	cfg := DefaultConfig()
-	cfg.WorkDir = work
-	cfg.DataDir = data
+	cfg.WorkDir = t.TempDir()
+	cfg.DataDir = t.TempDir()
 	cfg.SessionID = "test_stall"
 	cfg.Goal = "write a library file"
 	cfg.Stream = false
-	cfg.MaxRetries = 0 // unlimited attempts
-	cfg.MaxElapsed = 0 // no clock at all: only the stall detector can stop this
-	cfg.MaxStall = 2
-	cfg.MaxRedecompose = 0 // no re-split: the leaf must be failed outright
-	cfg.RetryMinInterval = 5 * time.Millisecond
-	cfg.RetryMaxInterval = 10 * time.Millisecond
+	cfg.MaxRedecompose = 0
 
-	o, err := NewFromGoal(cfg, client, SilentLogger())
+	o, err := NewFromGoal(cfg, &llm.ScriptedClient{}, SilentLogger())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer o.Close()
 
-	done := make(chan error, 1)
-	go func() { done <- o.Run(context.Background()) }()
-
-	var runErr error
-	select {
-	case runErr = <-done:
-	case <-time.After(30 * time.Second):
-		t.Fatalf("run did not terminate; identical failures still loop forever (attempts=%d)", attempts)
-	}
-	if runErr == nil {
-		t.Fatalf("run should not succeed:\n%s", o.tree.RenderVisualTree())
-	}
-	if !strings.Contains(runErr.Error(), "stalled") {
-		t.Fatalf("run error should mention the stall, got: %v", runErr)
-	}
-	if attempts != 2 {
-		t.Fatalf("should stop at the stall limit (2 attempts), ran %d", attempts)
-	}
-
 	leaf, _ := o.tree.CloneNode(o.tree.RootID)
-	if leaf.State != models.TaskStateFailed {
-		t.Fatalf("leaf state %s, want FAILED", leaf.State)
+	if err := o.handleStall(leaf, 3, "grep -n 'func TestX' vec_test.go\nexit 1"); err != nil {
+		t.Fatal(err)
 	}
-	if o.sched.IsComplete() {
-		t.Fatal("a stalled leaf must never leave the root complete")
+	live, _ := o.tree.CloneNode(o.tree.RootID)
+	if live.State != models.TaskStatePending || live.Type != models.NodeTypeLeaf {
+		t.Fatalf("state=%s type=%s, want PENDING leaf", live.State, live.Type)
 	}
-
-	// The intervention has to be visible in the audit trail.
+	if len(live.ErrorHistory) != 0 {
+		t.Fatalf("stall history should reset, got %d", len(live.ErrorHistory))
+	}
 	ev, err := os.ReadFile(o.EventPath())
 	if err != nil || !strings.Contains(string(ev), "leaf_stall") {
 		t.Fatalf("expected a leaf_stall event in %s (err=%v)", o.EventPath(), err)
@@ -213,11 +170,11 @@ func TestOrchestrator_NoStallWhenFailuresDiffer(t *testing.T) {
 	}
 	defer o.Close()
 
-	if err := o.Run(context.Background()); err == nil {
-		t.Fatal("run should fail")
-	}
-	if attempts != 3 {
-		t.Fatalf("with stall detection off the leaf should retry until MaxRetries, ran %d", attempts)
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+	_ = o.Run(ctx)
+	if attempts < 3 {
+		t.Fatalf("with stall detection off the leaf should keep retrying past MaxRetries, ran %d", attempts)
 	}
 	if ev, err := os.ReadFile(o.EventPath()); err == nil && strings.Contains(string(ev), "leaf_stall") {
 		t.Fatal("no leaf_stall event should be recorded when detection is off")

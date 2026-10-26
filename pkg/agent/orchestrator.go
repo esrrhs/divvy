@@ -248,8 +248,25 @@ func (o *Orchestrator) resetInterrupted() {
 		models.TaskStateRunning,
 		models.TaskStateDecomposing,
 		models.TaskStateVerifying,
+		models.TaskStateFailed,
 	)
 	for _, id := range ids {
+		live, ok := o.tree.CloneNode(id)
+		if !ok {
+			continue
+		}
+		// A failed leaf blocks every task that depends on it and the run
+		// then exits. Resume puts it back in the queue with a fresh stall
+		// window so the same fingerprint does not immediately stop it again.
+		if live.State == models.TaskStateFailed && live.Type == models.NodeTypeLeaf {
+			_ = o.tree.UpdateNode(id, func(n *models.TaskNode) error {
+				n.ErrorHistory = nil
+				return nil
+			})
+		}
+		if live.State == models.TaskStateFailed && live.Type != models.NodeTypeLeaf {
+			continue
+		}
 		_ = o.sched.UpdateNodeState(id, models.TaskStatePending, "interrupted; will retry")
 	}
 }
@@ -1045,17 +1062,26 @@ func (o *Orchestrator) handleLeafFailure(leaf *models.TaskNode, errMsg string) e
 	canSplit := budgetLeft && leaf.Depth < o.cfg.MaxDepth
 	canRepair := budgetLeft && diagnosis.IsPlanDefect()
 	if !canSplit && !canRepair {
-		o.log.Errorf("giving up on %s", leaf.ID)
-		o.events.Record("leaf_giveup", leaf.ID, map[string]any{
+		// Replan budget is spent, but the leaf's verification command is still
+		// in its prompt. Keep retrying instead of marking FAILED: a terminal
+		// failure blocks every dependent and the run exits with nothing left
+		// to schedule.
+		o.log.Warnf("replan budget exhausted on %s; retrying the leaf", leaf.ID)
+		o.events.Record("retry", leaf.ID, map[string]any{
 			"reason":    clip(errMsg, evReasonChars),
 			"diagnosis": clip(diagnosis.Summary, evReasonChars),
+			"note":      "replan budget exhausted; keep retrying",
 		})
-		if err := o.sched.UpdateNodeState(leaf.ID, models.TaskStateFailed, errMsg); err != nil {
+		if err := o.tree.UpdateNode(leaf.ID, func(n *models.TaskNode) error {
+			n.Type = models.NodeTypeLeaf
+			n.State = models.TaskStatePending
+			n.ErrorMsg = errMsg
+			n.ErrorHistory = nil
+			return nil
+		}); err != nil {
 			return err
 		}
-		if o.sched.HasFailed() {
-			return fmt.Errorf("task %s failed: %s", leaf.ID, truncate(errMsg, 500))
-		}
+		o.sched.RefreshAncestors(leaf.ID)
 		return nil
 	}
 

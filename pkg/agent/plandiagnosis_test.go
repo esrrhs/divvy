@@ -153,10 +153,14 @@ func TestHandleLeafFailure_TooBigAtMaxDepthGivesUp(t *testing.T) {
 		return nil
 	})
 
-	err = o.handleLeafFailure(leaf, "worker out of steps before finish")
-	// Root may fail when its only child fails; that still counts as giving up.
+	if err := o.handleLeafFailure(leaf, "worker out of steps before finish"); err != nil {
+		t.Fatal(err)
+	}
 	live, _ := o.tree.CloneNode("deep")
-	if live.State != models.TaskStateFailed {
-		t.Fatalf("state=%s want FAILED when too-big at max depth (err=%v)", live.State, err)
+	if live.State != models.TaskStatePending || live.Type != models.NodeTypeLeaf {
+		t.Fatalf("state=%s type=%s, want PENDING leaf so the run keeps retrying", live.State, live.Type)
+	}
+	if len(live.ErrorHistory) != 0 {
+		t.Fatalf("stall history should reset, got %d records", len(live.ErrorHistory))
 	}
 }
