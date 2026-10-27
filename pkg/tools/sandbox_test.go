@@ -104,14 +104,43 @@ func TestSandbox_PathEscapeAndCRUD(t *testing.T) {
 func pgrepSleep(seconds int) string {
 	target := "sleep " + strconv.Itoa(seconds)
 	for i := 0; i < 20; i++ {
-		out, err := exec.Command("pgrep", "-f", target).Output()
-		if err != nil || strings.TrimSpace(string(out)) == "" {
+		if !anyExactSleep(target) {
 			return ""
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	out, _ := exec.Command("pgrep", "-f", target).Output()
-	return strings.TrimSpace(string(out))
+	if !anyExactSleep(target) {
+		return ""
+	}
+	// Report the offender's real command so a failure names the actual leak.
+	out, _ := exec.Command("ps", "-axo", "pid=,command=").Output()
+	var leaked []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if strings.HasSuffix(strings.TrimSpace(line), target) {
+			leaked = append(leaked, strings.TrimSpace(line))
+		}
+	}
+	return strings.Join(leaked, "\n")
+}
+
+// anyExactSleep reports whether a process whose full command line is exactly
+// target is running. pgrep -f is a substring match — "sleep 48" would also
+// hit unrelated "sleep 480" shells — so candidates are re-checked with ps.
+func anyExactSleep(target string) bool {
+	out, err := exec.Command("pgrep", "-f", target).Output()
+	if err != nil || strings.TrimSpace(string(out)) == "" {
+		return false
+	}
+	for _, pid := range strings.Fields(string(out)) {
+		cmd, err := exec.Command("ps", "-p", pid, "-o", "command=").Output()
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(string(cmd)) == target {
+			return true
+		}
+	}
+	return false
 }
 
 func TestSandbox_ReadFileLines(t *testing.T) {
