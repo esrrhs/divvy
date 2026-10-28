@@ -31,7 +31,7 @@ Rules:
 - If the work is a single file or a single function plus its test, set is_atomic=true, fill contract+dod for THIS task, and use an empty subtasks array.
 - Otherwise set is_atomic=false and produce 2 to 6 subtasks. Never produce a single child.
 - Prefer LEAF tasks. Only use COMPOUND when a child is still a whole subsystem.
-- Every LEAF must have at least one shell verification command that can run in the project workspace (go test, go build, test -f, grep -n, python -m unittest, etc.).
+- Every LEAF must have at least one shell verification command that can run in the project workspace (go test, go build, test -f, grep -F, python -m unittest, etc.). When checking code with grep, always use "grep -F" so characters like *, (, ) are matched literally rather than as regular expressions.
 - When the goal is a RUNNABLE program, server, API, CLI, or daemon, the LAST subtask MUST be an integration leaf (id like "integrate"): it wires every other layer together, creates the entry point (e.g. main.go), and its contract dependencies list ALL other subtasks. Its outputs include the entry file.
 - The TOP-LEVEL dod is goal-level acceptance, not a build of one package: its commands must actually EXERCISE the finished deliverable end to end. For an HTTP service, build it, start it briefly, hit a real endpoint with curl, then stop it. Example command:
   go build -o /tmp/smoke_app . && (/tmp/smoke_app & SRV=$!; sleep 1; curl -sf http://127.0.0.1:18080/tasks; RC=$?; kill $SRV; exit $RC)

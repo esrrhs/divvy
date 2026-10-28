@@ -216,6 +216,9 @@ func TestPlanPruneOnMissingBaseDir(t *testing.T) {
 // with a read-only base directory nothing can be deleted and the paths come
 // back as kept.
 func TestPruneSessionsRemoveError(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("chmod-based failure injection does not work as root")
+	}
 	tmp := t.TempDir()
 	s, err := NewStorage(tmp)
 	if err != nil {
@@ -262,6 +265,9 @@ func TestDeleteSessionStatError(t *testing.T) {
 // TestDeleteSessionRemoveErrors covers both remove-failure paths (tree file
 // and LATEST pointer) when the storage directory is read-only.
 func TestDeleteSessionRemoveErrors(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("chmod-based failure injection does not work as root")
+	}
 	tmp := t.TempDir()
 	s, err := NewStorage(tmp)
 	if err != nil {

@@ -3,6 +3,7 @@ package tools
 import (
 	"bytes"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 )
@@ -30,13 +31,15 @@ func CommitAll(dir, msg string) (committed bool, hash string, err error) {
 
 	var commitOut bytes.Buffer
 	commit := exec.Command("git", "-C", dir, "commit", "-m", msg)
+	commit.Env = append(os.Environ(), "LC_ALL=C", "LANG=C")
 	commit.Stdout = &commitOut
 	commit.Stderr = &commitOut
 	if err := commit.Run(); err != nil {
-		if strings.Contains(commitOut.String(), "nothing to commit") {
+		outStr := commitOut.String()
+		if strings.Contains(outStr, "nothing to commit") || strings.Contains(outStr, "nothing added to commit") || strings.Contains(outStr, "无文件要提交") {
 			return false, "", nil
 		}
-		return false, "", fmt.Errorf("git commit: %v: %s", err, strings.TrimSpace(commitOut.String()))
+		return false, "", fmt.Errorf("git commit: %v: %s", err, strings.TrimSpace(outStr))
 	}
 
 	rev := exec.Command("git", "-C", dir, "rev-parse", "--short", "HEAD")

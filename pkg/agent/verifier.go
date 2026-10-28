@@ -58,6 +58,16 @@ func (o *Orchestrator) verify(ctx context.Context, sb *tools.Sandbox, node *mode
 			return VerifyResult{OK: false, Command: cmd, Output: msg, ExitCode: -1}
 		}
 		if res.ExitCode != 0 {
+			if fbCmd, ok := asFixedStringGrep(cmd); ok {
+				fbRes, fbErr := sb.RunBash(ctx, fbCmd, timeout)
+				if fbErr == nil && fbRes.ExitCode == 0 && !fbRes.TimedOut {
+					o.log.Warnf("verify: grep failed as regex, but succeeded with -F (%s); accepting match", fbCmd)
+					res = fbRes
+					fmt.Fprintf(&combined, "$ %s (fallback -F)\nexit 0\n%s\n%s\n", fbCmd, fbRes.Stdout, fbRes.Stderr)
+				}
+			}
+		}
+		if res.ExitCode != 0 {
 			o.log.Errorf("verify failed: %s (exit %d)", cmd, res.ExitCode)
 			o.events.Record("verify", node.ID, map[string]any{
 				"command": cmd, "ok": false, "exit_code": res.ExitCode,
@@ -189,4 +199,34 @@ func (o *Orchestrator) withDiagnostics(sb *tools.Sandbox, raw string) string {
 		return compact + "\n" + raw
 	}
 	return raw
+}
+
+// asFixedStringGrep checks if cmd invokes grep without fixed-string or extended-regex flags,
+// and returns the command rewritten with `grep -F ` so literal code strings (like Go function signatures) match.
+func asFixedStringGrep(cmd string) (string, bool) {
+	trimmed := strings.TrimSpace(cmd)
+	if !strings.HasPrefix(trimmed, "grep ") && !strings.Contains(trimmed, " grep ") && !strings.Contains(trimmed, "|grep ") {
+		return "", false
+	}
+	fields := strings.Fields(cmd)
+	isGrep := false
+	for _, f := range fields {
+		if f == "grep" {
+			isGrep = true
+			continue
+		}
+		if isGrep && strings.HasPrefix(f, "-") {
+			if strings.ContainsAny(f, "FEPE") {
+				return "", false
+			}
+		}
+		if isGrep && !strings.HasPrefix(f, "-") {
+			break
+		}
+	}
+	idx := strings.Index(cmd, "grep ")
+	if idx < 0 {
+		return "", false
+	}
+	return cmd[:idx] + "grep -F " + cmd[idx+5:], true
 }

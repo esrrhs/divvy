@@ -1,6 +1,9 @@
+//go:build !windows
+
 package main
 
 import (
+	"io"
 	"net"
 	"os"
 	"runtime"
@@ -68,6 +71,10 @@ func TestRunServe_ShutdownOnSignal(t *testing.T) {
 	runErr := <-done
 	os.Stdout = orig
 	w.Close()
+
+	rest, _ := io.ReadAll(r)
+	banner.Write(rest)
+	_ = r.Close()
 
 	if runErr != nil {
 		t.Fatalf("runServe must shut down cleanly: %v", runErr)

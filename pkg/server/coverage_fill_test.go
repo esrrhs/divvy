@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
@@ -464,9 +463,7 @@ func TestCovFSListEntryTypes(t *testing.T) {
 	if err := os.Symlink(outside, filepath.Join(work, "link-out")); err != nil {
 		t.Fatal(err)
 	}
-	if err := syscall.Mkfifo(filepath.Join(work, "pipe"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	hasFifo := makeTestFifo(t, filepath.Join(work, "pipe"))
 
 	status, body := fsGet(t, ts.URL+"/api/fs/list?token=test-token")
 	if status != http.StatusOK {
@@ -502,7 +499,7 @@ func TestCovFSListEntryTypes(t *testing.T) {
 	if types["link-out"] != "symlink" || !escaped["link-out"] {
 		t.Fatalf("escaping symlink = %+v", types)
 	}
-	if types["pipe"] != "other" {
+	if hasFifo && types["pipe"] != "other" {
 		t.Fatalf("fifo type = %q", types["pipe"])
 	}
 	if types["in.txt"] != "file" || types["adir"] != "dir" || types["zfile.txt"] != "file" {
@@ -539,9 +536,7 @@ func TestCovFSFileEdges(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(work, "zdir"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := syscall.Mkfifo(filepath.Join(work, "pipe"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	hasFifo := makeTestFifo(t, filepath.Join(work, "pipe"))
 	big := filepath.Join(work, "tenkb.txt")
 	if err := os.WriteFile(big, []byte(strings.Repeat("a", 10*1024)), 0o644); err != nil {
 		t.Fatal(err)
@@ -563,9 +558,14 @@ func TestCovFSFileEdges(t *testing.T) {
 		{"link-in", http.StatusOK},
 		{"link-dangling", http.StatusNotFound},
 		{"link-dir", http.StatusBadRequest},
-		{"pipe", http.StatusBadRequest},
 		{"locked.txt", http.StatusInternalServerError},
 		{"tenkb.txt", http.StatusOK},
+	}
+	if hasFifo {
+		cases = append(cases, struct {
+			path string
+			want int
+		}{"pipe", http.StatusBadRequest})
 	}
 	for _, c := range cases {
 		status, body := fsGet(t, ts.URL+"/api/fs/file?token=test-token&path="+c.path)

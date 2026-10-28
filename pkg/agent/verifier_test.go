@@ -303,3 +303,24 @@ func TestVerify_GoFailurePrependsCompactDiagnostics(t *testing.T) {
 		t.Fatalf("raw output must follow the compact block:\n%s", vr.Output)
 	}
 }
+
+func TestVerify_GrepFixedStringFallback(t *testing.T) {
+	sb, err := tools.NewSandbox(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sb.WriteFile("test.go", "func TestAdd(t *testing.T) {\n\t// code\n}\n"); err != nil {
+		t.Fatal(err)
+	}
+	o := &Orchestrator{log: SilentLogger()}
+	node := &models.TaskNode{
+		DoD: models.DoD{
+			Commands:   []string{`grep "(t *testing.T)" test.go`},
+			TimeoutSec: 10,
+		},
+	}
+	vr := o.verify(context.Background(), sb, node)
+	if !vr.OK {
+		t.Fatalf("expected grep fallback with -F to succeed, got: %s", vr.Output)
+	}
+}
