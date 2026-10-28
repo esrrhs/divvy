@@ -6,7 +6,6 @@ import (
 	"io"
 	"net"
 	"os"
-	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -19,9 +18,6 @@ import (
 // token URL, then delivers SIGINT to prove the graceful shutdown path runs
 // (listener drained, runs interrupted, nil error).
 func TestRunServe_ShutdownOnSignal(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("signal-driven shutdown test is POSIX-only")
-	}
 	cfg := agent.DefaultConfig()
 	cfg.WorkDir = t.TempDir()
 	cfg.DataDir = t.TempDir()
@@ -88,9 +84,6 @@ func TestRunServe_ShutdownOnSignal(t *testing.T) {
 // TestRunServe_PortTakenFails covers the listener error branch: an occupied
 // port must surface as an error from runServe.
 func TestRunServe_PortTakenFails(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("signal-driven test setup is POSIX-only")
-	}
 	// Grab a live listener so Start cannot bind it.
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
