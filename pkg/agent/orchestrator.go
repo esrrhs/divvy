@@ -341,6 +341,12 @@ func (o *Orchestrator) Run(ctx context.Context) (runErr error) {
 	}
 	reportPlanWarnings()
 
+	// A resumed tree may have been planned before structural completeness was
+	// enforced (or by a planner that ignored the instruction). Heal it before
+	// any leaf runs: a goal-level acceptance with nothing to route its failure
+	// to is a dead end that -resume can never escape.
+	o.healPlanStructure()
+
 	parallel := o.parallel()
 	done := make(chan string, 64)
 	var mu sync.Mutex

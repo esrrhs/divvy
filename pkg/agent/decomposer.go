@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -57,7 +58,13 @@ func (o *Orchestrator) decompose(ctx context.Context, node *models.TaskNode) err
 
 	var lastErr error
 	for attempt := 1; ; attempt++ {
-		if lastErr != nil {
+		var planErr *planIncompleteError
+		structureIssue := errors.As(lastErr, &planErr)
+
+		// A structural replan is a conversation with the planner, not a
+		// transient failure: retrying immediately with a pointed message is
+		// the whole point, so no backoff.
+		if lastErr != nil && !structureIssue {
 			delay := RetryDelay(attempt-1, o.cfg.retryMin(), o.cfg.retryMax())
 			o.log.Warnf("decompose %s failed: %v; retry in %s", node.ID, lastErr, delay)
 			_ = o.checkpoint()
@@ -67,7 +74,16 @@ func (o *Orchestrator) decompose(ctx context.Context, node *models.TaskNode) err
 		}
 
 		messages := append([]llm.Message{}, base...)
-		if lastErr != nil {
+		switch {
+		case structureIssue:
+			messages = append(messages, llm.Message{
+				Role: llm.RoleUser,
+				Content: "Your plan is structurally incomplete:\n" + planErr.Error() +
+					"\n\nRe-issue the WHOLE plan with this fixed. Every path and command in the " +
+					"goal-level DoD must be produced by some subtask, and a runnable goal needs a " +
+					"subtask that creates its entry point. Return ONLY corrected JSON.",
+			})
+		case lastErr != nil:
 			messages = append(messages, llm.Message{
 				Role:    llm.RoleUser,
 				Content: "Your previous JSON was invalid:\n" + lastErr.Error() + "\n\nReturn ONLY corrected JSON.",
@@ -102,7 +118,7 @@ func (o *Orchestrator) decompose(ctx context.Context, node *models.TaskNode) err
 			}
 		}
 
-		if o.cfg.DecomposeTries > 0 && attempt >= o.cfg.DecomposeTries {
+		if o.cfg.DecomposeTries > 0 && attempt >= o.cfg.DecomposeTries && !structureIssue {
 			o.log.Warnf("decompose failed for %s: %v; forcing leaf", node.ID, lastErr)
 			return o.forceLeaf(node)
 		}
@@ -122,11 +138,17 @@ func (o *Orchestrator) decomposeUserPrompt(node *models.TaskNode) string {
 	b.WriteString("\nExisting DoD:\n")
 	b.WriteString(formatDoD(node.DoD))
 	if node.ErrorMsg != "" {
-		if strings.Contains(node.ErrorMsg, planRepairMarker) {
+		switch {
+		case strings.Contains(node.ErrorMsg, planStructureMarker):
+			fmt.Fprintf(&b, "\nPrevious plan was structurally incomplete — fix the SHAPE of the "+
+				"plan before splitting further (a subtask must produce the entry point and every "+
+				"path the goal-level DoD runs):\n%s\n",
+				truncate(node.ErrorMsg, 2500))
+		case strings.Contains(node.ErrorMsg, planRepairMarker):
 			fmt.Fprintf(&b, "\nPrevious failure — DIAGNOSE THE PLAN FIRST (DoD/contract may be wrong; "+
 				"prefer is_atomic=true and fix expected_output/commands before splitting further):\n%s\n",
 				truncate(node.ErrorMsg, 2500))
-		} else {
+		default:
 			fmt.Fprintf(&b, "\nPrevious failure (you MUST split smaller and address this):\n%s\n", truncate(node.ErrorMsg, 2500))
 		}
 	}
@@ -206,6 +228,36 @@ func (o *Orchestrator) applyDecompose(node *models.TaskNode, parsed decomposeRes
 	if err := o.sched.ValidateDependencies(); err != nil {
 		_ = o.tree.ResetChildren(node.ID)
 		return err
+	}
+
+	// A runnable goal whose plan cannot assemble is unrecoverable later: the
+	// goal-level acceptance has no integration leaf to route its failure to,
+	// so the root goes straight to FAILED and no retry can repair it. Catch it
+	// here, while every leaf is still unexecuted and a replan is still cheap.
+	if node.ID == o.tree.RootID {
+		if blockers := o.planBlockers(); len(blockers) > 0 {
+			// node is a snapshot taken before decomposition; read the live
+			// counter or the replan budget never advances and this loops.
+			cur, _ := o.tree.CloneNode(node.ID)
+			if cur != nil && cur.DecomposeCount < o.cfg.MaxRedecompose {
+				o.log.Warnf("plan is structurally incomplete, replanning %s:", node.ID)
+				for _, b := range blockers {
+					o.log.Warnf("  - %s", b)
+				}
+				_ = o.tree.UpdateNode(node.ID, func(n *models.TaskNode) error {
+					n.DecomposeCount++
+					n.ErrorMsg = planStructureMarker + strings.Join(blockers, "\n")
+					return nil
+				})
+				_ = o.tree.ResetChildren(node.ID)
+				return &planIncompleteError{blockers: blockers}
+			}
+			// Out of replan budget: stop negotiating with the planner and add
+			// the missing piece ourselves, so the goal stays reachable.
+			if _, err := o.ensureIntegrationLeaf(strings.Join(blockers, "; ")); err != nil {
+				return fmt.Errorf("plan incomplete and cannot heal: %w", err)
+			}
+		}
 	}
 
 	return o.sched.UpdateNodeState(node.ID, models.TaskStateRunning, "")
