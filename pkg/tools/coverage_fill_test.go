@@ -1066,7 +1066,7 @@ func TestCovClassifyWalkErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	m.Close() // mirror directory gone
-	if _, _, _, err := m.classifyChanges(); err == nil {
+	if _, _, _, _, err := m.classifyChanges(); err == nil {
 		t.Fatal("walking a vanished mirror must fail")
 	}
 	// A skipped-name directory inside the mirror is ignored.
@@ -1081,7 +1081,7 @@ func TestCovClassifyWalkErrors(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(m2.Dir, "node_modules", "junk.js"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	writes, removals, conflicts, err := m2.classifyChanges()
+	writes, removals, conflicts, _, err := m2.classifyChanges()
 	if err != nil || len(writes) != 0 || len(removals) != 0 || len(conflicts) != 0 {
 		t.Fatalf("ignored dirs must not be classified: %+v %+v %+v %v", writes, removals, conflicts, err)
 	}
@@ -1089,7 +1089,7 @@ func TestCovClassifyWalkErrors(t *testing.T) {
 	if err := os.Symlink(filepath.Join(m2.Dir, "a.txt"), filepath.Join(m2.Dir, "link.txt")); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, _, err = m2.classifyChanges(); err != nil {
+	if _, _, _, _, err = m2.classifyChanges(); err != nil {
 		t.Fatalf("symlink in mirror must be skipped: %v", err)
 	}
 }

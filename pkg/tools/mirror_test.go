@@ -691,3 +691,153 @@ func TestMirror_RepoWithoutCommitsFallsBack(t *testing.T) {
 		t.Fatalf("file missing in copy mirror: %q", got)
 	}
 }
+
+func TestSymlinkSegment(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "real", "pkg", "a.go"), "package pkg\n")
+	if err := os.Symlink(filepath.Join("real", "pkg"), filepath.Join(root, "alias")); err != nil {
+		t.Skipf("symlinks unsupported here: %v", err)
+	}
+	cases := []struct {
+		rel  string
+		want bool
+		why  string
+	}{
+		{"real/pkg/a.go", false, "plain path"},
+		{"real/pkg/b.go", false, "plain path, missing file"},
+		{"alias/a.go", true, "first segment is a link"},
+		{"missing/a.go", false, "missing component has nothing to resolve"},
+		{"./alias/a.go", true, "dot prefix must not hide the link"},
+	}
+	for _, c := range cases {
+		if got := symlinkSegment(root, c.rel); got != c.want {
+			t.Errorf("symlinkSegment(%q) = %v, want %v (%s)", c.rel, got, c.want, c.why)
+		}
+	}
+
+	// A link nested below a real directory must be caught too: a merge would
+	// travel through it just the same.
+	if err := os.MkdirAll(filepath.Join(root, "outer"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("..", "real"), filepath.Join(root, "outer", "inner")); err != nil {
+		t.Skipf("symlinks unsupported here: %v", err)
+	}
+	if !symlinkSegment(root, "outer/inner/a.go") {
+		t.Error("nested symlink segment not detected")
+	}
+}
+
+// layoutFixture builds a workspace whose tree is reachable two ways: the real
+// directory internal/core and the symlink core -> internal/core. This is the
+// shape that makes a new mirror path look like an existing workspace file to
+// anything that resolves links while comparing digests.
+func layoutFixture(t *testing.T) (src string, m *Mirror) {
+	t.Helper()
+	src = t.TempDir()
+	writeFile(t, filepath.Join(src, "internal", "core", "core.go"), "package core\n")
+	writeFile(t, filepath.Join(src, "internal", "core", "core_test.go"), "package core // pre-existing\n")
+	if err := os.Symlink(filepath.Join("internal", "core"), filepath.Join(src, "core")); err != nil {
+		t.Skipf("symlinks unsupported here: %v", err)
+	}
+	m, err := NewMirror(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(m.Close)
+	return src, m
+}
+
+func TestMirror_MergeBackSymlinkedDestinationIsLayoutError(t *testing.T) {
+	src, m := layoutFixture(t)
+
+	// The leaf works under the alias. The copy mirror never carried the link
+	// (copyTree skips non-regular files), so this is a plain new directory
+	// there and the leaf has no way to notice the discrepancy.
+	writeFile(t, filepath.Join(m.Dir, "core", "core_test.go"), "package core // from leaf\n")
+	writeFile(t, filepath.Join(m.Dir, "notes.txt"), "unrelated\n")
+
+	merged, deleted, err := m.MergeBack()
+	var layoutErr *MirrorLayoutError
+	if !errors.As(err, &layoutErr) {
+		t.Fatalf("want MirrorLayoutError, got %v (merged=%v deleted=%v)", err, merged, deleted)
+	}
+	if len(layoutErr.Paths) != 1 || layoutErr.Paths[0] != "core/core_test.go" {
+		t.Fatalf("layout paths = %v, want [core/core_test.go]", layoutErr.Paths)
+	}
+	if !strings.Contains(err.Error(), "symlink") {
+		t.Errorf("message should name the cause, got %q", err.Error())
+	}
+
+	// A layout problem is not a concurrency conflict: classifying it as one
+	// sends the caller into a re-snapshot loop that cannot converge.
+	var conflictErr *MergeConflictError
+	if errors.As(err, &conflictErr) {
+		t.Errorf("layout problem reported as MergeConflictError: %v", conflictErr)
+	}
+
+	// All-or-nothing still holds: the unrelated, mergeable file is not
+	// written when the merge is refused.
+	if _, statErr := os.Stat(filepath.Join(src, "notes.txt")); !os.IsNotExist(statErr) {
+		t.Error("notes.txt was merged despite the layout error")
+	}
+	if got := readFile(t, filepath.Join(src, "internal", "core", "core_test.go")); got != "package core // pre-existing\n" {
+		t.Errorf("file behind the link was modified: %q", got)
+	}
+}
+
+func TestMirror_MergeBackSymlinkedDestinationMergesAfterFix(t *testing.T) {
+	src, m := layoutFixture(t)
+	writeFile(t, filepath.Join(m.Dir, "core", "core_test.go"), "package core // from leaf\n")
+	writeFile(t, filepath.Join(m.Dir, "notes.txt"), "unrelated\n")
+
+	// The documented fix: replace the alias with a real directory.
+	if err := os.Remove(filepath.Join(src, "core")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(src, "core"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	merged, _, err := m.MergeBack()
+	if err != nil {
+		t.Fatalf("merge after layout fix: %v", err)
+	}
+	if len(merged) != 2 {
+		t.Fatalf("merged = %v, want 2 entries", merged)
+	}
+	if got := readFile(t, filepath.Join(src, "core", "core_test.go")); got != "package core // from leaf\n" {
+		t.Errorf("merged content = %q", got)
+	}
+	if got := readFile(t, filepath.Join(src, "notes.txt")); got != "unrelated\n" {
+		t.Errorf("notes.txt = %q", got)
+	}
+	// The real package directory is untouched: the leaf wrote to the alias
+	// path, and the merge must not fan out to both.
+	if got := readFile(t, filepath.Join(src, "internal", "core", "core_test.go")); got != "package core // pre-existing\n" {
+		t.Errorf("real package file = %q", got)
+	}
+}
+
+func TestMirror_PreviewChangesMarksSymlinkedDestination(t *testing.T) {
+	_, m := layoutFixture(t)
+	writeFile(t, filepath.Join(m.Dir, "core", "core_test.go"), "package core // from leaf\n")
+
+	changes, err := m.PreviewChanges()
+	if err != nil {
+		t.Fatalf("preview: %v", err)
+	}
+	var found bool
+	for _, c := range changes {
+		if c.Path != "core/core_test.go" {
+			continue
+		}
+		found = true
+		if !c.Conflict {
+			t.Error("path through a symlink must be flagged so approval cannot merge it")
+		}
+	}
+	if !found {
+		t.Fatalf("change list has no entry for core/core_test.go: %+v", changes)
+	}
+}

@@ -52,7 +52,7 @@ func run(args []string) error {
 	parallelN := fs.Int("parallel", cfg.Parallel, "leaves to execute concurrently (only safe when leaves touch different files, unless -isolate)")
 	isolate := fs.Bool("isolate", false, "run each leaf in a workspace mirror, merge only on success (default: on when -parallel > 1)")
 	plan := fs.Bool("plan", false, "decompose into a task tree and exit without executing (run later with -resume)")
-	strict := fs.Bool("strict", false, "with -plan: exit non-zero when the plan check reports warnings")
+	strict := fs.Bool("strict", false, "with -plan: exit non-zero when the plan or workspace layout check reports warnings")
 	gitCommit := fs.Bool("git-commit", false, "git commit each leaf's merged changes (workdir must be a git repo)")
 	native := fs.Bool("native-tools", false, "use OpenAI tool_calls instead of JSON actions")
 	web := fs.Bool("web", false, "enable outbound web_search/web_fetch/http_request for leaves (offline by default)")

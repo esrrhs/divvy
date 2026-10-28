@@ -317,6 +317,14 @@ func (o *Orchestrator) Run(ctx context.Context) (runErr error) {
 	if saved := o.tree.TotalTokenUsage(); saved.Calls > 0 {
 		o.log.Infof("tokens so far: %d (%d calls)", saved.TotalTokens, saved.Calls)
 	}
+	// Workspace consistency is reported before any leaf runs: an alias or a
+	// module/tree mismatch makes one file addressable two ways, and a leaf
+	// working inside an isolated mirror cannot see the workspace well enough to
+	// notice. Left unreported it surfaces as a merge conflict or as a leaf
+	// guessing at a data problem it did not create.
+	for _, w := range o.layoutWarnings() {
+		o.log.Warnf("layout check: %s", w)
+	}
 	o.printTree()
 
 	if err := o.checkpoint(); err != nil {
@@ -540,6 +548,36 @@ func (o *Orchestrator) Run(ctx context.Context) (runErr error) {
 	}
 }
 
+// layoutWarnings formats workspace-level inconsistencies that make a path mean
+// more than one thing (symlink aliases, module path vs. directory tree).
+//
+// These are deliberately not blockers: a symlink can be perfectly legitimate
+// in a real project, and the workspace belongs to the user, not to divvy. They
+// are reported once, up front, so the problem is visible before a leaf spends
+// its budget rediscovering it — and -strict turns them into a failure for
+// unattended runs that should not start on a workspace that needs fixing.
+func (o *Orchestrator) layoutWarnings() []string {
+	issues, err := tools.CheckLayout(o.sandbox.Root)
+	if err != nil {
+		o.log.Debugf("layout check: %v", err)
+		return nil
+	}
+	if len(issues) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(issues))
+	paths := make([]string, 0, len(issues))
+	for _, is := range issues {
+		paths = append(paths, is.Path)
+		out = append(out, fmt.Sprintf("%s (%s): %s", is.Path, is.Kind, is.Detail))
+	}
+	o.events.Record("layout_warning", "", map[string]any{
+		"count": len(issues),
+		"paths": clip(strings.Join(paths, ", "), evReasonChars),
+	})
+	return out
+}
+
 // RunPlan decomposes the goal into a full tree of leaves without executing any
 // of them. The saved session can later be executed with -resume.
 func (o *Orchestrator) RunPlan(ctx context.Context) (runErr error) {
@@ -586,13 +624,21 @@ func (o *Orchestrator) RunPlan(ctx context.Context) (runErr error) {
 	for _, w := range warns {
 		o.log.Warnf("plan check: %s", w)
 	}
+	// Workspace layout is reported next to the plan check because both answer
+	// "is it safe to start executing?" — one about the tree, one about the
+	// ground it runs on.
+	layoutWarns := o.layoutWarnings()
+	for _, w := range layoutWarns {
+		o.log.Warnf("layout check: %s", w)
+	}
+	totalWarns := len(warns) + len(layoutWarns)
 
 	o.printTree()
 	_, total, _ := o.tree.GetLeafProgress()
 	o.logUsage()
-	if len(warns) > 0 {
+	if totalWarns > 0 {
 		o.log.Warnf("plan ready: %d leaf tasks, %d warning(s) (execute with: -resume -session %s)",
-			total, len(warns), o.tree.ID)
+			total, totalWarns, o.tree.ID)
 	} else {
 		o.log.Okf("plan ready: %d leaf tasks, no issues (execute with: -resume -session %s)",
 			total, o.tree.ID)
@@ -600,8 +646,8 @@ func (o *Orchestrator) RunPlan(ctx context.Context) (runErr error) {
 	if err := o.checkpoint(); err != nil {
 		return err
 	}
-	if o.cfg.Strict && len(warns) > 0 {
-		return fmt.Errorf("plan check failed: %d warning(s)", len(warns))
+	if o.cfg.Strict && totalWarns > 0 {
+		return fmt.Errorf("plan check failed: %d warning(s)", totalWarns)
 	}
 	return nil
 }
@@ -861,6 +907,19 @@ func (o *Orchestrator) executeLeaf(ctx context.Context, leaf *models.TaskNode) e
 					prevErr = merr.Error()
 					o.recordNodeError(leaf.ID, prevErr)
 					o.log.Warnf("publish failed for %s (attempt %d): %v", leaf.ID, attempt, merr)
+					// A layout problem (the destination resolves through a
+					// symlink) is not a sibling race: a fresh snapshot resolves
+					// the same link the same way, and the leaf cannot fix it by
+					// trying again. Fail with the structural reason instead of
+					// burning the retry budget on an unwinnable loop.
+					var layout *tools.MirrorLayoutError
+					if errors.As(merr, &layout) {
+						o.log.Errorf("%s cannot be merged, workspace layout is inconsistent", leaf.ID)
+						if err := o.sched.UpdateNodeState(leaf.ID, models.TaskStateFailed, layout.Error()); err != nil {
+							return err
+						}
+						return nil
+					}
 					// A merge conflict means a sibling leaf committed a change
 					// to the same files after this mirror was taken. Retrying
 					// against the same mirror would hit the identical

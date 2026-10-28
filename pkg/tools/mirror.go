@@ -218,17 +218,59 @@ func (e *MergeConflictError) Error() string {
 		"re-run this leaf against a fresh workspace copy", strings.Join(e.Paths, ", "))
 }
 
+// MirrorLayoutError reports mirror paths that cannot be merged because the
+// destination in the source workspace resolves through a symlink: writing
+// there would land wherever the link points, not at the path being merged.
+//
+// This is not a concurrency conflict. No sibling leaf is involved, and a fresh
+// snapshot resolves the same link the same way, so retrying is pure waste.
+// Keeping it a distinct type lets the caller stop instead of looping, and lets
+// the message name the actual problem — a workspace layout that needs fixing.
+type MirrorLayoutError struct {
+	Paths []string
+}
+
+func (e *MirrorLayoutError) Error() string {
+	return fmt.Sprintf("merge blocked on %s: the destination path resolves through a symlink, "+
+		"so merging would write outside the tree this leaf worked in; "+
+		"remove the symlink (or make it a real directory) and re-run",
+		strings.Join(e.Paths, ", "))
+}
+
 // mirrorWrite is one file the leaf created or modified, pending merge.
 type mirrorWrite struct {
 	rel string
 	dst string
 }
 
+// symlinkSegment reports whether any path segment of rel under root is a
+// symlink. os.Stat would silently resolve it, and a merge through it would
+// write somewhere other than the path the mirror believes it is merging into.
+func symlinkSegment(root, rel string) bool {
+	cur := root
+	for _, seg := range strings.Split(filepath.ToSlash(rel), "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			continue
+		}
+		cur = filepath.Join(cur, seg)
+		info, err := os.Lstat(cur)
+		if err != nil {
+			// Missing component: nothing to resolve through.
+			return false
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // classifyChanges diffs the mirror against its snapshot and the live source
 // workspace without touching anything: writes (added/modified, mergeable),
-// removals (deleted, mergeable) and conflicts (a sibling changed the same
-// path after the snapshot; MergeBack must refuse them).
-func (m *Mirror) classifyChanges() (writes []mirrorWrite, removals, conflicts []string, err error) {
+// removals (deleted, mergeable), conflicts (a sibling changed the same path
+// after the snapshot; MergeBack must refuse them) and layout problems (the
+// destination resolves through a symlink; retrying cannot help).
+func (m *Mirror) classifyChanges() (writes []mirrorWrite, removals, conflicts, layout []string, err error) {
 	present := make(map[string]bool)
 
 	walkErr := filepath.WalkDir(m.Dir, func(p string, d fs.DirEntry, werr error) error {
@@ -277,6 +319,15 @@ func (m *Mirror) classifyChanges() (writes []mirrorWrite, removals, conflicts []
 			// to merge.
 			return nil
 		}
+		// The file changes and merging will write it, so the destination must
+		// not resolve through a symlink. Checked before the snapshot/conflict
+		// logic on purpose: a path alias and a concurrent edit look identical
+		// from the digest alone, and calling this a conflict sends the caller
+		// into an endless re-snapshot loop.
+		if symlinkSegment(m.src, rel) {
+			layout = append(layout, rel)
+			return nil
+		}
 		baseSum, existedAtSnapshot := m.base[rel]
 		switch {
 		case !existedAtSnapshot:
@@ -297,7 +348,7 @@ func (m *Mirror) classifyChanges() (writes []mirrorWrite, removals, conflicts []
 		return nil
 	})
 	if walkErr != nil {
-		return nil, nil, nil, fmt.Errorf("merge mirror %s: %w", m.Dir, walkErr)
+		return nil, nil, nil, nil, fmt.Errorf("merge mirror %s: %w", m.Dir, walkErr)
 	}
 
 	// Deletions propagate only for files that existed at snapshot time, and
@@ -309,7 +360,7 @@ func (m *Mirror) classifyChanges() (writes []mirrorWrite, removals, conflicts []
 		dstPath := filepath.Join(m.src, filepath.FromSlash(rel))
 		currentSum, err := fileDigest(dstPath)
 		if err != nil && !os.IsNotExist(err) {
-			return nil, nil, nil, fmt.Errorf("check %s: %w", rel, err)
+			return nil, nil, nil, nil, fmt.Errorf("check %s: %w", rel, err)
 		}
 		if currentSum != baseSum {
 			conflicts = append(conflicts, rel)
@@ -320,7 +371,7 @@ func (m *Mirror) classifyChanges() (writes []mirrorWrite, removals, conflicts []
 	sort.Strings(conflicts)
 	sort.Slice(writes, func(i, j int) bool { return writes[i].rel < writes[j].rel })
 	sort.Strings(removals)
-	return writes, removals, conflicts, nil
+	return writes, removals, conflicts, layout, nil
 }
 
 // MergeBack copies files that are new or modified in the mirror into the
@@ -333,9 +384,15 @@ func (m *Mirror) classifyChanges() (writes []mirrorWrite, removals, conflicts []
 // *MergeConflictError naming the paths is returned. It returns
 // workspace-relative paths of merged and deleted files on success.
 func (m *Mirror) MergeBack() (merged, deleted []string, err error) {
-	writes, removals, conflicts, err := m.classifyChanges()
+	writes, removals, conflicts, layout, err := m.classifyChanges()
 	if err != nil {
 		return nil, nil, err
+	}
+	// Layout problems come first: they make the merge impossible rather than
+	// merely unsafe, and reporting them as conflicts would send the caller
+	// into a retry loop that can never converge.
+	if len(layout) > 0 {
+		return nil, nil, &MirrorLayoutError{Paths: layout}
 	}
 	if len(conflicts) > 0 {
 		return nil, nil, &MergeConflictError{Paths: conflicts}
@@ -431,16 +488,24 @@ func readPreviewContent(path string, total int) (content string, binary, truncat
 // human diff review, WITHOUT applying anything. Paths are sorted; conflicts
 // are included (flagged) so the UI can explain why approval cannot proceed.
 func (m *Mirror) PreviewChanges() ([]FileChange, error) {
-	writes, removals, conflicts, err := m.classifyChanges()
+	writes, removals, conflicts, layout, err := m.classifyChanges()
 	if err != nil {
 		return nil, err
 	}
-	conflictSet := make(map[string]bool, len(conflicts))
-	for _, c := range conflicts {
+	// Layout problems block approval exactly like conflicts do: the merge
+	// cannot be applied either way, and the reviewer needs to see which paths.
+	// They are tracked in one list because layout paths never reach writes, so
+	// anything that only iterates conflicts would silently hide them — a
+	// review that reports "no changes" while the merge is impossible.
+	blocked := make([]string, 0, len(conflicts)+len(layout))
+	blocked = append(blocked, conflicts...)
+	blocked = append(blocked, layout...)
+	conflictSet := make(map[string]bool, len(blocked))
+	for _, c := range blocked {
 		conflictSet[c] = true
 	}
 
-	out := make([]FileChange, 0, len(writes)+len(removals))
+	out := make([]FileChange, 0, len(writes)+len(removals)+len(blocked))
 	total := 0
 	for _, w := range writes {
 		fc := FileChange{Path: w.rel, Conflict: conflictSet[w.rel], OldMode: m.baseMode[w.rel]}
@@ -483,14 +548,14 @@ func (m *Mirror) PreviewChanges() ([]FileChange, error) {
 		out = append(out, fc)
 	}
 
-	// Conflicting paths that classification found but the writes/removals
-	// lists do not carry (they are neither mergeable writes nor removals)
-	// still need to be shown.
+	// Blocked paths that classification found but the writes/removals lists do
+	// not carry (they are neither mergeable writes nor removals) still need to
+	// be shown.
 	covered := make(map[string]bool, len(out))
 	for _, fc := range out {
 		covered[fc.Path] = true
 	}
-	for _, c := range conflicts {
+	for _, c := range blocked {
 		if covered[c] {
 			continue
 		}
