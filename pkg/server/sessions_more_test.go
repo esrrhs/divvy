@@ -285,4 +285,7 @@ func TestAPI_AddInstructionWhileRunning(t *testing.T) {
 		t.Fatalf("add while running: %d, want 200", status)
 	}
 	close(gate)
+	if err := h.Wait(); err != nil {
+		t.Fatal(err)
+	}
 }

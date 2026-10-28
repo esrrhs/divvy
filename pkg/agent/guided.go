@@ -77,7 +77,7 @@ func NewGuider(o *Orchestrator, io GuidedIO) *Guider {
 		o:        o,
 		io:       io,
 		askCh:    make(chan string),
-		answerCh: make(chan string),
+		answerCh: make(chan string, 1),
 	}
 }
 
@@ -261,7 +261,13 @@ func (g *Guider) execute(ctx context.Context) error {
 // user input (pause / queued plan changes) and worker questions.
 func (g *Guider) runLeafInteractive(ctx context.Context, leaf *models.TaskNode) error {
 	leafCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	defer func() {
+		cancel()
+		select {
+		case <-g.answerCh:
+		default:
+		}
+	}()
 
 	doneCh := make(chan error, 1)
 	go func() {
