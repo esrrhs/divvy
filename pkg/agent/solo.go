@@ -116,7 +116,11 @@ func (o *Orchestrator) RunSolo(ctx context.Context) (runErr error) {
 
 	var lastFailure, stallNote string
 	roundsRun := 0
-	for round := 1; round <= rounds; round++ {
+	// bonus holds one extra round back for the requirement audit. It is spent
+	// only when acceptance actually passes, so a run that never gets there is
+	// unaffected.
+	bonus := 0
+	for round := 1; round <= rounds+bonus; round++ {
 		roundsRun = round
 		if err := ctx.Err(); err != nil {
 			return err
@@ -150,6 +154,21 @@ func (o *Orchestrator) RunSolo(ctx context.Context) (runErr error) {
 			return ctx.Err()
 		}
 		if vr.OK {
+			if s.auditDue() {
+				// Acceptance commands are a floor. A measured run passed all of
+				// them while leaving a stated requirement unimplemented (a test
+				// suite the goal asked to be table-driven, and a demo whose
+				// print cadence was nothing like the goal's). Neither is
+				// expressible as a command, so one extra turn is spent making
+				// the model check the goal against the disk.
+				s.auditDone = true
+				bonus = 1
+				o.log.Actionf("acceptance passes; auditing each requirement against the goal before finishing")
+				o.events.Record("solo_audit", root.ID, map[string]any{"round": round})
+				s.msgs = append(s.msgs, llm.Message{Role: llm.RoleUser, Content: soloAuditPrompt(o.tree.Goal)})
+				_ = s.checkpoint()
+				continue
+			}
 			if summary == "" {
 				summary = "acceptance passed"
 			}
@@ -371,6 +390,16 @@ type soloSession struct {
 	stepFP   string
 	stepSame int
 	stepNags int
+
+	// auditDone marks the one-time requirement audit that runs after
+	// acceptance first passes.
+	auditDone bool
+}
+
+// auditDue reports whether the post-acceptance requirement audit is still owed.
+// A session with no goal text has nothing to audit.
+func (s *soloSession) auditDue() bool {
+	return !s.auditDone && strings.TrimSpace(s.o.tree.Goal) != ""
 }
 
 // soloStepNags caps how many times one round interrupts the guess loop. Two is
@@ -827,6 +856,25 @@ Change strategy:
 
 The full history of what you built is still in this conversation. Keep everything that already works.`,
 		same, vr.ExitCode, vr.Command, truncate(vr.Output, 6000))
+}
+
+// soloAuditPrompt is the last turn before a solo run reports success. It costs
+// one call and targets the one thing acceptance commands structurally cannot
+// cover: requirements written in prose.
+func soloAuditPrompt(goal string) string {
+	return fmt.Sprintf(`The acceptance commands pass. Before you call finish, audit the goal itself — they are a floor, not the definition of done.
+
+Go through the goal one requirement at a time, including negative ones ("standard library only", "no third-party dependencies") and any scenario or artefact it explicitly asks for. For each, name the evidence on disk: a file, a test function, or a command output you have seen.
+
+Goal:
+%s
+
+How to audit:
+- Be concrete. "Implemented" is not evidence. "vec2/vec2_test.go covers add, sub, scale, dot, cross, length, normalize and rotate" is.
+- If the goal asks for something in a particular shape (a table-driven test, a specific package split), open the code and check it really has that shape.
+- If the goal gives numbers or cadence (durations, intervals, tolerances, print frequency), read the code and compare the actual values with the ones asked for.
+- If a requirement has no evidence, do that work now, re-run the acceptance commands, then call finish.
+- If everything is covered, call finish with a one-line summary.`, goal)
 }
 
 func soloRepairPrompt(vr VerifyResult) string {

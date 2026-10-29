@@ -499,6 +499,44 @@ func TestRunSolo_InterruptsStepThrash(t *testing.T) {
 	}
 }
 
+// TestRunSolo_AuditsGoalBeforeFinishing: acceptance commands are a floor. A
+// measured run passed all of them while leaving prose requirements
+// unimplemented, so one extra turn is spent checking the goal against the disk.
+func TestRunSolo_AuditsGoalBeforeFinishing(t *testing.T) {
+	calls := 0
+	client := &llm.ScriptedClient{Handle: func(context.Context, llm.Request) (*llm.Response, error) {
+		calls++
+		if calls == 1 {
+			return action(t, `{"thought":"write","action":"write_file","args":{"path":"hello.txt","content":"hi\n"}}`), nil
+		}
+		return action(t, `{"thought":"done","action":"finish","args":{"summary":"wrote hello.txt"}}`), nil
+	}}
+	o := newSoloOrch(t, client, []string{"test -f hello.txt"})
+	// The audit must not be starved by the round budget: it gets its own.
+	o.cfg.SoloRounds = 1
+
+	if err := o.RunSolo(context.Background()); err != nil {
+		t.Fatalf("RunSolo: %v", err)
+	}
+	root, _ := o.tree.CloneNode(o.tree.RootID)
+	if root.State != models.TaskStateCompleted {
+		t.Fatalf("root state = %s, want COMPLETED", root.State)
+	}
+	if len(client.Requests) != 3 {
+		t.Fatalf("%d requests, want write + finish + audit turn", len(client.Requests))
+	}
+	audit := joinedContents(client.Requests[2].Messages)
+	for _, want := range []string{"audit the goal itself", "table-driven", "print frequency", o.tree.Goal} {
+		if !strings.Contains(audit, want) {
+			t.Errorf("audit prompt is missing %q", want)
+		}
+	}
+	// A single audit, not one per round.
+	if n := strings.Count(audit, "audit the goal itself"); n != 1 {
+		t.Fatalf("audit appears %d times", n)
+	}
+}
+
 func TestSoloContextBudget(t *testing.T) {
 	o := newSoloOrch(t, &llm.ScriptedClient{}, nil)
 	if got := o.soloContextBudget(); got != soloContextChars {
