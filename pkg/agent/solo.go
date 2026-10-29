@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -400,6 +401,14 @@ type soloSession struct {
 	stepSame int
 	stepNags int
 
+	// callKey / sameCall catch the other loop shape: the exact same tool call
+	// repeated. Observed in the wild as ten identical read_file calls on a
+	// 54-line file, with the same thought each time — the model re-read to
+	// "understand what's expected" and never made an edit.
+	callKey    string
+	sameCall   int
+	repeatNags int
+
 	// auditDone marks the one-time requirement audit that runs after
 	// acceptance first passes.
 	auditDone bool
@@ -414,6 +423,56 @@ func (s *soloSession) auditDue() bool {
 // soloStepNags caps how many times one round interrupts the guess loop. Two is
 // enough to reframe the problem; a third is just noise in the transcript.
 const soloStepNags = 2
+
+// soloRepeatLimit is how many identical tool calls in a row count as a loop.
+// Two would fire on a legitimate read-then-verify pair; four wastes a step on
+// something already unmistakable.
+const soloRepeatLimit = 3
+
+// trackRepeatCall interrupts a loop of identical tool calls. It is separate
+// from trackStepFailure on purpose: a read cannot fail, so a run can spin
+// forever without ever tripping the failure-based guard.
+func (s *soloSession) trackRepeatCall(step int, act taggedAction) (string, bool) {
+	if s.repeatNags >= soloStepNags {
+		return "", false
+	}
+	// json.Marshal sorts map keys, so two equal argument maps produce the same
+	// string — fmt's %v on a map would too, but not by contract.
+	args, err := json.Marshal(act.Args)
+	if err != nil {
+		return "", false
+	}
+	key := act.Name + "\x00" + string(args)
+	if key == s.callKey {
+		s.sameCall++
+	} else {
+		s.callKey, s.sameCall = key, 1
+	}
+	if s.sameCall < soloRepeatLimit {
+		return "", false
+	}
+	s.callKey, s.sameCall = "", 0
+	s.repeatNags++
+	s.journal.escalation++
+	s.o.log.Warnf("solo step %d: %s called %d times with identical arguments; interrupting", step, act.Name, soloRepeatLimit)
+	s.o.events.Record("solo_repeat_call", s.nodeID, map[string]any{
+		"step":  step,
+		"tool":  act.Name,
+		"count": soloRepeatLimit,
+	})
+	return soloRepeatCallIntervention(act.Name, string(args), soloRepeatLimit), true
+}
+
+func soloRepeatCallIntervention(name, args string, n int) string {
+	return fmt.Sprintf(`You have now called %s with identical arguments %d times in a row: %s
+
+Repeating the call cannot produce a different result. Pick one:
+- You already have what you asked for — use it. Make the edit with replace_lines, or decide the file needs no change and move on.
+- The result did not tell you what you needed — change the call: another path, a narrower range, or a search for the specific symbol instead of reading the whole file.
+- You are checking whether something exists — search for it; do not re-read the file to find out.
+
+Your next action must change the workspace or advance the goal.`, name, n, clip(args, 400))
+}
 
 // trackStepFailure watches for the same command failing the same way twice in a
 // row within one round, and returns a message that interrupts the loop.
@@ -573,6 +632,8 @@ func (s *soloSession) runRound(ctx context.Context, steps int) (summary string, 
 			s.journal.note(act, out, callErr)
 			s.appendToolResult(act, out)
 			if msg, interrupted := s.trackStepFailure(step, act, out, callErr); interrupted {
+				s.msgs = append(s.msgs, llm.Message{Role: llm.RoleUser, Content: msg})
+			} else if msg, looped := s.trackRepeatCall(step, act); looped {
 				s.msgs = append(s.msgs, llm.Message{Role: llm.RoleUser, Content: msg})
 			}
 

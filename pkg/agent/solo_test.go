@@ -568,6 +568,37 @@ func TestRunSolo_SavesTranscriptWhenACallFails(t *testing.T) {
 	}
 }
 
+// TestRunSolo_InterruptsRepeatedToolCall: a read cannot fail, so a run can spin
+// forever without ever tripping the failure-based guard. Observed in the wild as
+// ten identical read_file calls on a 54-line file with the same thought each
+// time, ending only because the model noticed its own loop.
+func TestRunSolo_InterruptsRepeatedToolCall(t *testing.T) {
+	client := &llm.ScriptedClient{Handle: func(context.Context, llm.Request) (*llm.Response, error) {
+		return action(t, `{"thought":"let me read it again","action":"read_file","args":{"path":"a.txt"}}`), nil
+	}}
+	o := newSoloOrch(t, client, []string{"test -f never-created.txt"})
+	if err := os.WriteFile(filepath.Join(o.sandbox.Root, "a.txt"), []byte("hello\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	o.cfg.SoloSteps = 8
+	o.cfg.SoloRounds = 1
+
+	if err := o.RunSolo(context.Background()); err == nil {
+		t.Fatal("RunSolo should have failed")
+	}
+	last := joinedContents(client.Requests[len(client.Requests)-1].Messages)
+	n := strings.Count(last, "identical arguments")
+	if n == 0 {
+		t.Fatal("the repeated call was never interrupted")
+	}
+	if n > soloStepNags {
+		t.Fatalf("interrupted %d times, want at most %d", n, soloStepNags)
+	}
+	if !strings.Contains(last, "Your next action must change the workspace") {
+		t.Error("intervention does not demand a state-changing action")
+	}
+}
+
 func TestSoloContextBudget(t *testing.T) {
 	o := newSoloOrch(t, &llm.ScriptedClient{}, nil)
 	if got := o.soloContextBudget(); got != soloContextChars {
