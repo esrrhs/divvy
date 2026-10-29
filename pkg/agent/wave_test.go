@@ -182,6 +182,109 @@ func TestRun_WaveThrottleDefersDecomposition(t *testing.T) {
 // o_rootID is the root node id used by NewFromGoal ("root").
 const o_rootID = "root"
 
+// TestRun_WaveBatchesExecution pins the half of the throttle that planning
+// alone cannot deliver.
+//
+// A real run showed why: the root decomposition emitted all six leaves of the
+// goal in one shot, so capping *decomposition* changed nothing and the first
+// aggregate still ran after every leaf — the old "assemble once at the end"
+// shape. The wave has to bound execution too, or a flat plan is unaffected.
+func TestRun_WaveBatchesExecution(t *testing.T) {
+	leaves := `{
+  "is_atomic": false,
+  "reason": "flat plan of five",
+  "dod": {"commands": ["true"]},
+  "subtasks": [
+    {"id": "l1", "title": "one", "description": "d", "type": "leaf",
+     "contract": {"outputs": ["l1.txt"]}, "dod": {"commands": ["true"]}},
+    {"id": "l2", "title": "two", "description": "d", "type": "leaf",
+     "contract": {"outputs": ["l2.txt"]}, "dod": {"commands": ["true"]}},
+    {"id": "l3", "title": "three", "description": "d", "type": "leaf",
+     "contract": {"outputs": ["l3.txt"]}, "dod": {"commands": ["true"]}},
+    {"id": "l4", "title": "four", "description": "d", "type": "leaf",
+     "contract": {"outputs": ["l4.txt"]}, "dod": {"commands": ["true"]}},
+    {"id": "l5", "title": "five", "description": "d", "type": "leaf",
+     "contract": {"outputs": ["l5.txt"]}, "dod": {"commands": ["true"]}}
+  ]
+}`
+	client := &llm.ScriptedClient{Handle: func(_ context.Context, req llm.Request) (*llm.Response, error) {
+		if len(req.Messages) > 0 && strings.Contains(req.Messages[0].Content, architectMarker) {
+			return &llm.Response{Content: leaves}, nil
+		}
+		if wroteAlready(req) {
+			return jsonAction("finish", map[string]string{"summary": "done"}), nil
+		}
+		return jsonAction("write_file", map[string]string{"path": taskIDFromDecomposePrompt(req) + ".txt", "content": "x\n"}), nil
+	}}
+
+	cfg := DefaultConfig()
+	cfg.WorkDir = t.TempDir()
+	cfg.DataDir = t.TempDir()
+	cfg.SessionID = "test_wave_batch"
+	cfg.Goal = "five leaves"
+	cfg.Stream = false
+	cfg.MaxSteps = 6
+	cfg.Wave = 2
+	// Parallelism is what the launch quota has to fight: with a serial pool the
+	// pool itself would hand out one leaf per pass and hide a missing quota.
+	cfg.Parallel = 4
+	cfg.AggregateCommands = []string{"true"}
+	cfg.RetryMinInterval = time.Millisecond
+	cfg.RetryMaxInterval = 2 * time.Millisecond
+
+	o, err := NewFromGoal(cfg, client, SilentLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := o.Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	ev, err := SummarizeEvents(o.EventPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Five leaves at two per wave: 2 + 2 + 1, so three aggregates.
+	if ev.Aggregates < 3 {
+		t.Fatalf("aggregates = %d, want at least 3 (5 leaves at 2 per wave)", ev.Aggregates)
+	}
+	if ev.Aggregates > 6 {
+		t.Fatalf("aggregates = %d; the wave is not batching execution", ev.Aggregates)
+	}
+}
+
+// TestPlanWarnings_IgnoresRepairLeaves keeps the injected repair task out of the
+// plan-quality review. It declares no outputs on purpose — it edits files that
+// already exist — so flagging it as "weak" would be warning about the fix.
+func TestPlanWarnings_IgnoresRepairLeaves(t *testing.T) {
+	o := newSoloOrch(t, &llm.ScriptedClient{}, nil)
+	defer o.Close()
+	if _, err := o.tree.AddChild(o.tree.RootID, "weak", "no outputs on purpose", "", models.NodeTypeLeaf); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := o.tree.AddChild(o.tree.RootID, waveRepairPrefix+"_1", "Repair the workspace", "", models.NodeTypeLeaf); err != nil {
+		t.Fatal(err)
+	}
+	var sawRepair, sawWeak bool
+	for _, w := range o.planWarnings() {
+		if strings.Contains(w, waveRepairPrefix) {
+			sawRepair = true
+		}
+		if strings.HasPrefix(w, "weak ") {
+			sawWeak = true
+		}
+	}
+	if sawRepair {
+		t.Error("the repair leaf was reported as a weak contract")
+	}
+	if !sawWeak {
+		t.Error("an ordinary leaf with no outputs should still be reported")
+	}
+}
+
 // TestAggregateReady_DerivedCommandNeedsSources pins the difference between the
 // operator's -aggregate (a contract, always runs) and a derived one (only once
 // there is code to check).

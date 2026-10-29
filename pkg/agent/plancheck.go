@@ -18,6 +18,13 @@ func (o *Orchestrator) planWarnings() []string {
 
 	for _, leaf := range o.tree.Leaves() {
 		id := leaf.ID
+		// Repair leaves are not planned work: they are injected in response to a
+		// broken aggregate, they edit files that already exist (so they declare
+		// no outputs by design), and their DoD is the aggregate command itself.
+		// Warning about their contract would be warning about the fix.
+		if strings.HasPrefix(id, waveRepairPrefix) {
+			continue
+		}
 		switch {
 		case len(leaf.DoD.Commands) == 0:
 			warns = append(warns, fmt.Sprintf("%s (%s): no verification commands", id, leaf.Title))

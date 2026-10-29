@@ -48,10 +48,16 @@ type waveState struct {
 	repairs    int    // repair leaves injected
 	baselineFP string // fingerprint of a workspace that was already broken at start
 	landed     atomic.Int32
+	// dispatched counts the leaves this wave has launched. The wave bounds
+	// execution, not just planning: a planner that emits five leaves in one
+	// shot would otherwise run all five before the first aggregate, which is
+	// the old "assemble once at the end" behaviour wearing a new name.
+	dispatched atomic.Int32
 }
 
 // waveEnabled reports whether the run uses the loop at all. -wave 0 restores the
-// old flat behaviour exactly: no throttle, no aggregate, no repair leaves.
+// old flat behaviour exactly: no throttle, no batching, no aggregate, no repair
+// leaves.
 func (o *Orchestrator) waveEnabled() bool {
 	return o.cfg.Wave > 0
 }
@@ -59,25 +65,36 @@ func (o *Orchestrator) waveEnabled() bool {
 // noteLeaf records that a leaf landed since the last aggregate.
 func (w *waveState) noteLeaf() { w.landed.Add(1) }
 
-// waveBoundary reports that everything planned has landed: nothing is in
-// flight, no leaf is waiting, and the tree has not run out of road. That is the
-// moment the workspace can be checked as a whole.
-//
-// The end of the plan counts as a boundary. It is tempting to skip it on the
-// grounds that goal acceptance follows immediately, but acceptance is the
-// expensive claim and it fails without saying whose fault it was — the aggregate
-// is the cheap one that names a command.
-func (o *Orchestrator) waveBoundary() bool {
-	if !o.waveEnabled() || o.wave.landed.Load() == 0 {
-		return false
+// waveBudget is how many more leaves this wave may launch.
+func (o *Orchestrator) waveBudget() int {
+	if !o.waveEnabled() {
+		return 1 << 30
 	}
-	if o.tree.PendingLeafCount() > 0 {
+	left := o.cfg.Wave - int(o.wave.dispatched.Load())
+	if left < 0 {
+		return 0
+	}
+	return left
+}
+
+// waveBoundary reports that a wave is over: nothing is in flight (the caller
+// checks), nothing is left to plan, or this wave has launched its quota.
+//
+// Ending a wave with nothing landed is not a boundary worth aggregating — but
+// it does reset the quota, otherwise a wave whose leaves all failed would
+// deadlock the scheduler with no room left to launch anything.
+func (o *Orchestrator) waveBoundary() bool {
+	if !o.waveEnabled() {
 		return false
 	}
 	if o.sched.IsComplete() || o.sched.HasFailed() {
 		return false
 	}
-	return true
+	full := o.wave.dispatched.Load() >= int32(o.cfg.Wave)
+	if !full && o.tree.PendingLeafCount() > 0 {
+		return false
+	}
+	return o.wave.landed.Load() > 0 || full
 }
 
 // waveHasRoom reports whether the tree may be expanded further.
@@ -241,6 +258,9 @@ func (o *Orchestrator) baselineAggregate(ctx context.Context) {
 // wave that just landed, and turns a failure into the next wave's first task.
 func (o *Orchestrator) runWaveAggregate(ctx context.Context) error {
 	landed := int(o.wave.landed.Swap(0))
+	// Reset the launch quota even when nothing landed: the wave is over either
+	// way, and leaving it spent would stop the next wave from starting.
+	o.wave.dispatched.Store(0)
 	if landed == 0 {
 		return nil
 	}

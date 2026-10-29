@@ -572,7 +572,16 @@ func (o *Orchestrator) Run(ctx context.Context) (runErr error) {
 				ready = o.sched.GetReadyLeafNodesAvoiding(claims)
 			}
 		}
+		// Leaves fill the pool, but only up to this wave's quota. A wave that
+		// launches everything the planner emitted is the old behaviour again:
+		// a planner that writes five leaves in one shot would run all five
+		// before the first aggregate, which is exactly the "assemble at the
+		// end" shape this loop exists to avoid.
+		budget := o.waveBudget()
 		for _, leaf := range ready {
+			if budget <= 0 {
+				break
+			}
 			lf := leaf
 			leafClaims := engine.OutputSetClaims(lf.Contract.Outputs)
 			started, poolFull := tryDispatch(lf.ID, leafClaims, func(c context.Context) error {
@@ -589,6 +598,8 @@ func (o *Orchestrator) Run(ctx context.Context) (runErr error) {
 			}
 			if started {
 				progressed = true
+				o.wave.dispatched.Add(1)
+				budget--
 			}
 		}
 
