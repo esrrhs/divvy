@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -10,6 +11,11 @@ import (
 	"github.com/esrrhs/divvy/pkg/models"
 	"github.com/esrrhs/divvy/pkg/tools"
 )
+
+// errSoloAlreadyComplete reports that the goal was already finished. It is not
+// a failure — -resume on a done session simply has nothing to do — so RunSolo
+// turns it into a clean exit.
+var errSoloAlreadyComplete = errors.New("solo goal already complete")
 
 // Solo mode drives the whole goal in one conversation.
 //
@@ -57,6 +63,9 @@ func (o *Orchestrator) RunSolo(ctx context.Context) (runErr error) {
 	o.log.Infof("mode    one context, no decomposition")
 
 	autoAcceptance, err := o.prepareSoloRoot()
+	if errors.Is(err, errSoloAlreadyComplete) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
@@ -78,10 +87,22 @@ func (o *Orchestrator) RunSolo(ctx context.Context) (runErr error) {
 		nodeID:         root.ID,
 		budget:         o.soloContextBudget(),
 		autoAcceptance: autoAcceptance,
-		msgs: []llm.Message{
-			{Role: llm.RoleSystem, Content: soloSystemFor(o.cfg.WebEnabled, o.sandbox.DynamicToolDescriptions())},
-			{Role: llm.RoleUser, Content: o.soloTaskPrompt(o.sandbox, root)},
-		},
+		histPath:       o.storage.GetSoloHistoryPath(o.tree.ID),
+	}
+	system := llm.Message{Role: llm.RoleSystem, Content: soloSystemFor(o.cfg.WebEnabled, o.sandbox.DynamicToolDescriptions())}
+	if prev, err := loadSoloHistory(s.histPath); err != nil || len(prev) < 2 {
+		if err != nil {
+			o.log.Warnf("earlier transcript unreadable, starting a new one: %v", err)
+		}
+		s.msgs = []llm.Message{system, {Role: llm.RoleUser, Content: o.soloTaskPrompt(o.sandbox, root)}}
+	} else {
+		// Resume: the transcript IS the state. Keep it, refresh the system
+		// prompt (tool docs and rules may have changed), and tell the model
+		// where the workspace stands now rather than replaying a stale
+		// snapshot from the first turn.
+		o.log.Infof("resuming: %d earlier messages from %s", len(prev), s.histPath)
+		s.msgs = append(prev, llm.Message{Role: llm.RoleUser, Content: o.soloResumePrompt(root)})
+		s.msgs[0] = system
 	}
 
 	steps := o.cfg.SoloSteps
@@ -132,6 +153,7 @@ func (o *Orchestrator) RunSolo(ctx context.Context) (runErr error) {
 			if summary == "" {
 				summary = "acceptance passed"
 			}
+			_ = s.checkpoint()
 			return o.finishSolo(summary)
 		}
 
@@ -172,7 +194,7 @@ func (o *Orchestrator) RunSolo(ctx context.Context) (runErr error) {
 		// of a fresh leaf re-deriving the project from a contract.
 		s.msgs = append(s.msgs, llm.Message{Role: llm.RoleUser, Content: soloRepairFor(vr, s.sameFailure)})
 		s.journal.noteFailure(vr.Command)
-		if err := o.checkpoint(); err != nil {
+		if err := s.checkpoint(); err != nil {
 			return err
 		}
 	}
@@ -188,7 +210,7 @@ func (o *Orchestrator) RunSolo(ctx context.Context) (runErr error) {
 	if err := o.sched.UpdateNodeState(o.tree.RootID, models.TaskStateFailed, msg); err != nil {
 		return err
 	}
-	_ = o.checkpoint()
+	_ = s.checkpoint()
 	// The node is marked FAILED above; the run itself must also report failure.
 	// Returning the state transition's nil here would make the CLI print
 	// "done" for a goal that never passed acceptance.
@@ -210,6 +232,13 @@ func (o *Orchestrator) prepareSoloRoot() (autoAcceptance bool, err error) {
 	if len(root.ChildrenIDs) > 0 {
 		return false, fmt.Errorf("session %s already has %d planned subtasks; -solo needs a fresh session (do not combine it with -resume of a tree run)",
 			o.tree.ID, len(root.ChildrenIDs))
+	}
+	// A completed solo root is a finished goal, and the tree is one leaf, so
+	// nothing else records that. Re-running it would rebuild a deliverable
+	// that already passes its acceptance.
+	if root.State == models.TaskStateCompleted && root.IntegrationVerified {
+		o.log.Okf("session %s already completed this goal; nothing to do (start a new session to run it again)", o.tree.ID)
+		return false, errSoloAlreadyComplete
 	}
 	switch {
 	case len(o.cfg.DoDCommands) > 0:
@@ -324,6 +353,10 @@ type soloSession struct {
 	// the evolving workspace is legitimate.
 	autoAcceptance bool
 	journal        soloJournal
+	// histPath is where the transcript is written so an interrupted run
+	// resumes its own conversation instead of rebuilding from a workspace it
+	// has no memory of.
+	histPath string
 
 	// failureFP / sameFailure track repeated acceptance failures across
 	// rounds. Fingerprints come from stall.go, so "penetrated by 0.0985" and
@@ -331,6 +364,16 @@ type soloSession struct {
 	// number. That is exactly the case where retrying in place is wasted.
 	failureFP   string
 	sameFailure int
+}
+
+// checkpoint persists both halves of solo's state: the tree (so -status sees
+// the truth) and the transcript (so -resume continues instead of restarting).
+// A transcript write failure is never fatal — it costs memory, not correctness.
+func (s *soloSession) checkpoint() error {
+	if err := saveSoloHistory(s.histPath, s.msgs); err != nil {
+		s.o.log.Warnf("solo transcript not saved: %v", err)
+	}
+	return s.o.checkpoint()
 }
 
 // noteFailure folds one failed acceptance into the streak and returns its new
@@ -430,10 +473,11 @@ func (s *soloSession) runRound(ctx context.Context, steps int) (summary string, 
 			// token accounting (the only persisted state) on a crash makes the
 			// budget look untouched on resume.
 			if step%10 == 0 {
-				_ = o.checkpoint()
+				_ = s.checkpoint()
 			}
 		}
 	}
+	_ = s.checkpoint()
 	return "", false, nil
 }
 
@@ -637,7 +681,19 @@ func (o *Orchestrator) soloTaskPrompt(sb *tools.Sandbox, root *models.TaskNode) 
 	b.WriteString("Acceptance that will run after you call finish:\n")
 	b.WriteString(formatDoD(root.DoD))
 	b.WriteString("\n\nWorkspace files right now:\n")
-	b.WriteString(sb.Snapshot())
+	snap := sb.Snapshot()
+	b.WriteString(snap)
+	if workspaceHasFiles(snap) {
+		// Measured failure mode: handed a goal whose workspace already held a
+		// passing implementation, a solo run rewrote every file from scratch —
+		// it read the goal's "from scratch" wording as "ignore what is here".
+		// The rule is general: read before you replace.
+		b.WriteString(`
+The workspace is NOT empty. The entries above may be a partial or even a complete previous attempt at this goal. Treat them as work to check, not as a blank slate:
+- Run the acceptance commands first. Whatever already passes does not need to be rewritten.
+- Read a file before you replace it. Overwriting a file you have not read throws away work that may already be correct, and costs the budget of rebuilding it.
+- Fix the part that is wrong and keep the part that is right.`)
+	}
 	b.WriteString(`
 How this run works:
 - You own the goal from start to finish. Nothing runs after you: no reviewer, no later task that will fix what you skip.
@@ -648,6 +704,31 @@ How this run works:
 
 Start now.`)
 	return b.String()
+}
+
+// soloResumePrompt opens a resumed solo turn. The transcript above is the
+// model's own earlier work, but its opening snapshot is stale, so the current
+// one is restated here — otherwise the model plans against a workspace that no
+// longer matches the disk.
+func (o *Orchestrator) soloResumePrompt(root *models.TaskNode) string {
+	var b strings.Builder
+	b.WriteString("This run was interrupted and is now resuming. Everything above is your own earlier work in this same conversation; the workspace is as you left it.\n\n")
+	b.WriteString("Acceptance that will run after you call finish:\n")
+	b.WriteString(formatDoD(root.DoD))
+	b.WriteString("\n\nWorkspace files right now:\n")
+	b.WriteString(o.sandbox.Snapshot())
+	b.WriteString(`
+Do not restart from scratch. Run the acceptance commands first to see where you actually are, then continue from that point. What already passes does not need to be rewritten.`)
+	return b.String()
+}
+
+// workspaceHasFiles reports whether a snapshot describes a non-empty workspace.
+// ListDir answers "" or "(empty)" for an empty directory and an error sentence
+// when it could not read at all — in that case assume there is something there
+// and let the model look.
+func workspaceHasFiles(snap string) bool {
+	t := strings.TrimSpace(snap)
+	return t != "" && t != "(empty)" && !strings.HasPrefix(t, "(unable to list workspace")
 }
 
 func soloRepairFor(vr VerifyResult, same int) string {

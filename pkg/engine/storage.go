@@ -32,6 +32,14 @@ func (s *Storage) GetTreeFilePath(sessionID string) string {
 	return filepath.Join(s.baseDir, fmt.Sprintf("%s.json", sessionID))
 }
 
+// GetSoloHistoryPath returns the file holding a solo run's conversation.
+// Solo is one growing context, so the transcript is session state in the same
+// sense the tree is: losing it means -resume restarts the whole goal against a
+// workspace it no longer remembers building.
+func (s *Storage) GetSoloHistoryPath(sessionID string) string {
+	return filepath.Join(s.baseDir, fmt.Sprintf("%s.solo.jsonl", sessionID))
+}
+
 // SaveTree saves the task tree atomically to avoid corruption on crash.
 func (s *Storage) SaveTree(tree *TaskTree) error {
 	if tree == nil {
@@ -168,6 +176,7 @@ func (s *Storage) PruneSessions(keep int) (*PruneResult, error) {
 func (s *Storage) existingArtifacts(id string) []string {
 	candidates := []string{
 		s.GetTreeFilePath(id),
+		s.GetSoloHistoryPath(id),
 		filepath.Join(s.baseDir, "logs", id+".log"),
 		filepath.Join(s.baseDir, "events", id+".jsonl"),
 	}

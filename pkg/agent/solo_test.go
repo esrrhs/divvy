@@ -322,6 +322,143 @@ func TestSoloNoteFailure_ResetsOnDifferentFailure(t *testing.T) {
 	}
 }
 
+func joinedContents(msgs []llm.Message) string {
+	var b strings.Builder
+	for _, m := range msgs {
+		b.WriteString(m.Content)
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// TestRunSolo_ResumesTranscript: the transcript is solo's state. Without it a
+// resumed run starts over against a workspace it has no memory of building —
+// which a measured run answered by rewriting every file from scratch.
+func TestRunSolo_ResumesTranscript(t *testing.T) {
+	client := &llm.ScriptedClient{Handle: func(context.Context, llm.Request) (*llm.Response, error) {
+		return action(t, `{"thought":"write","action":"write_file","args":{"path":"hello.txt","content":"hi\n"}}`), nil
+	}}
+	o := newSoloOrch(t, client, []string{"test -f hello.txt"})
+	path := o.storage.GetSoloHistoryPath(o.tree.ID)
+	if err := saveSoloHistory(path, []llm.Message{
+		{Role: llm.RoleSystem, Content: "STALE-SYSTEM-PROMPT"},
+		{Role: llm.RoleUser, Content: "EARLIER-GOAL-TURN"},
+		{Role: llm.RoleAssistant, Content: "I already built vec2 and shapes"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := o.RunSolo(context.Background()); err != nil {
+		t.Fatalf("RunSolo: %v", err)
+	}
+	if len(client.Requests) == 0 {
+		t.Fatal("no requests recorded")
+	}
+	first := joinedContents(client.Requests[0].Messages)
+	if !strings.Contains(first, "EARLIER-GOAL-TURN") {
+		t.Error("resume dropped the earlier conversation")
+	}
+	if !strings.Contains(first, "I already built vec2 and shapes") {
+		t.Error("resume dropped the earlier assistant turn")
+	}
+	if !strings.Contains(first, "resuming") {
+		t.Error("resume did not tell the model it is continuing")
+	}
+	if strings.Contains(first, "STALE-SYSTEM-PROMPT") {
+		t.Error("resume kept the stale system prompt instead of refreshing it")
+	}
+}
+
+// TestSaveLoadSoloHistory_ToleratesTornTail: a crash mid-write must cost the
+// last message, not the whole transcript.
+func TestSaveLoadSoloHistory_ToleratesTornTail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s.jsonl")
+	msgs := []llm.Message{
+		{Role: llm.RoleSystem, Content: "sys"},
+		{Role: llm.RoleAssistant, Content: "call", ToolCalls: []llm.ToolCall{
+			{ID: "t1", Function: llm.ToolFunction{Name: "read_file", Arguments: `{"path":"a.go"}`}},
+		}},
+		{Role: llm.RoleTool, ToolCallID: "t1", Name: "read_file", Content: "package a"},
+	}
+	if err := saveSoloHistory(path, msgs); err != nil {
+		t.Fatal(err)
+	}
+	got, err := loadSoloHistory(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 || got[1].ToolCalls[1-1].Function.Name != "read_file" || got[2].ToolCallID != "t1" {
+		t.Fatalf("round trip lost tool calls: %+v", got)
+	}
+
+	// Simulate a torn write: valid prefix, half a JSON object at the end.
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(`{"role":"assistant","content":"hal`); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	got, err = loadSoloHistory(path)
+	if err != nil {
+		t.Fatalf("torn tail should not fail the load: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("kept %d messages, want the 3 complete ones", len(got))
+	}
+	// Unknown path is a first run, not an error.
+	if m, err := loadSoloHistory(filepath.Join(t.TempDir(), "missing.jsonl")); err != nil || m != nil {
+		t.Fatalf("missing transcript = %v, %v", m, err)
+	}
+}
+
+func TestPrepareSoloRoot_RefusesCompletedSession(t *testing.T) {
+	o := newSoloOrch(t, &llm.ScriptedClient{}, []string{"test -f hello.txt"})
+	if _, err := o.prepareSoloRoot(); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.tree.UpdateNode(o.tree.RootID, func(n *models.TaskNode) error {
+		n.State = models.TaskStateCompleted
+		n.IntegrationVerified = true
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := o.prepareSoloRoot(); err != errSoloAlreadyComplete {
+		t.Fatalf("err = %v, want errSoloAlreadyComplete", err)
+	}
+	// -resume on a finished solo session is a no-op, not a failure.
+	if err := o.RunSolo(context.Background()); err != nil {
+		t.Fatalf("RunSolo on a completed session = %v, want nil", err)
+	}
+}
+
+// TestSoloTaskPrompt_WarnsAboutExistingWork pins the wording that stops a
+// fresh run from rewriting a workspace it was handed.
+func TestSoloTaskPrompt_WarnsAboutExistingWork(t *testing.T) {
+	o := newSoloOrch(t, &llm.ScriptedClient{}, []string{"test -f hello.txt"})
+	root, _ := o.tree.CloneNode(o.tree.RootID)
+
+	if got := o.soloTaskPrompt(o.sandbox, root); strings.Contains(got, "NOT empty") {
+		t.Error("empty workspace must not be described as existing work")
+	}
+	if err := os.WriteFile(filepath.Join(o.sandbox.Root, "existing.go"), []byte("package x\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	got := o.soloTaskPrompt(o.sandbox, root)
+	if !strings.Contains(got, "NOT empty") {
+		t.Error("non-empty workspace is not flagged")
+	}
+	if !strings.Contains(got, "Read a file before you replace it") {
+		t.Error("prompt does not forbid blind overwrites")
+	}
+	if !strings.Contains(got, "existing.go") {
+		t.Error("prompt does not list the existing files")
+	}
+}
+
 func TestSoloContextBudget(t *testing.T) {
 	o := newSoloOrch(t, &llm.ScriptedClient{}, nil)
 	if got := o.soloContextBudget(); got != soloContextChars {

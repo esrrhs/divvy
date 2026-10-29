@@ -57,7 +57,7 @@ func run(args []string) error {
 	soloRounds := fs.Int("solo-rounds", 0, "with -solo: repair rounds after a failed acceptance (default 3)")
 	soloContext := fs.Int("solo-context", 0, "with -solo: conversation characters sent per request (default 100000)")
 	var dodFlags []string
-	fs.Func("dod", "explicit acceptance command; repeatable, and one value may hold several separated by ';'. Overrides the planner's and the toolchain's defaults (tree: root only; -solo: the whole run)", func(v string) error {
+	fs.Func("dod", "explicit acceptance `command`; repeatable, and one value may hold several separated by ';'. Overrides the planner's and the toolchain's defaults (tree: root only; -solo: the whole run)", func(v string) error {
 		for _, c := range strings.Split(v, ";") {
 			if c = strings.TrimSpace(c); c != "" {
 				dodFlags = append(dodFlags, c)
