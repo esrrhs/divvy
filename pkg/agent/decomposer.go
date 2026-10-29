@@ -30,6 +30,15 @@ type decomposeChild struct {
 }
 
 func (o *Orchestrator) decompose(ctx context.Context, node *models.TaskNode) error {
+	// Never expand a node that already has children. applyDecompose rolls back
+	// by calling ResetChildren, which deletes the subtree — correct while the
+	// children it just created are still PENDING, catastrophic if they have
+	// already run. The scheduler only hands out childless compounds today, so
+	// this is a guard against a future caller, not a live path.
+	if cur, ok := o.tree.CloneNode(node.ID); ok && len(cur.ChildrenIDs) > 0 {
+		return fmt.Errorf("node %s already has %d child(ren); refusing to re-decompose and discard completed work",
+			node.ID, len(cur.ChildrenIDs))
+	}
 	planRepair := strings.Contains(node.ErrorMsg, planRepairMarker)
 	if node.Depth >= o.cfg.MaxDepth && !planRepair {
 		o.log.Warnf("max depth %d reached, forcing %s to leaf", o.cfg.MaxDepth, node.ID)

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -339,6 +340,92 @@ func TestAggregateReady_DerivedCommandNeedsSources(t *testing.T) {
 	cfg2.AggregateCommands = []string{"true"}
 	if !newOrch(cfg2).aggregateReady() {
 		t.Error("explicit -aggregate must always run")
+	}
+}
+
+// TestRun_CompletedLeavesSurviveAggregateRepair pins the promise that makes the
+// loop affordable: a leaf that already landed is never re-run.
+//
+// A broken aggregate adds a *sibling* whose job is to repair the workspace. It
+// must not clear the tree, reset the leaves that passed, or send them through
+// their worker again — that would turn every repair into a re-run of everything
+// planned so far, and the token bill would grow quadratically with wave count.
+func TestRun_CompletedLeavesSurviveAggregateRepair(t *testing.T) {
+	plan := `{
+  "is_atomic": false,
+  "reason": "two leaves",
+  "dod": {"commands": ["test -f a.txt"]},
+  "subtasks": [
+    {"id": "write_a", "title": "write a", "description": "write the file", "type": "leaf",
+     "contract": {"outputs": ["a.txt"]}, "dod": {"commands": ["true"]}},
+    {"id": "write_b", "title": "write b", "description": "write it too", "type": "leaf",
+     "contract": {"outputs": ["b.txt"]}, "dod": {"commands": ["true"]}}
+  ]
+}`
+	var mu sync.Mutex
+	starts := map[string]int{} // leaf id -> how many times its worker started from scratch
+	// Each leaf writes the file its contract declares, so the root's
+	// "test -f a.txt" is a real end-to-end check of the whole plan.
+	outputs := map[string]string{"write_a": "a.txt", "write_b": "b.txt"}
+	client := &llm.ScriptedClient{Handle: func(_ context.Context, req llm.Request) (*llm.Response, error) {
+		if len(req.Messages) > 0 && strings.Contains(req.Messages[0].Content, architectMarker) {
+			return &llm.Response{Content: plan}, nil
+		}
+		id := taskIDFromDecomposePrompt(req)
+		if !wroteAlready(req) {
+			mu.Lock()
+			starts[id]++
+			mu.Unlock()
+		}
+		if wroteAlready(req) {
+			return jsonAction("finish", map[string]string{"summary": "done"}), nil
+		}
+		if strings.Contains(joinedContents(req.Messages), "Repair the regression") {
+			return jsonAction("write_file", map[string]string{"path": "wave-ok.txt", "content": "ok\n"}), nil
+		}
+		return jsonAction("write_file", map[string]string{"path": outputs[id], "content": "x\n"}), nil
+	}}
+
+	cfg := DefaultConfig()
+	cfg.WorkDir = t.TempDir()
+	cfg.DataDir = t.TempDir()
+	cfg.SessionID = "test_wave_survive"
+	cfg.Goal = "write leaf.txt"
+	cfg.Stream = false
+	cfg.MaxSteps = 6
+	cfg.Wave = 3
+	cfg.AggregateCommands = []string{"test -f wave-ok.txt"}
+	cfg.RetryMinInterval = time.Millisecond
+	cfg.RetryMaxInterval = 2 * time.Millisecond
+
+	o, err := NewFromGoal(cfg, client, SilentLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := o.Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, id := range []string{"write_a", "write_b"} {
+		if starts[id] != 1 {
+			t.Fatalf("%s ran %d times, want exactly 1 (a repair must not re-run landed leaves)", id, starts[id])
+		}
+		node, ok := o.tree.CloneNode(id)
+		if !ok {
+			t.Fatalf("%s vanished from the tree", id)
+		}
+		if node.State != models.TaskStateCompleted {
+			t.Fatalf("%s state = %s after the repair, want COMPLETED", id, node.State)
+		}
+	}
+	if starts[waveRepairPrefix] != 1 {
+		t.Fatalf("repair leaf ran %d times, want 1", starts[waveRepairPrefix])
 	}
 }
 
