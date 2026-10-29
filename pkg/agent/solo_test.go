@@ -459,6 +459,46 @@ func TestSoloTaskPrompt_WarnsAboutExistingWork(t *testing.T) {
 	}
 }
 
+// TestRunSolo_InterruptsStepThrash: round-level stall detection only fires at a
+// round boundary, but a 60-step round is where the guessing actually happens.
+// A measured run spent 38 steps alternating edit/test on one assertion without
+// converging; the loop has to be interrupted where it happens.
+func TestRunSolo_InterruptsStepThrash(t *testing.T) {
+	client := &llm.ScriptedClient{Handle: func(context.Context, llm.Request) (*llm.Response, error) {
+		// The same command, failing identically, forever.
+		return action(t, `{"thought":"try again","action":"run_bash","args":{"command":"test -f never.txt"}}`), nil
+	}}
+	o := newSoloOrch(t, client, []string{"test -f never-created.txt"})
+	o.cfg.SoloSteps = 6
+	o.cfg.SoloRounds = 1
+
+	if err := o.RunSolo(context.Background()); err == nil {
+		t.Fatal("RunSolo should have failed")
+	}
+	if len(client.Requests) < 3 {
+		t.Fatalf("only %d requests", len(client.Requests))
+	}
+	// The intervention lands in the conversation and stays there, so the last
+	// request is where to count how many were issued.
+	last := joinedContents(client.Requests[len(client.Requests)-1].Messages)
+	nags := strings.Count(last, "Stop.")
+	if nags == 0 {
+		t.Fatal("the guess loop was never interrupted")
+	}
+	if nags > soloStepNags {
+		t.Fatalf("interrupted %d times in one round, want at most %d", nags, soloStepNags)
+	}
+	if !strings.Contains(last, "same output as your previous attempt") {
+		t.Error("intervention does not explain why it fired")
+	}
+	if !strings.Contains(last, "scratch/main.go") {
+		t.Error("intervention does not say where a scratch program must live")
+	}
+	if !strings.Contains(last, "Do not weaken or delete the check") {
+		t.Error("intervention does not forbid weakening the assertion")
+	}
+}
+
 func TestSoloContextBudget(t *testing.T) {
 	o := newSoloOrch(t, &llm.ScriptedClient{}, nil)
 	if got := o.soloContextBudget(); got != soloContextChars {

@@ -364,6 +364,72 @@ type soloSession struct {
 	// number. That is exactly the case where retrying in place is wasted.
 	failureFP   string
 	sameFailure int
+
+	// stepFP / stepSame track the same thing *inside* one round. A 60-step
+	// round is long enough for the model to guess-edit-test in a loop without
+	// ever reaching the round boundary where failures get reviewed.
+	stepFP   string
+	stepSame int
+	stepNags int
+}
+
+// soloStepNags caps how many times one round interrupts the guess loop. Two is
+// enough to reframe the problem; a third is just noise in the transcript.
+const soloStepNags = 2
+
+// trackStepFailure watches for the same command failing the same way twice in a
+// row within one round, and returns a message that interrupts the loop.
+//
+// Round-level detection alone is too coarse: a measured run spent 38 of its 60
+// steps alternating edit/test on one assertion whose failure value oscillated
+// between -0.15 and -1953 without ever converging, because each edit was a new
+// guess rather than an observation.
+func (s *soloSession) trackStepFailure(step int, act taggedAction, out string, callErr error) (string, bool) {
+	if act.Name != tools.ToolRunBash || s.stepNags >= soloStepNags {
+		return "", false
+	}
+	if callErr == nil && strings.HasPrefix(out, "exit_code: 0\n") {
+		s.stepFP, s.stepSame = "", 0
+		return "", false
+	}
+	cmd, _ := stringFromArgs(act.Args, "command")
+	fp := stallFingerprint(s.o.projectType(), strings.TrimSpace(cmd)+"\n"+out)
+	if fp == "" {
+		return "", false
+	}
+	if fp == s.stepFP {
+		s.stepSame++
+	} else {
+		s.stepFP, s.stepSame = fp, 1
+	}
+	if s.stepSame < 2 {
+		return "", false
+	}
+	// Reset so the next identical pair gets a fresh count; cap the nags.
+	s.stepFP, s.stepSame = "", 0
+	s.stepNags++
+	s.journal.escalation++
+	s.o.log.Warnf("solo step %d: the same command failed the same way twice; interrupting the guess loop", step)
+	s.o.events.Record("solo_step_stall", s.nodeID, map[string]any{
+		"step":    step,
+		"command": clip(cmd, evReasonChars),
+	})
+	return soloStepIntervention(cmd), true
+}
+
+// soloStepIntervention reframes the problem when an edit changed nothing
+// observable. It is deliberately about method, not about any domain: observe,
+// then fix what the observation points at.
+func soloStepIntervention(cmd string) string {
+	return fmt.Sprintf(`Stop. %q just failed with the same output as your previous attempt. Whatever you changed between those two runs made no observable difference, so another edit made the same way will not either.
+
+Before touching the code again:
+1. Write down the exact value that is wrong and the value you expected.
+2. Observe it: print the intermediate values around the failure, or drive the failing scenario from a small scratch program that prints state step by step. Keep the scratch program inside the workspace (for example scratch/main.go) so the toolchain can resolve the project's own packages — a file written outside the project cannot import them. Delete it before you call finish.
+3. If the observation contradicts what you assumed the code was doing, that contradiction is the bug. Fix that, not the number in the assertion.
+4. Re-run %q. If the output changes you are making progress; if it does not, the theory is still wrong.
+
+Do not weaken or delete the check to make it pass.`, cmd, cmd)
 }
 
 // checkpoint persists both halves of solo's state: the tree (so -status sees
@@ -468,6 +534,9 @@ func (s *soloSession) runRound(ctx context.Context, steps int) (summary string, 
 			}
 			s.journal.note(act, out, callErr)
 			s.appendToolResult(act, out)
+			if msg, interrupted := s.trackStepFailure(step, act, out, callErr); interrupted {
+				s.msgs = append(s.msgs, llm.Message{Role: llm.RoleUser, Content: msg})
+			}
 
 			// Checkpoint periodically: a solo session is long, and losing the
 			// token accounting (the only persisted state) on a crash makes the
@@ -751,7 +820,7 @@ Your last fix did not change the outcome. Do NOT edit the same lines again on an
 
 Change strategy:
 1. Say in one sentence what you believe the cause is, and what observation would confirm or refute it.
-2. Observe it. Print the intermediate values around the failure, add a temporary debug output, or run the failing scenario in a small scratch program that prints state step by step.
+2. Observe it. Print the intermediate values around the failure, add a temporary debug output, or run the failing scenario in a small scratch program that prints state step by step. Keep that program inside the workspace (for example scratch/main.go) so the toolchain can resolve the project's own packages.
 3. If your observation contradicts your theory, discard the theory and form a new one. Do not tune numbers until something passes.
 4. Only after the observation explains the failure, change the code at the place the observation points to.
 5. Re-run the acceptance command yourself.
