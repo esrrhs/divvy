@@ -180,9 +180,14 @@ func (o *Orchestrator) applyDecompose(node *models.TaskNode, parsed decomposeRes
 
 	// The top-level DoD is the goal-level acceptance run after every child
 	// completes. Persist it on the compound node; give it sane defaults when
-	// the model omitted commands.
+	// the model omitted commands. An operator-supplied acceptance wins: it is
+	// the contract the run is judged by, not a suggestion the planner may
+	// rewrite.
 	goalDoD := parsed.DoD
 	ensureGoalDoD(&goalDoD, o.projectType())
+	if len(o.cfg.DoDCommands) > 0 && node.ID == o.tree.RootID {
+		goalDoD.Commands = append([]string(nil), o.cfg.DoDCommands...)
+	}
 	if err := o.tree.UpdateNode(node.ID, func(n *models.TaskNode) error {
 		n.DoD = goalDoD
 		return nil

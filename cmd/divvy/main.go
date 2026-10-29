@@ -43,7 +43,7 @@ func run(args []string) error {
 	extra := fs.String("extra", "", "extra JSON merged into chat request body")
 	maxSteps := fs.Int("max-steps", cfg.MaxSteps, "max tool calls per leaf attempt")
 	maxRetries := fs.Int("max-retries", cfg.MaxRetries, "max verify retries per leaf (0 = unlimited)")
-	maxStall := fs.Int("max-stall", cfg.MaxStall, "give up on a leaf after this many identical failures in a row (0 = never)")
+	maxStall := fs.Int("max-stall", cfg.MaxStall, "give up after this many identical failures in a row (leaf attempt, or -solo round); 0 = never")
 	maxElapsed := fs.Duration("max-elapsed", cfg.MaxElapsed, "wall-clock budget for one leaf across all attempts (0 = unlimited)")
 	retryMaxWait := fs.Duration("retry-max-wait", cfg.RetryMaxInterval, "exponential backoff cap between retries")
 	maxDepth := fs.Int("max-depth", cfg.MaxDepth, "max decomposition depth")
@@ -56,6 +56,15 @@ func run(args []string) error {
 	soloSteps := fs.Int("solo-steps", 0, "with -solo: tool calls per round (default 80)")
 	soloRounds := fs.Int("solo-rounds", 0, "with -solo: repair rounds after a failed acceptance (default 3)")
 	soloContext := fs.Int("solo-context", 0, "with -solo: conversation characters sent per request (default 100000)")
+	var dodFlags []string
+	fs.Func("dod", "explicit acceptance command; repeatable, and one value may hold several separated by ';'. Overrides the planner's and the toolchain's defaults (tree: root only; -solo: the whole run)", func(v string) error {
+		for _, c := range strings.Split(v, ";") {
+			if c = strings.TrimSpace(c); c != "" {
+				dodFlags = append(dodFlags, c)
+			}
+		}
+		return nil
+	})
 	strict := fs.Bool("strict", false, "with -plan: exit non-zero when the plan or workspace layout check reports warnings")
 	gitCommit := fs.Bool("git-commit", false, "git commit each leaf's merged changes (workdir must be a git repo)")
 	native := fs.Bool("native-tools", false, "use OpenAI tool_calls instead of JSON actions")
@@ -102,6 +111,7 @@ func run(args []string) error {
 	cfg.SoloSteps = *soloSteps
 	cfg.SoloRounds = *soloRounds
 	cfg.SoloContextChars = *soloContext
+	cfg.DoDCommands = dodFlags
 	cfg.MaxStall = *maxStall
 	cfg.MaxElapsed = *maxElapsed
 	cfg.RetryMaxInterval = *retryMaxWait
@@ -464,6 +474,7 @@ Examples:
   divvy -plan -workdir ./ws "目标"   # 只拆解，检查任务树
   divvy -plan -strict -workdir ./ws "目标"   # 拆解 + 严格检查（CI 友好）
   divvy -solo -workdir ./ws "目标"   # 单上下文跑完整个目标，不拆解（目标能装进一个上下文时首选）
+  divvy -solo -dod "go vet ./...;go test ./..." -workdir ./ws "目标"   # 验收自己定，不用猜
   divvy -interactive -workdir .      # 交互式多轮开发（/help、/exit）
   divvy -resume -workdir ./ws        # 再执行
 

@@ -200,6 +200,128 @@ func TestSoloCompose_KeepsToolGroupsIntact(t *testing.T) {
 	}
 }
 
+// TestPrepareSoloRoot_OperatorAcceptanceWins: an explicit -dod is a contract.
+// Derived acceptance is a guess, and a guess must never override the operator,
+// not even when the guess looks more specific (go test ./... vs a shell check).
+func TestPrepareSoloRoot_OperatorAcceptanceWins(t *testing.T) {
+	o := newSoloOrch(t, &llm.ScriptedClient{}, nil)
+	o.cfg.DoDCommands = []string{"go vet ./...", "go test ./..."}
+	// Make the workspace look like a Go project so the derived acceptance
+	// would have something tempting to say.
+	if err := os.WriteFile(filepath.Join(o.sandbox.Root, "go.mod"), []byte("module app\n\ngo 1.21\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	auto, err := o.prepareSoloRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if auto {
+		t.Fatal("operator acceptance must not be re-resolved as the workspace changes")
+	}
+	root, _ := o.tree.CloneNode(o.tree.RootID)
+	if got := strings.Join(root.DoD.Commands, " ; "); got != "go vet ./... ; go test ./..." {
+		t.Fatalf("acceptance = %q, want the operator's two commands", got)
+	}
+	if root.DoD.TimeoutSec != soloAcceptanceTimeout {
+		t.Errorf("timeout = %d, want %d", root.DoD.TimeoutSec, soloAcceptanceTimeout)
+	}
+	// And it must survive an auto-refresh attempt.
+	s := &soloSession{o: o, sb: o.sandbox, autoAcceptance: auto}
+	s.refreshAcceptance(root)
+	if len(root.DoD.Commands) != 2 {
+		t.Fatalf("acceptance was overwritten: %v", root.DoD.Commands)
+	}
+}
+
+// TestRunSolo_EscalatesOnRepeatedFailure: the second identical failure must
+// change the instruction, not just repeat it. A measured phys2d run failed the
+// same penetration check twice and got worse (0.0985 -> 0.3973) because both
+// repairs were guesses at the same lines.
+func TestRunSolo_EscalatesOnRepeatedFailure(t *testing.T) {
+	client := &llm.ScriptedClient{Handle: func(context.Context, llm.Request) (*llm.Response, error) {
+		return action(t, `{"thought":"done","action":"finish","args":{"summary":"trust me"}}`), nil
+	}}
+	o := newSoloOrch(t, client, []string{"test -f never-created.txt"})
+	o.cfg.SoloRounds = 3
+	o.cfg.MaxStall = 10 // do not stop early; we want to inspect round 3's prompt
+
+	if err := o.RunSolo(context.Background()); err == nil {
+		t.Fatal("RunSolo should have failed")
+	}
+	if len(client.Requests) < 3 {
+		t.Fatalf("only %d requests, want 3 rounds", len(client.Requests))
+	}
+
+	contents := func(i int) string {
+		var b strings.Builder
+		for _, m := range client.Requests[i].Messages {
+			b.WriteString(m.Content)
+			b.WriteString("\n")
+		}
+		return b.String()
+	}
+	if !strings.Contains(contents(1), "Acceptance FAILED") {
+		t.Error("round 2 should carry the plain repair prompt")
+	}
+	if strings.Contains(contents(1), "Do NOT edit the same lines again") {
+		t.Error("round 2 escalated before the same failure had repeated")
+	}
+	if got := contents(2); !strings.Contains(got, "Do NOT edit the same lines again") {
+		t.Errorf("round 3 did not escalate to a strategy change")
+	} else if !strings.Contains(got, "Observe it") {
+		t.Error("escalation does not demand an observation")
+	}
+}
+
+// TestRunSolo_StopsEarlyOnStall: repeating the same failure is not progress,
+// so -max-stall applies to solo too. Without this the knob is documented for
+// leaves and silently ignored by the mode that runs everything in one loop.
+func TestRunSolo_StopsEarlyOnStall(t *testing.T) {
+	client := &llm.ScriptedClient{Handle: func(context.Context, llm.Request) (*llm.Response, error) {
+		return action(t, `{"thought":"done","action":"finish","args":{"summary":"trust me"}}`), nil
+	}}
+	o := newSoloOrch(t, client, []string{"test -f never-created.txt"})
+	o.cfg.SoloRounds = 10
+	o.cfg.MaxStall = 2
+
+	err := o.RunSolo(context.Background())
+	if err == nil {
+		t.Fatal("RunSolo should have failed")
+	}
+	if !strings.Contains(err.Error(), "repeated 2 times") {
+		t.Errorf("error = %q, want the stall reason", err)
+	}
+	if len(client.Requests) != 2 {
+		t.Fatalf("%d requests, want 2 — the stall guard should stop the loop", len(client.Requests))
+	}
+	root, _ := o.tree.CloneNode(o.tree.RootID)
+	if root.State != models.TaskStateFailed {
+		t.Fatalf("root state = %s, want FAILED", root.State)
+	}
+}
+
+// TestSoloNoteFailure_ResetsOnDifferentFailure: only an identical failure
+// counts as a stall. A run whose acceptance improves should keep its budget.
+func TestSoloNoteFailure_ResetsOnDifferentFailure(t *testing.T) {
+	o := newSoloOrch(t, &llm.ScriptedClient{}, []string{"test -f a.txt"})
+	s := &soloSession{o: o}
+	if got := s.noteFailure(VerifyResult{Command: "go test ./...", Output: "ball penetrated ground: y=-0.0985"}); got != 1 {
+		t.Fatalf("first failure run = %d", got)
+	}
+	// Same failure mode, different number: must still count as a repeat.
+	if got := s.noteFailure(VerifyResult{Command: "go test ./...", Output: "ball penetrated ground: y=-0.3973"}); got != 2 {
+		t.Fatalf("repeated failure run = %d, want 2", got)
+	}
+	// A genuinely different failure is new information, not a stall.
+	if got := s.noteFailure(VerifyResult{Command: "go test ./...", Output: "./vec: undefined: Dot"}); got != 1 {
+		t.Fatalf("different failure run = %d, want 1", got)
+	}
+	// A changed acceptance means the fingerprints are not comparable.
+	if got := s.noteFailure(VerifyResult{Command: "go vet ./...", Output: "ball penetrated ground: y=-0.0985"}); got != 1 {
+		t.Fatalf("failure under a new command run = %d, want 1", got)
+	}
+}
+
 func TestSoloContextBudget(t *testing.T) {
 	o := newSoloOrch(t, &llm.ScriptedClient{}, nil)
 	if got := o.soloContextBudget(); got != soloContextChars {

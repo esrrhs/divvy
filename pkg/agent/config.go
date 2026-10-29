@@ -82,6 +82,12 @@ type Config struct {
 	// characters). The full history stays in memory; only the window shrinks.
 	SoloContextChars int
 
+	// DoDCommands is an operator-supplied acceptance ("what counts as done").
+	// When set it wins over anything the planner or the toolchain defaults
+	// produce, for the root in tree mode and for the whole run in solo mode.
+	// Derived acceptance is a guess about the project; this is a contract.
+	DoDCommands []string
+
 	// LeafApproval controls the human diff-review gate that pauses after a
 	// leaf verifies and before its changes merge: "auto" (default, never
 	// pause — the CLI behavior) or "manual" (pause every leaf for approval;

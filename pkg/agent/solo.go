@@ -93,8 +93,10 @@ func (o *Orchestrator) RunSolo(ctx context.Context) (runErr error) {
 		rounds = soloDefaultRounds
 	}
 
-	var lastFailure string
+	var lastFailure, stallNote string
+	roundsRun := 0
 	for round := 1; round <= rounds; round++ {
+		roundsRun = round
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -142,17 +144,43 @@ func (o *Orchestrator) RunSolo(ctx context.Context) (runErr error) {
 		})
 		o.log.Warnf("solo round %d failed acceptance: %s", round, vr.Command)
 
+		// Same failure twice means the previous repair did not address the
+		// cause. Retrying in place a third time is what burned a measured run
+		// from a 0.0985 penetration to a 0.3973 one: the model kept editing
+		// the same lines with a fresh guess instead of changing strategy.
+		if same := s.noteFailure(vr); same >= 2 {
+			if o.cfg.MaxStall > 0 && same >= o.cfg.MaxStall {
+				stallNote = fmt.Sprintf("the identical failure repeated %d times, so retrying in place was stopped early (raise -max-stall or -solo-rounds to continue)", same)
+				o.log.Errorf("solo stalled: %s", stallNote)
+				o.events.Record("solo_stall", root.ID, map[string]any{
+					"run":    same,
+					"limit":  o.cfg.MaxStall,
+					"output": clip(vr.Output, evReasonChars),
+				})
+				break
+			}
+			o.log.Warnf("solo round %d failed the same way as the previous round; escalating to a strategy change", round)
+			s.journal.escalation++
+			o.events.Record("solo_escalate", root.ID, map[string]any{
+				"run":     same,
+				"command": vr.Command,
+			})
+		}
+
 		// The whole point of solo: the failure lands in the conversation that
 		// produced the code, so the model repairs it with full context instead
 		// of a fresh leaf re-deriving the project from a contract.
-		s.msgs = append(s.msgs, llm.Message{Role: llm.RoleUser, Content: soloRepairPrompt(vr)})
+		s.msgs = append(s.msgs, llm.Message{Role: llm.RoleUser, Content: soloRepairFor(vr, s.sameFailure)})
 		s.journal.noteFailure(vr.Command)
 		if err := o.checkpoint(); err != nil {
 			return err
 		}
 	}
 
-	msg := fmt.Sprintf("acceptance still failing after %d rounds", rounds)
+	msg := fmt.Sprintf("acceptance still failing after %d rounds", roundsRun)
+	if stallNote != "" {
+		msg = fmt.Sprintf("acceptance still failing after %d rounds: %s", roundsRun, stallNote)
+	}
 	if lastFailure != "" {
 		msg += ": " + truncate(lastFailure, 1000)
 	}
@@ -183,8 +211,16 @@ func (o *Orchestrator) prepareSoloRoot() (autoAcceptance bool, err error) {
 		return false, fmt.Errorf("session %s already has %d planned subtasks; -solo needs a fresh session (do not combine it with -resume of a tree run)",
 			o.tree.ID, len(root.ChildrenIDs))
 	}
-	autoAcceptance = len(root.DoD.Commands) == 0
-	if autoAcceptance {
+	switch {
+	case len(o.cfg.DoDCommands) > 0:
+		// An operator-supplied acceptance is a contract, not a guess: it does
+		// not follow the workspace and is never re-resolved.
+		root.DoD = models.DoD{
+			Commands:   append([]string(nil), o.cfg.DoDCommands...),
+			TimeoutSec: soloAcceptanceTimeout,
+		}
+	case len(root.DoD.Commands) == 0:
+		autoAcceptance = true
 		root.DoD = models.DoD{TimeoutSec: soloAcceptanceTimeout}
 		soloAcceptanceFor(&root.DoD, tools.DetectProject(o.sandbox.Root))
 	}
@@ -288,6 +324,29 @@ type soloSession struct {
 	// the evolving workspace is legitimate.
 	autoAcceptance bool
 	journal        soloJournal
+
+	// failureFP / sameFailure track repeated acceptance failures across
+	// rounds. Fingerprints come from stall.go, so "penetrated by 0.0985" and
+	// "penetrated by 0.3973" compare equal: same failure mode, different
+	// number. That is exactly the case where retrying in place is wasted.
+	failureFP   string
+	sameFailure int
+}
+
+// noteFailure folds one failed acceptance into the streak and returns its new
+// length (1 = a new failure mode). A fingerprint is only comparable when the
+// command that failed is the same, so a changed acceptance resets the streak.
+func (s *soloSession) noteFailure(vr VerifyResult) int {
+	fp := stallFingerprint(s.o.projectType(), vr.Command+"\n"+vr.Output)
+	switch {
+	case fp == "":
+		s.failureFP, s.sameFailure = "", 1
+	case fp == s.failureFP:
+		s.sameFailure++
+	default:
+		s.failureFP, s.sameFailure = fp, 1
+	}
+	return s.sameFailure
 }
 
 // runRound runs up to steps tool calls. finished reports that the model called
@@ -486,11 +545,12 @@ func messageChars(m llm.Message) int {
 // which commands failed. It is rendered only when history is elided, so the
 // model never loses the thread of its own work.
 type soloJournal struct {
-	files   []string
-	deletes []string
-	cmds    int
-	fails   []string
-	calls   int
+	files      []string
+	deletes    []string
+	cmds       int
+	fails      []string
+	calls      int
+	escalation int
 }
 
 func (j *soloJournal) note(act taggedAction, out string, callErr error) {
@@ -561,6 +621,9 @@ func (j *soloJournal) render(elided int) string {
 			fmt.Fprintf(&b, "  - %s\n", f)
 		}
 	}
+	if j.escalation > 0 {
+		fmt.Fprintf(&b, "You were already told %d time(s) that editing in place was not working and to observe before changing code.\n", j.escalation)
+	}
 	b.WriteString("Re-read any file you need before editing it; the log above is a summary, not the content.")
 	return b.String()
 }
@@ -585,6 +648,35 @@ How this run works:
 
 Start now.`)
 	return b.String()
+}
+
+func soloRepairFor(vr VerifyResult, same int) string {
+	if same < 2 {
+		return soloRepairPrompt(vr)
+	}
+	return soloEscalationPrompt(vr, same)
+}
+
+// soloEscalationPrompt is the second-repetition message. Plain "fix it again"
+// does not work once the model has already guessed twice: the failing case is
+// usually a wrong mental model, not a missing line, so the demand is to
+// observe before editing. The wording is deliberately project-agnostic.
+func soloEscalationPrompt(vr VerifyResult, same int) string {
+	return fmt.Sprintf(`Acceptance FAILED again, the same way as the previous %d rounds. Exit code %d from: %s
+
+%s
+
+Your last fix did not change the outcome. Do NOT edit the same lines again on another hunch, and do NOT loosen the assertion to make it pass — that is how the previous attempt made it worse.
+
+Change strategy:
+1. Say in one sentence what you believe the cause is, and what observation would confirm or refute it.
+2. Observe it. Print the intermediate values around the failure, add a temporary debug output, or run the failing scenario in a small scratch program that prints state step by step.
+3. If your observation contradicts your theory, discard the theory and form a new one. Do not tune numbers until something passes.
+4. Only after the observation explains the failure, change the code at the place the observation points to.
+5. Re-run the acceptance command yourself.
+
+The full history of what you built is still in this conversation. Keep everything that already works.`,
+		same, vr.ExitCode, vr.Command, truncate(vr.Output, 6000))
 }
 
 func soloRepairPrompt(vr VerifyResult) string {
