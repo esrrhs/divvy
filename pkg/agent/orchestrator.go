@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/esrrhs/divvy/pkg/cost"
@@ -53,6 +54,15 @@ type Orchestrator struct {
 	// (manual approval mode). Nil means the configured mode degrades to
 	// auto-approve with a warning.
 	leafApproval LeafApprovalHook
+
+	// wave is the plan → run → aggregate loop's bookkeeping (see wave.go).
+	wave waveState
+
+	// planning counts in-flight decompositions. The wave throttle reads it to
+	// avoid a second expansion in the same pass: a decomposition in progress
+	// has not grown the tree yet, so pending-leaf count underestimates the
+	// frontier and the cap would leak.
+	planning atomic.Int32
 }
 
 // SetLeafApprovalHook installs the human review gate used in manual mode.
@@ -373,6 +383,19 @@ func (o *Orchestrator) Run(ctx context.Context) (runErr error) {
 	// to is a dead end that -resume can never escape.
 	o.healPlanStructure()
 
+	// Where does the workspace stand before any leaf runs? Knowing this keeps a
+	// project that was already broken from being blamed on the first wave.
+	if o.waveEnabled() {
+		o.baselineAggregate(ctx)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if len(o.aggregateCommands()) == 0 || !o.aggregateReady() {
+			o.log.Infof("wave loop: nothing to aggregate yet; waves are throttled, but the build is " +
+				"only checked once the project has code (use -aggregate to force a command)")
+		}
+	}
+
 	parallel := o.parallel()
 	done := make(chan string, 64)
 	var mu sync.Mutex
@@ -446,6 +469,34 @@ func (o *Orchestrator) Run(ctx context.Context) (runErr error) {
 			_ = o.checkpoint()
 			return err
 		}
+		mu.Lock()
+		err := firstErr
+		busy := len(inFlight)
+		claims := make(map[string]bool, len(outputClaims))
+		for k := range outputClaims {
+			claims[k] = true
+		}
+		mu.Unlock()
+
+		// Wave boundary: everything planned has landed. Check the workspace as a
+		// whole before planning more — this is what makes the run a loop instead
+		// of a single up-front decomposition followed by one late assembly.
+		//
+		// It runs before goal acceptance on purpose. Acceptance is the expensive,
+		// end-to-end claim, and spending it on a workspace that does not even
+		// build wastes it: an aggregate failure also has a clear owner (the
+		// repair leaf), where an acceptance failure after a hundred leaves
+		// belongs to nobody in particular.
+		if busy == 0 && err == nil && o.waveBoundary() {
+			if err := o.runWaveAggregate(ctx); err != nil {
+				wg.Wait()
+				o.logUsage()
+				_ = o.checkpoint()
+				return err
+			}
+			continue
+		}
+
 		// Goal-level acceptance: when every child of a compound root is done,
 		// run the end-to-end DoD before the root is allowed to complete.
 		if o.sched.RootNeedsAcceptance() {
@@ -485,47 +536,53 @@ func (o *Orchestrator) Run(ctx context.Context) (runErr error) {
 			}
 			return fmt.Errorf("root task failed: %s", msg)
 		}
-		mu.Lock()
-		err := firstErr
-		busy := len(inFlight)
-		mu.Unlock()
 		if err != nil && busy == 0 {
 			_ = o.checkpoint()
 			return err
 		}
 
 		progressed := false
+		ready := o.sched.GetReadyLeafNodesAvoiding(claims)
 
-		// Decomposition fills the tree; leaves then fill the pool.
-		if node := o.sched.GetNextDecomposableNode(); node != nil {
-			n := node
-			if started, _ := tryDispatch(n.ID, nil, func(c context.Context) error {
-				if derr := o.decompose(c, n); derr != nil {
-					if c.Err() != nil {
-						o.parkInterrupted(n.ID)
-					} else {
-						o.log.Errorf("decompose %s: %v", n.ID, derr)
-						_ = o.sched.UpdateNodeState(n.ID, models.TaskStateFailed, derr.Error())
+		// Decomposition fills the tree, but only while the wave has room: the
+		// frontier is capped at -wave leaves so the planner has to look at real
+		// code before it thinks about more of the goal.
+		if o.waveHasRoom(len(ready) == 0) {
+			if node := o.sched.GetNextDecomposableNode(); node != nil {
+				n := node
+				if started, _ := tryDispatch(n.ID, nil, func(c context.Context) error {
+					o.planning.Add(1)
+					defer o.planning.Add(-1)
+					if derr := o.decompose(c, n); derr != nil {
+						if c.Err() != nil {
+							o.parkInterrupted(n.ID)
+						} else {
+							o.log.Errorf("decompose %s: %v", n.ID, derr)
+							_ = o.sched.UpdateNodeState(n.ID, models.TaskStateFailed, derr.Error())
+						}
 					}
+					return nil
+				}); started {
+					progressed = true
 				}
-				return nil
-			}); started {
-				progressed = true
+				// New leaves may carry weak contracts; surface that before they run.
+				reportPlanWarnings()
+				// A decomposition can free ready leaves; recompute rather than
+				// running a list taken before the tree grew.
+				ready = o.sched.GetReadyLeafNodesAvoiding(claims)
 			}
-			// New leaves may carry weak contracts; surface that before they run.
-			reportPlanWarnings()
 		}
-		mu.Lock()
-		claims := make(map[string]bool, len(outputClaims))
-		for k := range outputClaims {
-			claims[k] = true
-		}
-		mu.Unlock()
-		for _, leaf := range o.sched.GetReadyLeafNodesAvoiding(claims) {
+		for _, leaf := range ready {
 			lf := leaf
 			leafClaims := engine.OutputSetClaims(lf.Contract.Outputs)
 			started, poolFull := tryDispatch(lf.ID, leafClaims, func(c context.Context) error {
-				return o.executeLeaf(c, lf)
+				if lerr := o.executeLeaf(c, lf); lerr != nil {
+					return lerr
+				}
+				// Only landed work counts towards a wave: a failed leaf is
+				// handled by the retry/failure path, not by aggregation.
+				o.wave.noteLeaf()
+				return nil
 			})
 			if poolFull {
 				break

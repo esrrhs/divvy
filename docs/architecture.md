@@ -35,10 +35,13 @@ cmd/divvy            CLI：flag 解析、模式分发、信号处理
 NewFromGoal / Load
    └─ Orchestrator.Run
         ├─ startBudget            会话级 token / 美元硬上限（含 resume 前的花费）
+        ├─ baselineAggregate      叶子跑之前先量一次工作区（wave.go）
         ├─ reportPlanWarnings     契约体检（Run 与 -plan 都会跑）
         └─ 主循环
-             ├─ GetNextDecomposableNode → decompose      填树
-             ├─ GetReadyLeafNodesAvoiding(claims)         取就绪叶子（跳过产出冲突）
+             ├─ waveBoundary → runWaveAggregate     整波落地 → 整仓构建/测试
+             │     └─ 失败 → ensureRepairLeaf       聚合失败的活成为下一波第一个任务
+             ├─ GetNextDecomposableNode → decompose  填树（受 waveHasRoom 节流）
+             ├─ GetReadyLeafNodesAvoiding(claims)     取就绪叶子（跳过产出冲突）
              │     └─ executeLeaf
              │          ├─ newLeafMirror                  -isolate：建镜像 + 限定沙箱
              │          ├─ runWorker                      干净上下文 + 工具循环
@@ -47,6 +50,26 @@ NewFromGoal / Load
              ├─ RootNeedsAcceptance → verifyRootAcceptance 端到端验收
              └─ IsComplete / HasFailed
 ```
+
+### 波次循环：拆分 → 执行 → 聚合 → 再拆分
+
+主循环不是"开局拆完、最后装一次"，而是一圈圈转。实现在 `pkg/agent/wave.go`：
+
+| 环节 | 函数 | 判据 |
+|---|---|---|
+| 节流 | `waveHasRoom` | 已规划未执行的叶子数 < `-wave`；能跑的叶子为空时强制放行（否则死锁）；有拆解在途时一律不放行 |
+| 波边界 | `waveBoundary` | 有叶子落地、没有未终止叶子、根未完成也未失败 |
+| 聚合 | `runWaveAggregate` | 跑 `-aggregate` 或按工具链推断的整仓命令 |
+| 修复 | `ensureRepairLeaf` | 聚合失败的输出变成下一波第一个叶子（无产出、无依赖，立即可跑） |
+
+四个刻意的选择：
+
+1. **聚合先于根验收。** 验收是昂贵且不对人的端到端断言；工作区根本构建不过时跑它只是浪费，而聚合失败有明确责任人（修复叶子）。顺序在 `orchestrator.go` 主循环里，`waveBoundary` 分支在 `RootNeedsAcceptance` 之前。
+2. **一次只放一个拆解在途。** 拆解是异步的，`PendingLeafCount` 在它返回前仍是旧边界，若不拦住就会超额放行一整棵子树。`Orchestrator.planning` 计数即为此。
+3. **基线只对"已有源码"的工作区成立。** 空工作区里 `go test ./...` 必然失败（"no packages to test"），若记成基线，之后每次失败都会被判成"历史问题"而永不修复——恰好废掉这个机制。所以 `baselineAggregate` 先查 `hasSources`，没有源码就不记基线，由本次运行承担后果。
+4. **`-wave 0` 是诚实对照组。** 关闭节流、聚合、修复叶子，回到旧的平坦行为，用来对比同一目标在两种模式下的叶子数、token 与"最后能不能跑起来"。
+
+节流是**近似**的：判据在拆解之前算，一次拆解可能吐出多于剩余额度的叶子。这是有意的——精确配额会把一次拆解切碎，而拆解的粒度本来就是模型给的。
 
 ### 状态机
 
@@ -134,7 +157,9 @@ NewFromGoal / Load
 
 ## 会话事后分析
 
-`-log`（原始文本）与 `-events`（JSONL，便于 `jq`）覆盖细粒度回溯；`-report` 是二者的**汇总视图**：目标、进度、token 与估算成本、事件计数（llm/工具/验收失败/重试/停滞/重拆/放弃/超时）、任务树、逐节点的 token 与成本表，以及失败节点的最后错误。它只读持久化状态，因此对失败或被中断的会话同样可用——那正是需要它的时候。
+`-log`（原始文本）与 `-events`（JSONL，便于 `jq`）覆盖细粒度回溯；`-report` 是二者的**汇总视图**：目标、进度、token 与估算成本、事件计数（llm/工具/验收失败/重试/停滞/重拆/放弃/超时，以及波次循环的聚合次数/失败次数/修复叶子数）、任务树、逐节点的 token 与成本表，以及失败节点的最后错误。它只读持久化状态，因此对失败或被中断的会话同样可用——那正是需要它的时候。
+
+聚合一行只在循环真的跑过时才出现（`-wave 0` 的会话不会挂一排零）：通过的次数和失败的次数分开记，否则"聚合了 5 次"既可能是全程绿灯，也可能是坏了 4 次。
 
 事件汇总由 `agent.SummarizeEvents` 完成（无法解析的行只计数、不中断解析）；`-prune -keep N` 清理旧会话（含其日志与事件流），`LATEST` 指向的会话永不删，`-dry-run` 可先看清单。
 

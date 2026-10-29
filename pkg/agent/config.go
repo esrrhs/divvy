@@ -88,6 +88,24 @@ type Config struct {
 	// Derived acceptance is a guess about the project; this is a contract.
 	DoDCommands []string
 
+	// Wave bounds how many leaves may be planned-but-not-yet-executed at once.
+	// Decomposition is throttled by it, which turns "plan the whole tree up
+	// front" into "plan one wave, run it, look at what it produced, plan the
+	// next". 0 disables the throttle (the old flat behaviour).
+	Wave int
+
+	// AggregateCommands is the whole-workspace check run at every wave
+	// boundary: "does the project still build and pass its tests?". It is not
+	// the goal acceptance — it does not require an entry point or an
+	// end-to-end run, only that the last wave did not break the build. Empty
+	// means "derive from the toolchain".
+	AggregateCommands []string
+
+	// MaxAggregateFails bounds consecutive aggregate failures before the run
+	// gives up (0 = unlimited). A run whose every wave breaks the build is not
+	// making progress, however busy it looks.
+	MaxAggregateFails int
+
 	// LeafApproval controls the human diff-review gate that pauses after a
 	// leaf verifies and before its changes merge: "auto" (default, never
 	// pause — the CLI behavior) or "manual" (pause every leaf for approval;
@@ -123,6 +141,8 @@ func DefaultConfig() Config {
 		MaxRedecompose:   2,
 		DecomposeTries:   0,
 		Parallel:         1,
+		Wave:             3,
+		MaxAggregateFails: 4,
 		RetryMinInterval: time.Second,
 		RetryMaxInterval: 30 * time.Second,
 		Stream:           true,

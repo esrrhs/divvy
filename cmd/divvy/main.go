@@ -65,6 +65,17 @@ func run(args []string) error {
 		}
 		return nil
 	})
+	var aggregateFlags []string
+	fs.Func("aggregate", "whole-workspace `command` run at every wave boundary (build+tests); repeatable, and one value may hold several separated by ';'. Empty = derive from the toolchain", func(v string) error {
+		for _, c := range strings.Split(v, ";") {
+			if c = strings.TrimSpace(c); c != "" {
+				aggregateFlags = append(aggregateFlags, c)
+			}
+		}
+		return nil
+	})
+	wave := fs.Int("wave", cfg.Wave, "leaves that may be planned but not yet executed; decomposition stops there so the planner sees real code before thinking further (0 = old flat behaviour, no throttle and no aggregate)")
+	maxAggFails := fs.Int("max-aggregate-fails", cfg.MaxAggregateFails, "give up after this many consecutive wave aggregates fail (0 = never)")
 	strict := fs.Bool("strict", false, "with -plan: exit non-zero when the plan or workspace layout check reports warnings")
 	gitCommit := fs.Bool("git-commit", false, "git commit each leaf's merged changes (workdir must be a git repo)")
 	native := fs.Bool("native-tools", false, "use OpenAI tool_calls instead of JSON actions")
@@ -112,6 +123,9 @@ func run(args []string) error {
 	cfg.SoloRounds = *soloRounds
 	cfg.SoloContextChars = *soloContext
 	cfg.DoDCommands = dodFlags
+	cfg.AggregateCommands = aggregateFlags
+	cfg.Wave = *wave
+	cfg.MaxAggregateFails = *maxAggFails
 	cfg.MaxStall = *maxStall
 	cfg.MaxElapsed = *maxElapsed
 	cfg.RetryMaxInterval = *retryMaxWait
@@ -171,6 +185,10 @@ func run(args []string) error {
 	cfg.WorkDir = absWork
 
 	log := agent.NewLogger(cfg.Verbose)
+
+	if cfg.Wave <= 0 && len(cfg.AggregateCommands) > 0 {
+		log.Warnf("-aggregate has no effect with -wave 0: the wave loop and its aggregate check are both off")
+	}
 
 	if *interactive && *guided {
 		return fmt.Errorf("-interactive and -guided are mutually exclusive; choose one")

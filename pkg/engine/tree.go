@@ -235,6 +235,39 @@ func (t *TaskTree) NodeIDsInStates(states ...models.TaskState) []string {
 	return ids
 }
 
+// PendingLeafCount counts leaves that are planned but not yet finished.
+//
+// It is the throttle signal for incremental decomposition: the orchestrator
+// stops expanding the tree while this is at or above the wave size, so a run
+// never plans fifty leaves before the first one has produced any code.
+func (t *TaskTree) PendingLeafCount() int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	n := 0
+	for _, node := range t.Nodes {
+		if node.Type != models.NodeTypeLeaf || node.State.IsTerminal() {
+			continue
+		}
+		n++
+	}
+	return n
+}
+
+// CompletedLeafCount counts leaves that finished successfully.
+func (t *TaskTree) CompletedLeafCount() int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	n := 0
+	for _, node := range t.Nodes {
+		if node.Type == models.NodeTypeLeaf && node.State == models.TaskStateCompleted {
+			n++
+		}
+	}
+	return n
+}
+
 // Leaves returns clones of all leaf nodes, ordered by ID.
 func (t *TaskTree) Leaves() []*models.TaskNode {
 	t.mu.RLock()

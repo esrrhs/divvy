@@ -62,6 +62,12 @@ func (o *Orchestrator) Report() string {
 		fmt.Fprintf(&b, "events   %d  (llm %d, tool %d, verify-fail %d, retry %d, stall %d, resplit %d, giveup %d, timeout %d)\n",
 			ev.Total(), ev.LLMCalls, ev.ToolCalls, ev.VerifyFail, ev.Retries,
 			ev.Stalls, ev.Resplits, ev.GiveUps, ev.Timeouts)
+		// Only when the loop actually ran: "-wave 0" runs should not be padded
+		// with a row of zeroes that looks like a broken aggregate.
+		if ev.Aggregates > 0 || ev.Repairs > 0 {
+			fmt.Fprintf(&b, "waves    %d aggregate check(s), %d failed, %d repair leaf(s)\n",
+				ev.Aggregates, ev.AggregateFails, ev.Repairs)
+		}
 		if ev.Outcome != "" {
 			fmt.Fprintf(&b, "outcome  %s in %s\n", ev.Outcome, time.Duration(ev.DurationMS*int64(time.Millisecond)))
 		}

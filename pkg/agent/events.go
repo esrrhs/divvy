@@ -439,12 +439,18 @@ type EventSummary struct {
 	Resplits   int
 	GiveUps    int
 	Timeouts   int
-	Outcome    string    // from the newest session_end, "" if the run never ended cleanly
-	DurationMS int64     // wall clock of the newest session_end
-	FirstTS    time.Time // newest session_start, i.e. the latest entry point
-	LastTS     time.Time
-	Malformed  int // lines that were not valid JSON objects
-	Available  bool
+	// Wave loop counters. A run that never aggregates looks exactly like one
+	// that aggregated and always passed unless these are recorded separately,
+	// which hides the distinction the whole loop exists to make.
+	Aggregates     int // whole-workspace build/test checks run
+	AggregateFails int // how many of those failed
+	Repairs        int // repair leaves queued for a broken aggregate
+	Outcome        string    // from the newest session_end, "" if the run never ended cleanly
+	DurationMS     int64     // wall clock of the newest session_end
+	FirstTS        time.Time // newest session_start, i.e. the latest entry point
+	LastTS         time.Time
+	Malformed      int // lines that were not valid JSON objects
+	Available      bool
 }
 
 // SummarizeEvents reads one session's event stream and rolls it up. A missing
@@ -493,6 +499,13 @@ func SummarizeEvents(path string) (EventSummary, error) {
 			s.GiveUps++
 		case "leaf_timeout":
 			s.Timeouts++
+		case "wave_aggregate":
+			s.Aggregates++
+			if ok, isBool := ev["ok"].(bool); isBool && !ok {
+				s.AggregateFails++
+			}
+		case "wave_repair":
+			s.Repairs++
 		case "session_start":
 			if ts, ok := eventTime(ev); ok {
 				s.FirstTS = ts
