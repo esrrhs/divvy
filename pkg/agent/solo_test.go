@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -534,6 +535,36 @@ func TestRunSolo_AuditsGoalBeforeFinishing(t *testing.T) {
 	// A single audit, not one per round.
 	if n := strings.Count(audit, "audit the goal itself"); n != 1 {
 		t.Fatalf("audit appears %d times", n)
+	}
+}
+
+// TestRunSolo_SavesTranscriptWhenACallFails: a run that dies of an upstream
+// error is exactly the one worth resuming, and the periodic checkpoint is 10
+// steps away. A real run lost its whole transcript at step 7 this way.
+func TestRunSolo_SavesTranscriptWhenACallFails(t *testing.T) {
+	calls := 0
+	client := &llm.ScriptedClient{Handle: func(context.Context, llm.Request) (*llm.Response, error) {
+		calls++
+		if calls == 1 {
+			return action(t, `{"thought":"write","action":"write_file","args":{"path":"partial.txt","content":"half\n"}}`), nil
+		}
+		return nil, errors.New("LLM HTTP 404: model not found")
+	}}
+	o := newSoloOrch(t, client, []string{"test -f hello.txt"})
+
+	if err := o.RunSolo(context.Background()); err == nil {
+		t.Fatal("RunSolo should have propagated the API error")
+	}
+	path := o.storage.GetSoloHistoryPath(o.tree.ID)
+	got, err := loadSoloHistory(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) < 3 {
+		t.Fatalf("transcript has %d messages, want the goal, the tool call and its result", len(got))
+	}
+	if !strings.Contains(joinedContents(got), "partial.txt") {
+		t.Error("transcript lost the work done before the failure")
 	}
 }
 

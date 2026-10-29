@@ -104,6 +104,15 @@ func (o *Orchestrator) RunSolo(ctx context.Context) (runErr error) {
 		s.msgs = append(prev, llm.Message{Role: llm.RoleUser, Content: o.soloResumePrompt(root)})
 		s.msgs[0] = system
 	}
+	// The periodic checkpoints are every 10 steps, which is a long way from
+	// "the run died". An upstream error at step 7 used to lose the whole
+	// transcript — and a run that dies of an API error is exactly the one you
+	// resume. This defer covers every exit path, including panics.
+	defer func() {
+		if err := saveSoloHistory(s.histPath, s.msgs); err != nil {
+			o.log.Warnf("solo transcript not saved at exit: %v", err)
+		}
+	}()
 
 	steps := o.cfg.SoloSteps
 	if steps < 1 {
