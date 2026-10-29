@@ -52,6 +52,10 @@ func run(args []string) error {
 	parallelN := fs.Int("parallel", cfg.Parallel, "leaves to execute concurrently (only safe when leaves touch different files, unless -isolate)")
 	isolate := fs.Bool("isolate", false, "run each leaf in a workspace mirror, merge only on success (default: on when -parallel > 1)")
 	plan := fs.Bool("plan", false, "decompose into a task tree and exit without executing (run later with -resume)")
+	solo := fs.Bool("solo", false, "run the whole goal in ONE conversation, no decomposition (for goals that fit a context window)")
+	soloSteps := fs.Int("solo-steps", 0, "with -solo: tool calls per round (default 80)")
+	soloRounds := fs.Int("solo-rounds", 0, "with -solo: repair rounds after a failed acceptance (default 3)")
+	soloContext := fs.Int("solo-context", 0, "with -solo: conversation characters sent per request (default 100000)")
 	strict := fs.Bool("strict", false, "with -plan: exit non-zero when the plan or workspace layout check reports warnings")
 	gitCommit := fs.Bool("git-commit", false, "git commit each leaf's merged changes (workdir must be a git repo)")
 	native := fs.Bool("native-tools", false, "use OpenAI tool_calls instead of JSON actions")
@@ -94,6 +98,10 @@ func run(args []string) error {
 	cfg.ExtraJSON = *extra
 	cfg.MaxSteps = *maxSteps
 	cfg.MaxRetries = *maxRetries
+	cfg.Solo = *solo
+	cfg.SoloSteps = *soloSteps
+	cfg.SoloRounds = *soloRounds
+	cfg.SoloContextChars = *soloContext
 	cfg.MaxStall = *maxStall
 	cfg.MaxElapsed = *maxElapsed
 	cfg.RetryMaxInterval = *retryMaxWait
@@ -156,6 +164,9 @@ func run(args []string) error {
 
 	if *interactive && *guided {
 		return fmt.Errorf("-interactive and -guided are mutually exclusive; choose one")
+	}
+	if *solo && *plan {
+		return fmt.Errorf("-solo and -plan are mutually exclusive: -plan builds a task tree, -solo deliberately has none")
 	}
 
 	if *serve {
@@ -267,7 +278,7 @@ func run(args []string) error {
 	}
 
 	if *status {
-		o, err := agent.Load(cfg, nil, log)
+		o, err := agent.LoadSnapshot(cfg, nil, log)
 		if err != nil {
 			return err
 		}
@@ -276,7 +287,7 @@ func run(args []string) error {
 	}
 
 	if *report {
-		o, err := agent.Load(cfg, nil, log)
+		o, err := agent.LoadSnapshot(cfg, nil, log)
 		if err != nil {
 			return err
 		}
@@ -326,9 +337,12 @@ func run(args []string) error {
 	defer cancel()
 
 	start := time.Now()
-	if *plan {
+	switch {
+	case *plan:
 		err = o.RunPlan(ctx)
-	} else {
+	case cfg.Solo:
+		err = o.RunSolo(ctx)
+	default:
 		err = o.Run(ctx)
 	}
 	if err == context.Canceled || err == context.DeadlineExceeded {
@@ -449,6 +463,7 @@ Examples:
 
   divvy -plan -workdir ./ws "目标"   # 只拆解，检查任务树
   divvy -plan -strict -workdir ./ws "目标"   # 拆解 + 严格检查（CI 友好）
+  divvy -solo -workdir ./ws "目标"   # 单上下文跑完整个目标，不拆解（目标能装进一个上下文时首选）
   divvy -interactive -workdir .      # 交互式多轮开发（/help、/exit）
   divvy -resume -workdir ./ws        # 再执行
 

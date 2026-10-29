@@ -66,6 +66,22 @@ type Config struct {
 	GitCommit bool // commit each leaf's merged changes to the workdir git repo
 	Strict    bool // plan mode: fail on plan-check warnings
 
+	// Solo runs the whole goal in ONE conversation instead of decomposing it:
+	// one sandbox, one growing history, and acceptance failures fed back into
+	// the same context. It is the right shape when the goal plausibly fits in
+	// one context window; the tree stays the default for larger work because
+	// decomposition is what keeps a small model inside its window.
+	Solo bool
+	// SoloSteps is the per-round tool-call budget (0 = 80). A solo round is a
+	// whole deliverable, not one atomic file, so running out is normal.
+	SoloSteps int
+	// SoloRounds is how many repair rounds follow a failed acceptance when
+	// MaxRetries is 0 (0 = 3).
+	SoloRounds int
+	// SoloContextChars bounds the conversation sent per request (0 = 100k
+	// characters). The full history stays in memory; only the window shrinks.
+	SoloContextChars int
+
 	// LeafApproval controls the human diff-review gate that pauses after a
 	// leaf verifies and before its changes merge: "auto" (default, never
 	// pause — the CLI behavior) or "manual" (pause every leaf for approval;

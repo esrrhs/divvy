@@ -206,6 +206,29 @@ func NewFromGoal(cfg Config, client llm.Client, log *Logger) (*Orchestrator, err
 
 // Load resumes a saved session.
 func Load(cfg Config, client llm.Client, log *Logger) (*Orchestrator, error) {
+	o, err := loadTree(cfg, client, log, false)
+	if err != nil {
+		return nil, err
+	}
+	o.resetInterrupted()
+	return o, nil
+}
+
+// LoadSnapshot loads a saved session for inspection without the resume-side
+// repair. Read-only views (-status, -report) must show what was saved, not what
+// a resume would turn it into: resetInterrupted revives a FAILED leaf as
+// PENDING so it gets another attempt, which is wrong for a session that has
+// already ended and is only being looked at. A solo run is exactly that shape —
+// its whole tree is one leaf, so every failed solo session read back as
+// "PENDING / interrupted" while the report's own outcome line said "failed".
+//
+// It also trusts the saved workdir over the shell's, so `-report` run from
+// somewhere else describes the directory the session actually ran in.
+func LoadSnapshot(cfg Config, client llm.Client, log *Logger) (*Orchestrator, error) {
+	return loadTree(cfg, client, log, true)
+}
+
+func loadTree(cfg Config, client llm.Client, log *Logger, preferSavedWorkDir bool) (*Orchestrator, error) {
 	storage, err := engine.NewStorage(cfg.DataDir)
 	if err != nil {
 		return nil, err
@@ -224,15 +247,10 @@ func Load(cfg Config, client llm.Client, log *Logger) (*Orchestrator, error) {
 	if cfg.Goal == "" {
 		cfg.Goal = tree.Goal
 	}
-	if cfg.WorkDir == "." && tree.WorkDir != "" {
+	if tree.WorkDir != "" && (preferSavedWorkDir || cfg.WorkDir == ".") {
 		cfg.WorkDir = tree.WorkDir
 	}
-	o, err := New(cfg, tree, client, log)
-	if err != nil {
-		return nil, err
-	}
-	o.resetInterrupted()
-	return o, nil
+	return New(cfg, tree, client, log)
 }
 
 func bytesTrim(b []byte) string {
