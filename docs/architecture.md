@@ -96,6 +96,8 @@ NewFromGoal / Load
 2. **合并层（兜底）** — 契约没写产出（弱模型很常见）时调度层无从判断。`Mirror` 在快照时记录每个文件的 sha256，合并时若发现某文件在本叶子改动之后**又被别人改过**，整批放弃合并并返回 `*MergeConflictError`，绝不覆盖。此时该叶子会重建镜像重试，新镜像已含兄弟叶子的成果，失败重试因此变成一次"对齐"而非死循环。
 3. **布局层（前置）** — 符号链接让同一份文件拥有两个路径。副本镜像不携带链接（`copyTree` 跳过非常规文件），叶子在镜像里建 `core/x.go` 与另一叶子在 `internal/core/x.go` 上工作，在合并看来是两个不同文件；而合并若穿过链接，写入落到链接指向处而非待合并路径。启动时 `tools.CheckLayout` 只读目录项（不读源码、不跟随链接）报出符号链接与"模块路径 / 目录层级差一层"，合并阶段再用 `*MirrorLayoutError` 拦住穿越链接的写入。二者刻意分开：`MirrorLayoutError` **不是**并发冲突，重新快照得到同样的结果，重试只会空转。
 
+叶子在 verify 通过、合并之前还会跑 `tools.CheckLeafLayout`：模块路径与目录差一层、多余的 go.mod、契约产出落到模块同名目录下，都会以 `layout_drift` 让该叶子失败并给出 found vs expected 路径，避免 soft grep DoD 放行后让后续叶子烧 token 修 import。实现叶子的 DoD 应优先 compile/test；docs/test-only 叶子才允许只用 grep/`test -f`。弱模型连续空/非法 JSON 超过阈值会提前中止该 attempt，不再把 MaxSteps 烧完。
+
 `mergeMu` 只保证合并串行，不解决语义冲突——语义冲突由上面三层负责。
 
 ## 失败与恢复

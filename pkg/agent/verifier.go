@@ -45,6 +45,27 @@ func (o *Orchestrator) verify(ctx context.Context, sb *tools.Sandbox, node *mode
 			})
 			return VerifyResult{OK: false, Command: cmd, Output: msg, ExitCode: -1}
 		}
+		// One retry with a longer budget when the default-ish timeout fires:
+		// weak-model DoD often leaves TimeoutSec at 60 while go test needs more
+		// on a cold cache. Cap the bump so a hung command cannot run forever.
+		if res.TimedOut && timeout < 5*time.Minute {
+			retryTimeout := timeout * 2
+			if retryTimeout > 5*time.Minute {
+				retryTimeout = 5 * time.Minute
+			}
+			if retryTimeout > timeout {
+				o.log.Warnf("verify timeout on %s; retrying once with %s", cmd, retryTimeout)
+				o.events.Record("verify_timeout_retry", node.ID, map[string]any{
+					"command": cmd, "from_ms": timeout.Milliseconds(), "to_ms": retryTimeout.Milliseconds(),
+				})
+				retryStart := time.Now()
+				retryRes, retryErr := sb.RunBash(ctx, cmd, retryTimeout)
+				duration += time.Since(retryStart).Milliseconds()
+				if retryErr == nil {
+					res = retryRes
+				}
+			}
+		}
 		fmt.Fprintf(&combined, "$ %s\nexit %d\n%s\n%s\n", cmd, res.ExitCode, res.Stdout, res.Stderr)
 		if res.TimedOut {
 			msg := o.withDiagnostics(sb, combined.String()+"timed out\n")

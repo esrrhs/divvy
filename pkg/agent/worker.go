@@ -34,6 +34,7 @@ func (o *Orchestrator) runWorker(ctx context.Context, sb *tools.Sandbox, node *m
 	}
 
 	summary := ""
+	invalidRounds := 0
 	for step := 1; step <= maxSteps; step++ {
 		if err := ctx.Err(); err != nil {
 			return summary, err
@@ -55,12 +56,23 @@ func (o *Orchestrator) runWorker(ctx context.Context, sb *tools.Sandbox, node *m
 
 		actions := collectActions(resp)
 		if len(actions) == 0 {
+			invalidRounds++
+			o.events.Record("invalid_json", node.ID, map[string]any{
+				"step":    step,
+				"streak":  invalidRounds,
+				"snippet": clip(resp.Content, evReasonChars),
+			})
+			if invalidRounds >= maxInvalidJSONRounds {
+				return summary, fmt.Errorf("%w: %d consecutive empty/invalid JSON replies (refusing to burn the remaining step budget)",
+					ErrInvalidJSON, invalidRounds)
+			}
 			messages = append(messages,
 				llm.Message{Role: llm.RoleAssistant, Content: resp.Content},
-				llm.Message{Role: llm.RoleUser, Content: `Could not parse a tool call. Reply with ONLY JSON: {"thought":"...","action":"tool_name","args":{}}`},
+				llm.Message{Role: llm.RoleUser, Content: invalidJSONRetryPrompt(invalidRounds)},
 			)
 			continue
 		}
+		invalidRounds = 0
 
 		// Record assistant turn.
 		asst := llm.Message{Role: llm.RoleAssistant, Content: resp.Content, ToolCalls: resp.ToolCalls}
@@ -185,7 +197,27 @@ var ErrMaxSteps = errors.New("max tool calls reached")
 // stepBudgetWindow is how many calls before the end of the budget the worker
 // starts telling the model what it has left. Small models lose track of the
 // turn count long before the last call, so a late reminder is worth little.
-const stepBudgetWindow = 3
+const stepBudgetWindow = 5
+
+// maxInvalidJSONRounds is how many consecutive empty/unparseable model replies
+// the worker tolerates before aborting the attempt. Burning the full MaxSteps
+// budget on "please reply with JSON" loops is pure waste on weak models.
+const maxInvalidJSONRounds = 3
+
+// ErrInvalidJSON marks a leaf attempt that produced consecutive empty or
+// unparseable tool-call replies. Callers treat it like any other attempt
+// failure.
+var ErrInvalidJSON = errors.New("invalid JSON replies")
+
+func invalidJSONRetryPrompt(streak int) string {
+	return fmt.Sprintf(
+		"Could not parse a tool call (invalid/empty JSON, streak %d/%d). "+
+			"Reply with ONLY one JSON object and nothing else — no markdown fences, no commentary:\n"+
+			`{"thought":"short plan","action":"tool_name","args":{}}`+"\n"+
+			"Valid actions include list_dir, read_file, write_file, replace_lines, run_bash, finish.",
+		streak, maxInvalidJSONRounds,
+	)
+}
 
 // stepBudgetMessages returns the messages to send for one worker step. In the
 // last few steps it appends a reminder of how many tool calls remain, which
@@ -197,11 +229,19 @@ func (o *Orchestrator) stepBudgetMessages(messages []llm.Message, step, maxSteps
 	if remaining > stepBudgetWindow || remaining <= 0 {
 		return messages
 	}
-	hint := llm.Message{
-		Role: llm.RoleUser,
-		Content: fmt.Sprintf("[budget] %d tool call(s) left before this attempt is abandoned. "+
-			"Call finish now with a summary of what is done; do not start another edit.", remaining),
+	var content string
+	switch {
+	case remaining <= 1:
+		content = "[budget] LAST tool call. You MUST call finish now with a short summary of what is done. " +
+			"Do not edit, do not run another command — only finish."
+	case remaining <= 2:
+		content = fmt.Sprintf("[budget] %d tool call(s) left. Wrap up: if the task is done, call finish immediately; "+
+			"otherwise make one minimal fix then finish. Do not start a new feature.", remaining)
+	default:
+		content = fmt.Sprintf("[budget] %d tool call(s) left before this attempt is abandoned. "+
+			"Call finish soon with a summary of what is done; prefer finishing over another edit.", remaining)
 	}
+	hint := llm.Message{Role: llm.RoleUser, Content: content}
 	out := make([]llm.Message, 0, len(messages)+1)
 	out = append(out, messages...)
 	out = append(out, hint)
@@ -419,6 +459,9 @@ func (o *Orchestrator) projectContext(sb *tools.Sandbox, node *models.TaskNode, 
 	if prevError != "" {
 		fmt.Fprintf(&b, "\nPrevious attempt failed. Fix this error:\n%s\n", truncate(prevError, 4000))
 	}
+	b.WriteString("\nLayout reminder: write outputs at the contract paths relative to the workspace root; ")
+	b.WriteString("do not nest packages under a directory named after the Go module path; ")
+	b.WriteString("put go.mod only at the workspace root unless this task explicitly requires a nested module.\n")
 	b.WriteString("\nStart by listing or reading only what you need, then implement the task.")
 	return b.String()
 }

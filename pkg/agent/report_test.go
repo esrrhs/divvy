@@ -27,6 +27,8 @@ func TestSummarizeEvents(t *testing.T) {
 		`{"ts":"2026-01-01T00:00:07Z","kind":"leaf_resplit"}`,
 		`{"ts":"2026-01-01T00:00:08Z","kind":"leaf_giveup"}`,
 		`{"ts":"2026-01-01T00:00:09Z","kind":"leaf_timeout"}`,
+		`{"ts":"2026-01-01T00:00:09.05Z","kind":"layout_drift"}`,
+		`{"ts":"2026-01-01T00:00:09.06Z","kind":"invalid_json","streak":3}`,
 		`{"ts":"2026-01-01T00:00:09.1Z","kind":"wave_aggregate","ok":false,"cycle":1}`,
 		`{"ts":"2026-01-01T00:00:09.2Z","kind":"wave_repair"}`,
 		`{"ts":"2026-01-01T00:00:09.3Z","kind":"wave_aggregate","ok":true,"cycle":2}`,
@@ -52,6 +54,9 @@ func TestSummarizeEvents(t *testing.T) {
 		t.Fatalf("verify=%d retry=%d stall=%d resplit=%d giveup=%d timeout=%d",
 			s.VerifyFail, s.Retries, s.Stalls, s.Resplits, s.GiveUps, s.Timeouts)
 	}
+	if s.LayoutDrift != 1 || s.InvalidJSON != 1 {
+		t.Fatalf("layoutDrift=%d invalidJSON=%d", s.LayoutDrift, s.InvalidJSON)
+	}
 	// A passing and a failing aggregate must be told apart, and the repair
 	// counted: "aggregated 5 times" alone cannot distinguish "green throughout"
 	// from "broken four times".
@@ -64,11 +69,11 @@ func TestSummarizeEvents(t *testing.T) {
 	if s.Malformed != 1 {
 		t.Fatalf("malformed=%d, want 1", s.Malformed)
 	}
-	// 14 valid events: start, llm, 2x tool, verify, retry, stall, resplit,
-	// giveup, timeout, 2x aggregate, repair, end. The malformed line is counted
-	// separately.
-	if s.Total() != 14 {
-		t.Fatalf("total events=%d, want 14", s.Total())
+	// 16 valid events: start, llm, 2x tool, verify, retry, stall, resplit,
+	// giveup, timeout, layout_drift, invalid_json, 2x aggregate, repair, end.
+	// The malformed line is counted separately.
+	if s.Total() != 16 {
+		t.Fatalf("total events=%d, want 16", s.Total())
 	}
 	if !s.FirstTS.Equal(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)) {
 		t.Fatalf("first ts=%v", s.FirstTS)

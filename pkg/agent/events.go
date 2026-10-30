@@ -429,16 +429,18 @@ func (r *EventRecorder) LLMCall(kind, nodeID string, req llm.Request, resp *llm.
 // The tree already records where the run *ended*; this records how it got
 // there — how many attempts, retries and interventions it took.
 type EventSummary struct {
-	Counts     map[string]int // event kind -> occurrences
-	LLMCalls   int
-	ToolCalls  int
-	ToolErrors int
-	VerifyFail int
-	Retries    int
-	Stalls     int
-	Resplits   int
-	GiveUps    int
-	Timeouts   int
+	Counts      map[string]int // event kind -> occurrences
+	LLMCalls    int
+	ToolCalls   int
+	ToolErrors  int
+	VerifyFail  int
+	Retries     int
+	Stalls      int
+	Resplits    int
+	GiveUps     int
+	Timeouts    int
+	LayoutDrift int // layout_drift / layout_warning that blocked a leaf
+	InvalidJSON int // consecutive empty/unparseable tool-call replies
 	// Wave loop counters. A run that never aggregates looks exactly like one
 	// that aggregated and always passed unless these are recorded separately,
 	// which hides the distinction the whole loop exists to make.
@@ -499,6 +501,10 @@ func SummarizeEvents(path string) (EventSummary, error) {
 			s.GiveUps++
 		case "leaf_timeout":
 			s.Timeouts++
+		case "layout_drift", "layout_warning":
+			s.LayoutDrift++
+		case "invalid_json":
+			s.InvalidJSON++
 		case "wave_aggregate":
 			s.Aggregates++
 			if ok, isBool := ev["ok"].(bool); isBool && !ok {

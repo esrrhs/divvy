@@ -634,6 +634,22 @@ func (o *Orchestrator) Run(ctx context.Context) (runErr error) {
 	}
 }
 
+// leafLayoutDrift returns a concrete failure message when the leaf sandbox
+// violates the layout/path contract (module nesting, extra go.mod, outputs
+// landed under the wrong prefix). Empty string means the layout is acceptable.
+func (o *Orchestrator) leafLayoutDrift(root string, leaf *models.TaskNode) string {
+	outputs := leaf.Contract.Outputs
+	issues, err := tools.CheckLeafLayout(root, outputs)
+	if err != nil {
+		o.log.Debugf("leaf layout check: %v", err)
+		return ""
+	}
+	if len(issues) == 0 {
+		return ""
+	}
+	return tools.FormatLayoutIssues(issues)
+}
+
 // layoutWarnings formats workspace-level inconsistencies that make a path mean
 // more than one thing (symlink aliases, module path vs. directory tree).
 //
@@ -936,6 +952,25 @@ func (o *Orchestrator) executeLeaf(ctx context.Context, leaf *models.TaskNode) e
 			return ctx.Err()
 		}
 		if vr.OK {
+			// Layout fail-fast: soft DoD greps can pass against a drifted path
+			// (module-named nesting, extra go.mod). Refuse the leaf with a
+			// concrete found-vs-expected message instead of merging and
+			// forcing later leaves to burn tokens on broken imports.
+			if drift := o.leafLayoutDrift(sb.Root, leaf); drift != "" {
+				prevErr = drift
+				o.recordNodeError(leaf.ID, prevErr)
+				o.log.Warnf("layout drift for %s (attempt %d): %s", leaf.ID, attempt, truncate(drift, 240))
+				o.events.Record("layout_drift", leaf.ID, map[string]any{
+					"error": clip(drift, evReasonChars),
+				})
+				if err := o.retryOrGiveUp(ctx, leaf, attempt, prevErr); err != nil {
+					return err
+				}
+				if !retryable(o, leaf.ID) {
+					return nil
+				}
+				continue
+			}
 			// Manual human review: pause with the leaf's diff BEFORE any merge.
 			// Requires an isolated mirror so a rejection can discard the whole
 			// attempt and re-run against a fresh snapshot.

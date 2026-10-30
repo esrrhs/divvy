@@ -145,3 +145,58 @@ func TestPublishLeaf_PropagatesLayoutError(t *testing.T) {
 		t.Fatalf("publishLeaf error = %v, want *MirrorLayoutError", err)
 	}
 }
+
+// TestLeafLayoutDrift_FailsAfterSoftVerify pins the fail-fast path: a leaf
+// whose soft DoD greps a nested path must not COMPLETE after verify — layout
+// drift must surface with found-vs-expected paths so later leaves do not burn
+// tokens fixing imports.
+func TestLeafLayoutDrift_FailsAfterSoftVerify(t *testing.T) {
+	o := structureFixture(t, "2D physics module physics2d", []string{"go test ./..."},
+		map[string][]string{"core": {"physics2d/physics/physics.go"}})
+	root := o.sandbox.Root
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module physics2d\n\ngo 1.22\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "physics2d", "physics"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "physics2d", "physics", "physics.go"), []byte("package physics\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	leaf, ok := o.tree.CloneNode("core")
+	if !ok {
+		t.Fatal("missing leaf")
+	}
+	msg := o.leafLayoutDrift(root, leaf)
+	if msg == "" {
+		t.Fatal("expected layout drift for nested physics2d/physics under module physics2d")
+	}
+	for _, want := range []string{"layout drift", "physics2d"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("drift message missing %q: %s", want, msg)
+		}
+	}
+}
+
+func TestLeafLayoutDrift_CleanLayoutOK(t *testing.T) {
+	o := structureFixture(t, "2D physics module physics2d", []string{"go test ./..."},
+		map[string][]string{"core": {"physics/physics.go"}})
+	root := o.sandbox.Root
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module physics2d\n\ngo 1.22\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "physics"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "physics", "physics.go"), []byte("package physics\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	leaf, ok := o.tree.CloneNode("core")
+	if !ok {
+		t.Fatal("missing leaf")
+	}
+	if msg := o.leafLayoutDrift(root, leaf); msg != "" {
+		t.Fatalf("clean layout reported drift: %s", msg)
+	}
+}

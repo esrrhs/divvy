@@ -222,3 +222,96 @@ func TestCheckLayout_RealRepoIsClean(t *testing.T) {
 		}
 	}
 }
+
+func TestCheckLeafLayout_FlagsModuleNestingAfterSoftPass(t *testing.T) {
+	// Regression for the FreeLLM physics failure: soft grep DoD passed against
+	// physics2d/physics/x.go while go.mod said module physics2d. The leaf must
+	// fail layout before merge, not leave later leaves to rediscover the drift.
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "go.mod"), "module physics2d\n\ngo 1.22\n")
+	writeFile(t, filepath.Join(root, "physics2d", "physics", "physics.go"), "package physics\n")
+
+	issues, err := CheckLeafLayout(root, []string{"physics2d/physics/physics.go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	kinds := layoutKinds(issues)
+	if !strings.Contains(kinds, "module-nesting") && !strings.Contains(kinds, "contract-drift") {
+		t.Fatalf("issues = %s, want module-nesting or contract-drift", kinds)
+	}
+	msg := FormatLayoutIssues(issues)
+	if !strings.Contains(msg, "layout drift") {
+		t.Fatalf("FormatLayoutIssues = %q", msg)
+	}
+	if !strings.Contains(msg, "physics2d") {
+		t.Fatalf("message should name the drifted path: %q", msg)
+	}
+}
+
+func TestCheckLeafLayout_FlagsFoundVsExpected(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "go.mod"), "module physics2d\n")
+	writeFile(t, filepath.Join(root, "physics2d", "physics", "physics.go"), "package physics\n")
+
+	issues, err := CheckLeafLayout(root, []string{"physics/physics.go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var drift *LayoutIssue
+	for i := range issues {
+		if issues[i].Kind == LayoutContractDrift && issues[i].Path == "physics/physics.go" {
+			drift = &issues[i]
+			break
+		}
+	}
+	if drift == nil {
+		t.Fatalf("missing contract-drift for physics/physics.go in %s", layoutKinds(issues))
+	}
+	if !strings.Contains(drift.Detail, "physics2d/physics/physics.go") {
+		t.Fatalf("detail should name found path, got %q", drift.Detail)
+	}
+}
+
+func TestCheckLeafLayout_CleanContractPasses(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "go.mod"), "module physics2d\n")
+	writeFile(t, filepath.Join(root, "physics", "physics.go"), "package physics\n")
+
+	issues, err := CheckLeafLayout(root, []string{"physics/physics.go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(issues) != 0 {
+		t.Fatalf("clean layout reported %s", layoutKinds(issues))
+	}
+}
+
+func TestCheckLeafLayout_FlagsExtraGoMod(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "go.mod"), "module app\n")
+	writeFile(t, filepath.Join(root, "pkg", "go.mod"), "module app/pkg\n")
+	writeFile(t, filepath.Join(root, "pkg", "x.go"), "package pkg\n")
+
+	issues, err := CheckLeafLayout(root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(layoutKinds(issues), "extra-go-mod:pkg/go.mod") {
+		t.Fatalf("issues = %s, want extra-go-mod:pkg/go.mod", layoutKinds(issues))
+	}
+}
+
+func TestContractNestingOutputs(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "go.mod"), "module physics2d\n")
+	issues := ContractNestingOutputs(root, []string{"physics2d/physics/x.go", "physics/x.go"})
+	if len(issues) != 1 || issues[0].Path != "physics2d/physics/x.go" {
+		t.Fatalf("issues = %+v", issues)
+	}
+}
+
+func TestFormatLayoutIssues_Empty(t *testing.T) {
+	if FormatLayoutIssues(nil) != "" {
+		t.Fatal("empty issues should format to empty string")
+	}
+}

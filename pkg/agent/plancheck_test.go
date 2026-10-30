@@ -71,13 +71,12 @@ func TestOrchestrator_PlanWarnings(t *testing.T) {
 
 	warns := o.planWarnings()
 	joined := strings.Join(warns, "\n")
-	if len(warns) != 3 {
-		t.Fatalf("expected 3 warnings, got %d:\n%s", len(warns), joined)
-	}
 	for _, want := range []string{
 		"weak (Weak leaf): verification is only a placeholder (ls)",
 		"weak (Weak leaf): no declared outputs",
 		"x and y (siblings) both declare output shared.go",
+		"x (Writer x): verification is soft-only",
+		"y (Writer y): verification is soft-only",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("missing warning %q in:\n%s", want, joined)

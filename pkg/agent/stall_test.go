@@ -200,3 +200,21 @@ func newStallTestTree(id string, n int) *engine.TaskTree {
 	})
 	return tree
 }
+
+func TestSoftOnlyDoD(t *testing.T) {
+	if !softOnlyDoD([]string{"grep -F 'type X' a.go", "test -f a.go"}) {
+		t.Fatal("grep+test -f should be soft-only")
+	}
+	if softOnlyDoD([]string{"go test ./..."}) {
+		t.Fatal("go test must not be soft-only")
+	}
+	if softOnlyDoD([]string{"grep X a.go", "go build ./..."}) {
+		t.Fatal("mixed with compile must not be soft-only")
+	}
+	if !hasCodeOutputs([]string{"physics/x.go", "README.md"}) {
+		t.Fatal("expected code output detection")
+	}
+	if hasCodeOutputs([]string{"README.md", "docs/guide.md"}) {
+		t.Fatal("docs-only should not count as code outputs")
+	}
+}

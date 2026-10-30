@@ -59,9 +59,9 @@ func (o *Orchestrator) Report() string {
 		fmt.Fprintf(&b, "events   unavailable: %v\n", err)
 	}
 	if ev.Available {
-		fmt.Fprintf(&b, "events   %d  (llm %d, tool %d, verify-fail %d, retry %d, stall %d, resplit %d, giveup %d, timeout %d)\n",
+		fmt.Fprintf(&b, "events   %d  (llm %d, tool %d, verify-fail %d, retry %d, stall %d, resplit %d, giveup %d, timeout %d, layout-drift %d, invalid-json %d)\n",
 			ev.Total(), ev.LLMCalls, ev.ToolCalls, ev.VerifyFail, ev.Retries,
-			ev.Stalls, ev.Resplits, ev.GiveUps, ev.Timeouts)
+			ev.Stalls, ev.Resplits, ev.GiveUps, ev.Timeouts, ev.LayoutDrift, ev.InvalidJSON)
 		// Only when the loop actually ran: "-wave 0" runs should not be padded
 		// with a row of zeroes that looks like a broken aggregate.
 		if ev.Aggregates > 0 || ev.Repairs > 0 {

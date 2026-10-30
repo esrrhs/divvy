@@ -31,6 +31,18 @@ const (
 	// path fails to resolve and the fix is a directory move, which a leaf
 	// cannot infer from a compiler error it can only partially see.
 	LayoutModuleNesting LayoutIssueKind = "module-nesting"
+
+	// LayoutExtraGoMod: a go.mod was found outside the workspace root. Nested
+	// modules are legitimate in monorepos when contracted, but a weak model
+	// often drops a second go.mod next to a package by accident; later leaves
+	// then burn tokens chasing "wrong module" import errors.
+	LayoutExtraGoMod LayoutIssueKind = "extra-go-mod"
+
+	// LayoutContractDrift: declared outputs were expected at one path, but the
+	// matching files landed under a module-named nesting (or a similarly wrong
+	// prefix). Soft DoD greps against the drifted path then greenwash the leaf
+	// and leave every later import broken.
+	LayoutContractDrift LayoutIssueKind = "contract-drift"
 )
 
 // LayoutIssue is one workspace-level inconsistency. Path is workspace-relative
@@ -182,4 +194,239 @@ func goModulePath(root string) string {
 		}
 	}
 	return ""
+}
+
+// CheckLeafLayout runs the workspace layout check and then compares declared
+// contract outputs against what is actually on disk. It is the fail-fast gate
+// used after a leaf verifies (and before isolate merge): soft DoD greps can
+// pass against a drifted path, but later leaves cannot fix the imports.
+//
+// expectedOutputs may be empty; then only CheckLayout issues are returned.
+// An error is returned only when root itself cannot be read.
+func CheckLeafLayout(root string, expectedOutputs []string) ([]LayoutIssue, error) {
+	issues, err := CheckLayout(root)
+	if err != nil {
+		return nil, err
+	}
+	issues = append(issues, extraGoModIssues(root)...)
+	issues = append(issues, contractDriftIssues(root, expectedOutputs)...)
+	sort.Slice(issues, func(i, j int) bool {
+		if issues[i].Kind != issues[j].Kind {
+			return issues[i].Kind < issues[j].Kind
+		}
+		return issues[i].Path < issues[j].Path
+	})
+	return issues, nil
+}
+
+// FormatLayoutIssues renders issues as a single concrete failure message
+// naming found vs expected paths so a leaf retry (or a human) knows what to
+// move without rediscovering the drift from compiler noise.
+func FormatLayoutIssues(issues []LayoutIssue) string {
+	if len(issues) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("layout drift detected — refuse to accept this leaf until paths match the contract:\n")
+	for _, is := range issues {
+		fmt.Fprintf(&b, "  - [%s] %s: %s\n", is.Kind, is.Path, is.Detail)
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// ContractNestingOutputs reports declared output paths that would nest under
+// the Go module's directory name (e.g. module "physics2d" with output
+// "physics2d/physics/x.go"). Used at plan-check time before any leaf runs.
+func ContractNestingOutputs(root string, outputs []string) []LayoutIssue {
+	mod := goModulePath(root)
+	if mod == "" {
+		// No go.mod yet: still flag outputs that start with a repeated first
+		// segment when the goal named a module that way — but without a
+		// module declaration we cannot know the intended name, so skip.
+		return nil
+	}
+	return nestingAgainstModule(mod, outputs)
+}
+
+// nestingAgainstModule flags outputs whose first path segment equals the
+// module path or its last element, which is exactly the directory shape
+// moduleNestingIssue detects after the files exist.
+func nestingAgainstModule(mod string, outputs []string) []LayoutIssue {
+	if mod == "" {
+		return nil
+	}
+	prefixes := []string{mod, path.Base(mod)}
+	seen := map[string]bool{}
+	var out []LayoutIssue
+	for _, raw := range outputs {
+		rel := strings.Trim(strings.ReplaceAll(raw, "\\", "/"), "/")
+		if rel == "" || rel == "." {
+			continue
+		}
+		for _, prefix := range prefixes {
+			prefix = strings.Trim(path.Clean("/"+prefix), "/")
+			if prefix == "" || prefix == "." {
+				continue
+			}
+			if rel == prefix || strings.HasPrefix(rel, prefix+"/") {
+				if seen[rel] {
+					break
+				}
+				seen[rel] = true
+				out = append(out, LayoutIssue{
+					Path: rel,
+					Kind: LayoutContractDrift,
+					Detail: fmt.Sprintf(
+						"declared output nests under module path element %q; with go.mod module %q the file should live at %q (relative to workdir), not under a directory named after the module",
+						prefix, mod, strings.TrimPrefix(strings.TrimPrefix(rel, prefix+"/"), prefix),
+					),
+				})
+				break
+			}
+		}
+	}
+	return out
+}
+
+// extraGoModIssues flags go.mod files outside the workspace root. A nested
+// module with its own go.mod is reported so the operator (or a later leaf)
+// can confirm it was intentional; CheckLayout already skips nesting checks
+// for those directories, but the presence of an unexpected go.mod still
+// deserves a leaf-level fail when nothing contracted it.
+func extraGoModIssues(root string) []LayoutIssue {
+	var issues []LayoutIssue
+	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, werr error) error {
+		if werr != nil {
+			if p == root {
+				return werr
+			}
+			return nil
+		}
+		if d.IsDir() {
+			if p != root && skipDirNames[d.Name()] {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.Name() != "go.mod" || (d.Type()&fs.ModeSymlink) != 0 {
+			return nil
+		}
+		rel, err := filepath.Rel(root, p)
+		if err != nil {
+			return nil
+		}
+		rel = filepath.ToSlash(rel)
+		if rel == "go.mod" {
+			return nil
+		}
+		issues = append(issues, LayoutIssue{
+			Path: rel,
+			Kind: LayoutExtraGoMod,
+			Detail: fmt.Sprintf(
+				"go.mod should live at the workspace root (or be an explicitly contracted nested module); found %q — move or remove it so imports resolve from the root module",
+				rel,
+			),
+		})
+		return nil
+	})
+	return issues
+}
+
+// contractDriftIssues looks for declared outputs that are missing at their
+// contracted path but present under a module-named nesting. That is the
+// FreeLLM physics failure mode: soft grep DoD passed against
+// physics2d/physics/x.go while go.mod said module physics2d, so imports of
+// physics2d/physics could never resolve.
+func contractDriftIssues(root string, outputs []string) []LayoutIssue {
+	if len(outputs) == 0 {
+		return nil
+	}
+	mod := goModulePath(root)
+	var prefixes []string
+	if mod != "" {
+		prefixes = []string{mod, path.Base(mod)}
+	}
+	var issues []LayoutIssue
+	for _, raw := range outputs {
+		want := strings.Trim(strings.ReplaceAll(raw, "\\", "/"), "/")
+		if want == "" || want == "." {
+			continue
+		}
+		wantPath := filepath.Join(root, filepath.FromSlash(want))
+		if fileExists(wantPath) {
+			continue
+		}
+		// Look for the same basename under a module-named prefix.
+		base := path.Base(want)
+		var found []string
+		_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, werr error) error {
+			if werr != nil || d.IsDir() {
+				if werr == nil && d.IsDir() && p != root && skipDirNames[d.Name()] {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if d.Name() != base {
+				return nil
+			}
+			rel, err := filepath.Rel(root, p)
+			if err != nil {
+				return nil
+			}
+			rel = filepath.ToSlash(rel)
+			if rel == want {
+				return nil
+			}
+			// Prefer reporting nestings under the module name; also catch any
+			// path that ends with the contracted relative path under an extra
+			// prefix (e.g. want physics/x.go, found physics2d/physics/x.go).
+			if strings.HasSuffix(rel, "/"+want) || rel == want {
+				found = append(found, rel)
+				return nil
+			}
+			for _, prefix := range prefixes {
+				prefix = strings.Trim(path.Clean("/"+prefix), "/")
+				if prefix != "" && (rel == prefix+"/"+want || strings.HasPrefix(rel, prefix+"/")) {
+					if path.Base(rel) == base {
+						found = append(found, rel)
+					}
+				}
+			}
+			return nil
+		})
+		if len(found) == 0 {
+			continue
+		}
+		sort.Strings(found)
+		issues = append(issues, LayoutIssue{
+			Path: want,
+			Kind: LayoutContractDrift,
+			Detail: fmt.Sprintf(
+				"expected %q relative to workdir, but found %s instead — move the file(s) to the contracted path (do not nest under the module name)",
+				want, strings.Join(found, ", "),
+			),
+		})
+	}
+	// Also flag nesting of the declared outputs themselves against the module.
+	issues = append(issues, nestingAgainstModule(mod, outputs)...)
+	return dedupeLayoutIssues(issues)
+}
+
+func fileExists(p string) bool {
+	info, err := os.Lstat(p)
+	return err == nil && info.Mode().IsRegular()
+}
+
+func dedupeLayoutIssues(in []LayoutIssue) []LayoutIssue {
+	seen := map[string]bool{}
+	var out []LayoutIssue
+	for _, is := range in {
+		key := string(is.Kind) + "|" + is.Path
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, is)
+	}
+	return out
 }

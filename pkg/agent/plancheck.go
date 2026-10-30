@@ -31,6 +31,12 @@ func (o *Orchestrator) planWarnings() []string {
 		case placeholderDoD(leaf.DoD.Commands):
 			warns = append(warns, fmt.Sprintf("%s (%s): verification is only a placeholder (%s)",
 				id, leaf.Title, strings.Join(leaf.DoD.Commands, ", ")))
+		case softOnlyDoD(leaf.DoD.Commands) && hasCodeOutputs(leaf.Contract.Outputs):
+			// Docs/test-only leaves may legitimately use grep/test -f; implementation
+			// leaves that claim code outputs should prefer compile/test gates so a
+			// soft pass cannot greenwash a broken layout.
+			warns = append(warns, fmt.Sprintf("%s (%s): verification is soft-only (%s); prefer compile/test gates for implementation leaves (docs/test-only leaves may keep grep/test -f)",
+				id, leaf.Title, strings.Join(leaf.DoD.Commands, ", ")))
 		}
 		if len(leaf.Contract.Outputs) == 0 {
 			warns = append(warns, fmt.Sprintf("%s (%s): no declared outputs", id, leaf.Title))
@@ -42,6 +48,9 @@ func (o *Orchestrator) planWarnings() []string {
 			} else {
 				claimed[key] = id
 			}
+		}
+		for _, issue := range tools.ContractNestingOutputs(o.sandbox.Root, leaf.Contract.Outputs) {
+			warns = append(warns, fmt.Sprintf("%s (%s): %s", id, leaf.Title, issue.Detail))
 		}
 	}
 
@@ -120,6 +129,78 @@ func placeholderDoD(cmds []string) bool {
 		}
 	}
 	return true
+}
+
+// softOnlyDoD reports whether every verification command is a presence/string
+// check (grep, test -f, ls, true) with no compile or test runner. Soft checks
+// are fine for docs-only leaves; they are not enough when the leaf claims to
+// implement code.
+func softOnlyDoD(cmds []string) bool {
+	if len(cmds) == 0 {
+		return false
+	}
+	for _, c := range cmds {
+		if !isSoftVerifyCommand(c) {
+			return false
+		}
+	}
+	return true
+}
+
+func isSoftVerifyCommand(cmd string) bool {
+	fields := strings.Fields(strings.TrimSpace(cmd))
+	for len(fields) > 0 && strings.Contains(fields[0], "=") {
+		fields = fields[1:]
+	}
+	if len(fields) == 0 {
+		return true
+	}
+	switch fields[0] {
+	case "ls", "true", "echo", "test":
+		return true
+	case "grep", "egrep", "fgrep":
+		return true
+	case "rg":
+		// ripgrep used as a string presence check, same class as grep.
+		return true
+	}
+	// Pipelines that are only greps: "cat x | grep y".
+	if strings.Contains(cmd, "grep ") && !containsCompileOrTest(cmd) {
+		return true
+	}
+	return false
+}
+
+func containsCompileOrTest(cmd string) bool {
+	l := strings.ToLower(cmd)
+	needles := []string{
+		"go test", "go build", "go vet", "cargo test", "cargo build",
+		"npm test", "npm run", "pytest", "python -m", "py_compile",
+		"mvn ", "gradle ", "make ", "cmake", "tsc", "javac",
+	}
+	for _, n := range needles {
+		if strings.Contains(l, n) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasCodeOutputs reports whether any declared output looks like source code
+// (as opposed to README/docs/config-only deliverables).
+func hasCodeOutputs(outputs []string) bool {
+	for _, o := range outputs {
+		base := strings.ToLower(o)
+		if i := strings.LastIndex(base, "/"); i >= 0 {
+			base = base[i+1:]
+		}
+		for _, ext := range []string{".go", ".py", ".rs", ".js", ".jsx", ".ts", ".tsx", ".c", ".cc", ".cpp", ".h", ".java", ".kt", ".cs"} {
+			if strings.HasSuffix(base, ext) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // planBlockers returns structural defects that no amount of leaf-level work

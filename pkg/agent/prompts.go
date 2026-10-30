@@ -43,6 +43,8 @@ Rules:
 - Do not assume files exist unless they appear in the workspace snapshot.
 - Outputs should be concrete file paths whenever possible.
 - Keep each leaf small enough that a 7B-14B coding model can finish it in a few tool calls.
+- LAYOUT CONTRACT (critical): every output path is relative to the workspace root (-workdir). For a Go goal with module path M, put go.mod at the workspace root and packages at paths like ./pkg/... or ./internal/... — NEVER nest sources under a directory named M (module "physics2d" + package under ./physics is correct; ./physics2d/physics is WRONG and breaks imports). Do not create a second go.mod unless the goal explicitly asks for a nested module.
+- DoD LAYERING: for implementation leaves that produce code, prefer real compile/test gates (go test ./..., go build ./..., cargo test, npm test, python -m py_compile, …) over soft checks (grep, test -f, ls). Soft greps are allowed only for docs-only or "confirm string exists" leaves; the root/-dod acceptance remains the full end-to-end gate.
 `
 
 const workerSystemBase = workerMarker + `
@@ -85,9 +87,11 @@ Rules:
 - Prefer write_file for new files. Prefer old_string/new_string for small edits.
 - Stay inside the workspace. Do not access the network.
 - After writing code, you MAY run_bash to compile or test.
+- LAYOUT: create and edit files at the contract's output paths relative to the workspace root. Never nest a Go package under a directory named after the module path. Put go.mod only at the workspace root unless the task explicitly requires a nested module.
+- Prefer finishing only after a compile/test command relevant to the task succeeds, not after a soft grep alone.
 - In a git repository, finish is automatically checked via review_diff: unresolved conflict markers or hard-coded secrets REJECT finish and send the report back to you. Remove them (or call review_diff first) rather than finishing twice.
 - When the task is done and likely to pass the verification commands, call finish.
-- Never wrap JSON in markdown.
+- Never wrap JSON in markdown. Reply with exactly one JSON object: {"thought":"...","action":"tool_name","args":{...}}.
 - One action per turn.
 `
 
@@ -100,9 +104,11 @@ Rules:
 - Prefer write_file for new files. Prefer old_string/new_string for small edits.
 - Stay inside the workspace for files. Network access is limited to web_search/web_fetch for public pages the task genuinely needs; do not fetch unrelated sites.
 - After writing code, you MAY run_bash to compile or test.
+- LAYOUT: create and edit files at the contract's output paths relative to the workspace root. Never nest a Go package under a directory named after the module path. Put go.mod only at the workspace root unless the task explicitly requires a nested module.
+- Prefer finishing only after a compile/test command relevant to the task succeeds, not after a soft grep alone.
 - In a git repository, finish is automatically checked via review_diff: unresolved conflict markers or hard-coded secrets REJECT finish and send the report back to you. Remove them (or call review_diff first) rather than finishing twice.
 - When the task is done and likely to pass the verification commands, call finish.
-- Never wrap JSON in markdown.
+- Never wrap JSON in markdown. Reply with exactly one JSON object: {"thought":"...","action":"tool_name","args":{...}}.
 - One action per turn.
 `
 

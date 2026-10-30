@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -97,22 +98,43 @@ func TestStepBudgetMessages(t *testing.T) {
 	o := &Orchestrator{}
 	msgs := []llm.Message{{Role: llm.RoleSystem}, {Role: llm.RoleUser}}
 
-	if got := o.stepBudgetMessages(msgs, 1, 5); len(got) != 2 {
+	if got := o.stepBudgetMessages(msgs, 1, 8); len(got) != 2 {
 		t.Fatalf("no hint expected early in the budget, got %d messages", len(got))
 	}
-	got := o.stepBudgetMessages(msgs, 3, 5)
+	got := o.stepBudgetMessages(msgs, 4, 8) // 5 left → inside window of 5
 	if len(got) != 3 {
-		t.Fatalf("hint expected in the last 3 steps, got %d messages", len(got))
+		t.Fatalf("hint expected in the last 5 steps, got %d messages", len(got))
 	}
-	if !strings.Contains(got[2].Content, "3 tool call(s) left") {
+	if !strings.Contains(got[2].Content, "5 tool call(s) left") {
 		t.Fatalf("hint should state the remaining count: %q", got[2].Content)
 	}
-	// Last step: exactly one call left.
-	last := o.stepBudgetMessages(msgs, 5, 5)
-	if !strings.Contains(last[2].Content, "1 tool call(s) left") {
-		t.Fatalf("last step should report 1 call left: %q", last[2].Content)
+	// Last step: force finish wording.
+	last := o.stepBudgetMessages(msgs, 8, 8)
+	if !strings.Contains(last[2].Content, "LAST tool call") {
+		t.Fatalf("last step should force finish: %q", last[2].Content)
 	}
 	if len(msgs) != 2 {
 		t.Fatalf("stepBudgetMessages mutated the caller's history: %d", len(msgs))
+	}
+}
+
+// TestRunWorker_InvalidJSONAbortsEarly pins the weak-model guard: consecutive
+// empty/unparseable replies must abort the attempt before MaxSteps is burned.
+func TestRunWorker_InvalidJSONAbortsEarly(t *testing.T) {
+	client := &llm.ScriptedClient{Handle: func(_ context.Context, req llm.Request) (*llm.Response, error) {
+		return &llm.Response{Content: "sure, I will help with that"}, nil
+	}}
+	o, sb := newWorkerOrchestrator(t, client)
+	o.cfg.MaxSteps = 20
+
+	_, err := o.runWorker(context.Background(), sb, o.tree.GetRoot(), "")
+	if err == nil {
+		t.Fatal("expected invalid-JSON abort")
+	}
+	if !errors.Is(err, ErrInvalidJSON) {
+		t.Fatalf("err = %v, want ErrInvalidJSON", err)
+	}
+	if n := len(client.Requests); n != maxInvalidJSONRounds {
+		t.Fatalf("worker calls = %d, want %d (must not burn MaxSteps)", n, maxInvalidJSONRounds)
 	}
 }

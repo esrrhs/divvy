@@ -114,7 +114,7 @@ func TestOrchestrator_StrictPlanFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = o.RunPlan(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "plan check failed: 3 warning(s)") {
+	if err == nil || !strings.Contains(err.Error(), "plan check failed: 5 warning(s)") {
 		t.Fatalf("expected strict failure, got %v", err)
 	}
 	// The plan is still saved for inspection / fixing via -resume.

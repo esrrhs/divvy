@@ -94,8 +94,11 @@ func (o *Orchestrator) decompose(ctx context.Context, node *models.TaskNode) err
 			})
 		case lastErr != nil:
 			messages = append(messages, llm.Message{
-				Role:    llm.RoleUser,
-				Content: "Your previous JSON was invalid:\n" + lastErr.Error() + "\n\nReturn ONLY corrected JSON.",
+				Role: llm.RoleUser,
+				Content: "Your previous JSON was invalid:\n" + lastErr.Error() +
+					"\n\nReturn ONLY one JSON object matching the schema exactly — no markdown fences, no commentary. " +
+					"Required keys: is_atomic, reason, contract, dod, subtasks. " +
+					"Each subtask needs id, title, description, type, contract, dod.",
 			})
 		}
 
