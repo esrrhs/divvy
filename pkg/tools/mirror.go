@@ -78,10 +78,22 @@ func NewMirror(src string) (*Mirror, error) {
 		}
 		return m, nil
 	}
-	base, baseMode, err := copyTree(src, dir)
-	if err != nil {
+	if _, _, err := copyTree(src, dir); err != nil {
 		os.RemoveAll(dir)
 		return nil, fmt.Errorf("snapshot %s: %w", src, err)
+	}
+	// Drop CMake/Meson/Ninja caches that embed the source workdir's absolute
+	// paths: a leaf cmake in this mirror would otherwise fail with cache
+	// directory mismatch. Digests are taken after the scrub so MergeBack
+	// does not treat the deleted caches as intentional removals.
+	if _, err := ScrubConfigureCaches(dir); err != nil {
+		os.RemoveAll(dir)
+		return nil, fmt.Errorf("scrub configure caches in mirror: %w", err)
+	}
+	base, baseMode, err := snapshotDigests(dir)
+	if err != nil {
+		os.RemoveAll(dir)
+		return nil, fmt.Errorf("digest mirror %s: %w", dir, err)
 	}
 	return &Mirror{Dir: dir, base: base, baseMode: baseMode, src: src}, nil
 }
@@ -114,6 +126,10 @@ func newWorktreeMirror(src, dir string) (*Mirror, error) {
 	if err := overlayWorktreeState(src, dir); err != nil {
 		cleanup()
 		return nil, err
+	}
+	if _, err := ScrubConfigureCaches(dir); err != nil {
+		cleanup()
+		return nil, fmt.Errorf("scrub configure caches in worktree: %w", err)
 	}
 	base, baseMode, err := snapshotDigests(dir)
 	if err != nil {
@@ -294,6 +310,11 @@ func (m *Mirror) classifyChanges() (writes []mirrorWrite, removals, conflicts, l
 			return err
 		}
 		rel = filepath.ToSlash(rel)
+		// Configure caches embed absolute roots; never merge, conflict, or
+		// delete them via classifyChanges. ScrubConfigureCaches owns them.
+		if isConfigureCacheRel(rel) {
+			return nil
+		}
 		present[rel] = true
 
 		info, err := d.Info()
@@ -379,6 +400,12 @@ func (m *Mirror) classifyChanges() (writes []mirrorWrite, removals, conflicts, l
 // created in the source after the snapshot are left untouched unless the
 // mirror created the same path.
 //
+// Configure/build-system caches (CMakeCache.txt, CMakeFiles/, *.ninja,
+// compile_commands.json, meson-*, …) are never merged: they embed the mirror's
+// absolute path and would poison the next cmake/meson run in the shared
+// workdir. After a successful merge, ScrubConfigureCaches also drops any such
+// artifacts that already lived in the source.
+//
 // The merge is all-or-nothing: if any file this leaf touched was also changed
 // in the source since the snapshot, nothing is written and a
 // *MergeConflictError naming the paths is returned. It returns
@@ -399,6 +426,11 @@ func (m *Mirror) MergeBack() (merged, deleted []string, err error) {
 	}
 
 	for _, w := range writes {
+		// Never copy configure caches into the shared workdir: they embed the
+		// mirror's absolute path and break the next cmake/meson run there.
+		if isConfigureCacheRel(w.rel) {
+			continue
+		}
 		mpath := filepath.Join(m.Dir, filepath.FromSlash(w.rel))
 		data, err := os.ReadFile(mpath)
 		if err != nil {
@@ -424,6 +456,12 @@ func (m *Mirror) MergeBack() (merged, deleted []string, err error) {
 			return merged, nil, fmt.Errorf("delete %s: %w", rel, rmErr)
 		}
 		deleted = append(deleted, rel)
+	}
+	// Final pass: drop any configure caches that already lived in the
+	// workdir (from a previous leaf or a local cmake). Cheap to regenerate,
+	// and leaving a mirror-poisoned CMakeCache.txt makes root DoD fail.
+	if _, scrubErr := ScrubConfigureCaches(m.src); scrubErr != nil {
+		return merged, deleted, fmt.Errorf("scrub configure caches after merge: %w", scrubErr)
 	}
 	return merged, deleted, nil
 }

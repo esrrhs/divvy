@@ -933,6 +933,21 @@ func (o *Orchestrator) executeLeaf(ctx context.Context, leaf *models.TaskNode) e
 			}
 			prevErr = err.Error()
 			o.log.Warnf("worker error: %s", prevErr)
+			// Consecutive empty/invalid JSON is a soft abort: the model produced
+			// no usable tool calls, so charging MaxRetries / RetryCount would
+			// burn the leaf's budget on syntax noise instead of real verify
+			// failures. Deadline still applies so a permanently broken model
+			// cannot spin forever.
+			if errors.Is(err, ErrInvalidJSON) {
+				if softErr := o.softRetryInvalidJSON(ctx, leaf, prevErr); softErr != nil {
+					return softErr
+				}
+				if !retryable(o, leaf.ID) {
+					return nil
+				}
+				attempt-- // undo the for-loop increment so MaxRetries is not charged
+				continue
+			}
 			o.recordNodeError(leaf.ID, prevErr)
 			if err := o.retryOrGiveUp(ctx, leaf, attempt, prevErr); err != nil {
 				return err
@@ -1111,6 +1126,36 @@ func (o *Orchestrator) newLeafMirror() (*tools.Mirror, *tools.Sandbox, error) {
 	sb.HideEnv(o.sandbox.HiddenEnv()...)
 	o.log.Infof("isolated workspace: %s", tools.TrimPath(sb.Root))
 	return mirror, sb, nil
+}
+
+// softRetryInvalidJSON parks the leaf for another try without charging
+// RetryCount or the MaxRetries budget. Invalid/empty JSON early-stops are
+// syntax noise from a weak model, not a real verify failure — burning retries
+// on them exhausts the leaf before it ever gets to run tools. The wall-clock
+// deadline still applies so a permanently broken model cannot spin forever.
+func (o *Orchestrator) softRetryInvalidJSON(ctx context.Context, leaf *models.TaskNode, errMsg string) error {
+	if o.deadlineExceeded(leaf.ID, 1) {
+		return o.giveUpOnDeadline(leaf, errMsg)
+	}
+	_ = o.tree.UpdateNode(leaf.ID, func(n *models.TaskNode) error {
+		n.ErrorMsg = errMsg
+		return nil
+	})
+	if err := o.sched.UpdateNodeState(leaf.ID, models.TaskStatePending, errMsg); err != nil {
+		return err
+	}
+	_ = o.checkpoint()
+	delay := RetryDelay(1, o.cfg.retryMin(), o.cfg.retryMax())
+	o.log.Warnf("soft-retry %s after invalid JSON (not charged) in %s", leaf.ID, delay)
+	o.events.Record("invalid_json_soft_retry", leaf.ID, map[string]any{
+		"delay_ms": delay.Milliseconds(),
+		"reason":   clip(errMsg, evReasonChars),
+	})
+	if err := waitBackoff(ctx, delay); err != nil {
+		o.parkInterrupted(leaf.ID)
+		return err
+	}
+	return nil
 }
 
 // retryable reports whether the leaf should keep retrying inside this worker:

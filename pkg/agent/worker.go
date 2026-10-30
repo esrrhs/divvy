@@ -205,8 +205,9 @@ const stepBudgetWindow = 5
 const maxInvalidJSONRounds = 3
 
 // ErrInvalidJSON marks a leaf attempt that produced consecutive empty or
-// unparseable tool-call replies. Callers treat it like any other attempt
-// failure.
+// unparseable tool-call replies. Callers soft-retry without charging
+// RetryCount / MaxRetries — syntax noise must not burn the leaf budget the
+// way a real verify failure does.
 var ErrInvalidJSON = errors.New("invalid JSON replies")
 
 func invalidJSONRetryPrompt(streak int) string {

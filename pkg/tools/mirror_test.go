@@ -841,3 +841,100 @@ func TestMirror_PreviewChangesMarksSymlinkedDestination(t *testing.T) {
 		t.Fatalf("change list has no entry for core/core_test.go: %+v", changes)
 	}
 }
+
+// TestMirror_ScrubsConfigureCachesOnSnapshotAndMerge pins the isolate→workdir
+// cmake poison: a leaf that configures under /tmp/divvy_mirror-… writes absolute
+// paths into build/CMakeCache.txt; merging that file into the shared workdir
+// makes the next root `cmake -S . -B build` fail with cache directory mismatch.
+// Prefer deleting cheap-to-regenerate configure outputs over rewriting paths.
+func TestMirror_ScrubsConfigureCachesOnSnapshotAndMerge(t *testing.T) {
+	src := t.TempDir()
+	writeFile(t, filepath.Join(src, "CMakeLists.txt"), "project(demo)\n")
+	writeFile(t, filepath.Join(src, "src", "main.c"), "int main(){return 0;}\n")
+	// Pre-existing workdir cache pointing at the workdir itself — must not be
+	// copied into the mirror (leaf cmake would see the wrong source root).
+	writeFile(t, filepath.Join(src, "build", "CMakeCache.txt"),
+		"CMAKE_CACHEFILE_DIR:INTERNAL="+src+"/build\nCMAKE_HOME_DIRECTORY:INTERNAL="+src+"\n")
+	writeFile(t, filepath.Join(src, "build", "CMakeFiles", "cmake.check_cache"), "poison\n")
+	writeFile(t, filepath.Join(src, "build", "compile_commands.json"), `[{"directory":"`+src+`/build"}]`)
+	writeFile(t, filepath.Join(src, "build", "build.ninja"), "build all: phony\n")
+
+	m, err := NewMirror(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+
+	for _, rel := range []string{
+		"build/CMakeCache.txt",
+		"build/CMakeFiles/cmake.check_cache",
+		"build/compile_commands.json",
+		"build/build.ninja",
+	} {
+		if _, statErr := os.Stat(filepath.Join(m.Dir, filepath.FromSlash(rel))); !os.IsNotExist(statErr) {
+			t.Fatalf("mirror still has configure cache %s after snapshot scrub: %v", rel, statErr)
+		}
+	}
+	// Source files must still be present for the leaf to work.
+	if got := readFile(t, filepath.Join(m.Dir, "CMakeLists.txt")); got != "project(demo)\n" {
+		t.Fatalf("CMakeLists.txt lost in mirror: %q", got)
+	}
+
+	// Leaf "configures" inside the mirror and also edits a real source file.
+	mirrorCache := "CMAKE_CACHEFILE_DIR:INTERNAL=" + m.Dir + "/build\nCMAKE_HOME_DIRECTORY:INTERNAL=" + m.Dir + "\n"
+	writeFile(t, filepath.Join(m.Dir, "build", "CMakeCache.txt"), mirrorCache)
+	writeFile(t, filepath.Join(m.Dir, "build", "CMakeFiles", "TargetDirectories.txt"), m.Dir+"/build\n")
+	writeFile(t, filepath.Join(m.Dir, "build", "compile_commands.json"), `[{"directory":"`+m.Dir+`/build"}]`)
+	writeFile(t, filepath.Join(m.Dir, "src", "main.c"), "int main(){return 1;}\n")
+
+	merged, deleted, err := m.MergeBack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deleted) != 0 {
+		t.Fatalf("unexpected deletions: %v", deleted)
+	}
+	for _, rel := range merged {
+		if isConfigureCacheRel(rel) {
+			t.Fatalf("configure cache %s must not appear in merged list", rel)
+		}
+	}
+	if got := readFile(t, filepath.Join(src, "src", "main.c")); got != "int main(){return 1;}\n" {
+		t.Fatalf("source edit not merged: %q", got)
+	}
+	// Post-merge workdir must be free of mirror-poisoned caches so a root DoD
+	// `cmake -S . -B build` starts from a clean configure.
+	for _, rel := range []string{
+		"build/CMakeCache.txt",
+		"build/CMakeFiles",
+		"build/compile_commands.json",
+		"build/build.ninja",
+	} {
+		if _, statErr := os.Stat(filepath.Join(src, filepath.FromSlash(rel))); !os.IsNotExist(statErr) {
+			t.Fatalf("workdir still has configure cache %s after merge: %v", rel, statErr)
+		}
+	}
+}
+
+func TestScrubConfigureCaches_IdempotentAndSkipsIgnored(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "build", "CMakeCache.txt"), "x\n")
+	writeFile(t, filepath.Join(root, "node_modules", "CMakeCache.txt"), "keep-ignored\n")
+	removed, err := ScrubConfigureCaches(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(removed) == 0 {
+		t.Fatal("expected at least CMakeCache.txt removed")
+	}
+	if _, err := os.Stat(filepath.Join(root, "node_modules", "CMakeCache.txt")); err != nil {
+		t.Fatalf("ignored tree must be left alone: %v", err)
+	}
+	removed2, err := ScrubConfigureCaches(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(removed2) != 0 {
+		t.Fatalf("second scrub should be a no-op, got %v", removed2)
+	}
+}
