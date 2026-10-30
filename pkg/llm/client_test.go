@@ -39,3 +39,60 @@ func TestChatStreamCapturesUsage(t *testing.T) {
 		t.Fatalf("usage not captured from final chunk: %+v", resp.Usage)
 	}
 }
+
+func TestChatSetsClientIdentificationHeaders(t *testing.T) {
+	var gotUA, gotTitle string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUA = r.Header.Get("User-Agent")
+		gotTitle = r.Header.Get("X-Title")
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"choices":[{"finish_reason":"stop","message":{"content":"ok"}}],"usage":{"total_tokens":1}}`))
+	}))
+	defer srv.Close()
+
+	client := NewOpenAIClient("key", srv.URL, 5*time.Second)
+	if client.UserAgent != "divvy" {
+		t.Fatalf("default UserAgent = %q, want divvy", client.UserAgent)
+	}
+	_, err := client.Chat(context.Background(), Request{
+		Model:    "test",
+		Messages: []Message{{Role: RoleUser, Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotUA != "divvy" {
+		t.Fatalf("User-Agent = %q, want divvy", gotUA)
+	}
+	if gotTitle != "divvy" {
+		t.Fatalf("X-Title = %q, want divvy", gotTitle)
+	}
+
+	// Empty UserAgent still falls back to divvy on the wire.
+	gotUA, gotTitle = "", ""
+	client.UserAgent = ""
+	_, err = client.Chat(context.Background(), Request{
+		Model:    "test",
+		Messages: []Message{{Role: RoleUser, Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotUA != "divvy" || gotTitle != "divvy" {
+		t.Fatalf("empty UserAgent fallback: UA=%q X-Title=%q", gotUA, gotTitle)
+	}
+
+	// Custom override applies to both headers.
+	gotUA, gotTitle = "", ""
+	client.UserAgent = "divvy-custom"
+	_, err = client.Chat(context.Background(), Request{
+		Model:    "test",
+		Messages: []Message{{Role: RoleUser, Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotUA != "divvy-custom" || gotTitle != "divvy-custom" {
+		t.Fatalf("custom UserAgent: UA=%q X-Title=%q", gotUA, gotTitle)
+	}
+}

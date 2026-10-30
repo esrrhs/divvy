@@ -22,6 +22,7 @@ type OpenAIClient struct {
 	MaxBackoff  time.Duration // cap for exponential backoff; default 30s
 	MinInterval time.Duration
 	ExtraJSON   string
+	UserAgent   string // default "divvy"; sent as User-Agent and X-Title
 	OnToken     func(string)
 
 	mu      sync.Mutex
@@ -41,6 +42,7 @@ func NewOpenAIClient(apiKey, baseURL string, timeout time.Duration) *OpenAIClien
 		BaseURL:    strings.TrimRight(baseURL, "/"),
 		MaxRetries: 0,
 		MaxBackoff: 30 * time.Second,
+		UserAgent:  "divvy",
 		HTTPClient: &http.Client{Timeout: timeout + 15*time.Second},
 	}
 }
@@ -167,6 +169,12 @@ func (c *OpenAIClient) do(ctx context.Context, req Request, stream bool) (*Respo
 		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	ua := c.UserAgent
+	if ua == "" {
+		ua = "divvy"
+	}
+	httpReq.Header.Set("User-Agent", ua)
+	httpReq.Header.Set("X-Title", ua)
 	if c.APIKey != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+c.APIKey)
 	}
