@@ -452,6 +452,10 @@ func (s *Sandbox) Call(ctx context.Context, name string, args map[string]any) (s
 		if err != nil {
 			return "", err
 		}
+		// Weak models invent ctest --filter-test and omit --timeout; rewrite
+		// before exec so leaves do not burn steps fighting a nonexistent flag
+		// or hang forever on a stuck gtest (see mini Redis FreeLLM E2E).
+		command = NormalizeCTestCommand(command)
 		timeout := time.Duration(0)
 		if sec, err := intArg(args, "timeout_sec"); err == nil && sec > 0 {
 			timeout = time.Duration(sec) * time.Second

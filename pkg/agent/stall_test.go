@@ -218,3 +218,31 @@ func TestSoftOnlyDoD(t *testing.T) {
 		t.Fatal("docs-only should not count as code outputs")
 	}
 }
+
+// TestStallFingerprintPrefersVerifyTimeout ensures cmake success noise before a
+// hung ctest does not produce distinct fingerprints across identical hangs.
+func TestStallFingerprintPrefersVerifyTimeout(t *testing.T) {
+	a := stallFingerprint(tools.ProjectGeneric, `$ cmake -S . -B build
+exit 0
+-- Configuring done (0.2s)
+[100%] Built target demo
+VERIFY TIMED OUT: ctest --test-dir build -R integrate
+timed out
+`)
+	b := stallFingerprint(tools.ProjectGeneric, `$ cmake -S . -B build
+exit 0
+-- Configuring done (0.3s)
+[ 93%] Built target other
+VERIFY TIMED OUT: ctest --test-dir build -R integrate
+timed out
+`)
+	if a == "" || a != b {
+		t.Fatalf("timeout marker must dominate fingerprint: %q vs %q", a, b)
+	}
+	other := stallFingerprint(tools.ProjectGeneric, `VERIFY TIMED OUT: ctest --test-dir build -R other
+timed out
+`)
+	if other == a {
+		t.Fatal("different timed-out commands must not share a fingerprint")
+	}
+}

@@ -307,7 +307,7 @@ const soloAcceptanceTimeout = 300
 func soloAcceptanceFor(dod *models.DoD, proj tools.ProjectType) {
 	dod.TimeoutSec = soloAcceptanceTimeout
 	switch proj {
-	case tools.ProjectGo, tools.ProjectNode, tools.ProjectRust, tools.ProjectPython:
+	case tools.ProjectGo, tools.ProjectNode, tools.ProjectRust, tools.ProjectPython, tools.ProjectCMake:
 		dod.Commands = defaultDoDCommands(nil, proj)
 	default:
 		// Nothing identifiable yet. "ls" would pass on an empty directory, so

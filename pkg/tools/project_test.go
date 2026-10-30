@@ -18,6 +18,7 @@ func TestDetectProject(t *testing.T) {
 		{"python pyproject", "pyproject.toml", ProjectPython},
 		{"python requirements", "requirements.txt", ProjectPython},
 		{"python setup", "setup.py", ProjectPython},
+		{"cmake", "CMakeLists.txt", ProjectCMake},
 		{"make", "Makefile", ProjectMake},
 	}
 	for _, c := range cases {
@@ -48,6 +49,18 @@ func TestDetectProject(t *testing.T) {
 		// go.mod wins over both others.
 		if got := DetectProject(dir); got != ProjectGo {
 			t.Fatalf("expected go to win priority, got %q", got)
+		}
+	})
+
+	t.Run("cmake wins over makefile", func(t *testing.T) {
+		dir := t.TempDir()
+		for _, m := range []string{"Makefile", "CMakeLists.txt"} {
+			if err := os.WriteFile(filepath.Join(dir, m), []byte("x"), 0644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if got := DetectProject(dir); got != ProjectCMake {
+			t.Fatalf("expected cmake over make, got %q", got)
 		}
 	})
 }

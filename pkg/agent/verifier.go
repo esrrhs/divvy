@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"fmt"
-	"regexp"
 	"strings"
 	"time"
 
@@ -70,13 +69,18 @@ func (o *Orchestrator) verify(ctx context.Context, sb *tools.Sandbox, node *mode
 		}
 		fmt.Fprintf(&combined, "$ %s\nexit %d\n%s\n%s\n", cmd, res.ExitCode, res.Stdout, res.Stderr)
 		if res.TimedOut {
-			msg := o.withDiagnostics(sb, combined.String()+"timed out\n")
+			// Lead with an explicit timeout marker so stallFingerprint does not
+			// hash the preceding successful cmake noise (Redis E2E: three 180s
+			// ctest hangs never triggered MaxStall because the fingerprint was
+			// dominated by "Configuring done" / "Built target" lines).
+			raw := fmt.Sprintf("VERIFY TIMED OUT: %s\n%stimed out\n", cmd, combined.String())
+			msg := o.withDiagnostics(sb, raw)
 			o.log.Errorf("verify timeout: %s", cmd)
 			o.events.Record("verify", node.ID, map[string]any{
 				"command": cmd, "ok": false, "exit_code": res.ExitCode,
 				"timed_out":   true,
 				"duration_ms": duration,
-				"output_tail": tailClip(combined.String(), evVerifyTail),
+				"output_tail": tailClip(raw, evVerifyTail),
 			})
 			return VerifyResult{OK: false, Command: cmd, Output: msg, ExitCode: -1}
 		}
@@ -224,25 +228,25 @@ func (o *Orchestrator) withDiagnostics(sb *tools.Sandbox, raw string) string {
 	return raw
 }
 
-// ctestFilterTestFlag matches the non-existent flag weak models invent for
-// leaf-scoped CTest DoD ("ctest --filter-test cli"). Real CTest uses -R /
-// --tests-regex. Without this rewrite a leaf that already builds and whose
-// tests pass under -R can never verify, burns MaxRetries, and never stalls
-// cleanly because the preceding successful cmake lines dominate the fingerprint.
-var ctestFilterTestFlag = regexp.MustCompile(`--filter-test\s+(\S+)`)
-
 // normalizeDoDCommands rewrites known-invalid DoD command shapes emitted by
-// weak planners into the equivalent toolchain-correct form. It is deliberately
-// narrow: only flags that can never succeed as written.
+// weak planners into the equivalent toolchain-correct form (ctest --filter-test
+// → -R, inject --timeout). Delegates to tools.NormalizeCTestCommand.
 func normalizeDoDCommands(cmds []string) []string {
 	out := make([]string, 0, len(cmds))
 	for _, cmd := range cmds {
-		if strings.Contains(cmd, "ctest") && strings.Contains(cmd, "--filter-test") {
-			cmd = ctestFilterTestFlag.ReplaceAllString(cmd, `-R $1`)
-		}
-		out = append(out, cmd)
+		out = append(out, tools.NormalizeCTestCommand(cmd))
 	}
 	return out
+}
+
+// dodHasCTest reports whether any DoD command invokes ctest.
+func dodHasCTest(cmds []string) bool {
+	for _, c := range cmds {
+		if strings.Contains(c, "ctest") {
+			return true
+		}
+	}
+	return false
 }
 
 // asFixedStringGrep checks if cmd invokes grep without fixed-string or extended-regex flags,

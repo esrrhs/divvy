@@ -310,9 +310,10 @@ func (m *Mirror) classifyChanges() (writes []mirrorWrite, removals, conflicts, l
 			return err
 		}
 		rel = filepath.ToSlash(rel)
-		// Configure caches embed absolute roots; never merge, conflict, or
-		// delete them via classifyChanges. ScrubConfigureCaches owns them.
-		if isConfigureCacheRel(rel) {
+		// Configure caches and out-of-tree build trees embed absolute roots /
+		// are mirror-local; never merge, conflict, or delete them via
+		// classifyChanges. ScrubConfigureCaches owns them.
+		if shouldSkipMirrorBuildRel(rel) {
 			return nil
 		}
 		present[rel] = true
@@ -401,10 +402,12 @@ func (m *Mirror) classifyChanges() (writes []mirrorWrite, removals, conflicts, l
 // mirror created the same path.
 //
 // Configure/build-system caches (CMakeCache.txt, CMakeFiles/, *.ninja,
-// compile_commands.json, meson-*, …) are never merged: they embed the mirror's
-// absolute path and would poison the next cmake/meson run in the shared
-// workdir. After a successful merge, ScrubConfigureCaches also drops any such
-// artifacts that already lived in the source.
+// compile_commands.json, meson-*, …) and conventional out-of-tree build trees
+// (build/, _build/, cmake-build-*, …) are never merged: they embed the
+// mirror's absolute path or are cheap-to-regenerate binaries/objects, and
+// would poison the next cmake/meson run in the shared workdir. After a
+// successful merge, ScrubConfigureCaches also drops any such artifacts that
+// already lived in the source.
 //
 // The merge is all-or-nothing: if any file this leaf touched was also changed
 // in the source since the snapshot, nothing is written and a
@@ -426,9 +429,10 @@ func (m *Mirror) MergeBack() (merged, deleted []string, err error) {
 	}
 
 	for _, w := range writes {
-		// Never copy configure caches into the shared workdir: they embed the
-		// mirror's absolute path and break the next cmake/meson run there.
-		if isConfigureCacheRel(w.rel) {
+		// Never copy configure caches or out-of-tree build artifacts into the
+		// shared workdir: they embed the mirror's absolute path / are cheap to
+		// regenerate and break the next cmake/meson run there.
+		if shouldSkipMirrorBuildRel(w.rel) {
 			continue
 		}
 		mpath := filepath.Join(m.Dir, filepath.FromSlash(w.rel))

@@ -101,6 +101,11 @@ func defaultDoDCommands(outputs []string, proj tools.ProjectType) []string {
 	case tools.ProjectPython:
 		// Syntax check with real non-zero exit on broken code.
 		cmds = append(cmds, pythonCheckCmd)
+	case tools.ProjectCMake:
+		cmds = append(cmds,
+			"cmake -S . -B build && cmake --build build -j2",
+			"ctest --test-dir build --output-on-failure",
+		)
 	}
 	if len(cmds) == 0 {
 		cmds = []string{"ls"}

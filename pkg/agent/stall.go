@@ -36,7 +36,14 @@ func stallFingerprint(pt tools.ProjectType, msg string) string {
 		return ""
 	}
 	var body string
-	if diag := strings.TrimSpace(tools.CompactDiagnostics(pt, trimmed)); diag != "" {
+	// Prefer an explicit verify-timeout marker so preceding successful cmake
+	// noise ("Configuring done", "Built target") cannot defeat MaxStall when
+	// ctest hangs (Redis FreeLLM E2E: three identical 180s hangs never stalled).
+	if i := strings.Index(trimmed, "VERIFY TIMED OUT:"); i >= 0 {
+		body = headLines(trimmed[i:], stallFingerprintLines)
+	} else if i := strings.Index(strings.ToLower(trimmed), "timed out"); i >= 0 && i < 200 {
+		body = headLines(trimmed[i:], stallFingerprintLines)
+	} else if diag := strings.TrimSpace(tools.CompactDiagnostics(pt, trimmed)); diag != "" {
 		body = diag
 	} else {
 		body = headLines(trimmed, stallFingerprintLines)

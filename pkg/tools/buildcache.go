@@ -36,6 +36,20 @@ var configureCacheDirNames = map[string]bool{
 	".mesonpy-native": true,
 }
 
+// outOfTreeBuildDirNames are conventional cmake/meson -B directories. Object
+// files, binaries and Makefiles under them are also mirror-local and must not
+// merge into the shared workdir (Redis E2E merged build/*.o + poisoned caches
+// and left root DoD fighting a half-mirrored tree). Cheap to regenerate via
+// cmake --build.
+var outOfTreeBuildDirNames = map[string]bool{
+	"build":                      true,
+	"_build":                     true,
+	"cmake-build-debug":          true,
+	"cmake-build-release":        true,
+	"cmake-build-relwithdebinfo": true,
+	"cmake-build-minsizerel":     true,
+}
+
 // isConfigureCacheRel reports whether a slash-separated workspace-relative path
 // is a configure/build-system cache artifact that must not cross the
 // mirror↔workdir boundary.
@@ -59,15 +73,39 @@ func isConfigureCacheRel(rel string) bool {
 	return false
 }
 
+// isOutOfTreeBuildRel reports whether rel lives under a conventional out-of-tree
+// build directory (top-level segment only: "build/foo", not "src/build/foo").
+func isOutOfTreeBuildRel(rel string) bool {
+	rel = filepath.ToSlash(rel)
+	if rel == "" {
+		return false
+	}
+	first := rel
+	if i := strings.IndexByte(rel, '/'); i >= 0 {
+		first = rel[:i]
+	}
+	return outOfTreeBuildDirNames[first]
+}
+
+// shouldSkipMirrorBuildRel reports paths that must never merge or conflict
+// across the mirror↔workdir boundary: configure caches and whole out-of-tree
+// build trees.
+func shouldSkipMirrorBuildRel(rel string) bool {
+	return isConfigureCacheRel(rel) || isOutOfTreeBuildRel(rel)
+}
+
 // ScrubConfigureCaches removes CMake/Meson/Ninja configure outputs under root
-// that embed absolute paths. It skips the same ignored directories as mirrors
-// (.git, node_modules, …). Returns the workspace-relative paths that were
-// removed (files and directories). Missing paths are fine; other errors abort.
+// that embed absolute paths, and drops conventional out-of-tree build
+// directories entirely (object files / binaries are also mirror-local). It
+// skips the same ignored directories as mirrors (.git, node_modules, …).
+// Returns the workspace-relative paths that were removed (files and
+// directories). Missing paths are fine; other errors abort.
 func ScrubConfigureCaches(root string) (removed []string, err error) {
 	if root == "" {
 		return nil, nil
 	}
 	var dirHits []string
+	var outOfTreeHits []string
 	walkErr := filepath.WalkDir(root, func(p string, d fs.DirEntry, werr error) error {
 		if werr != nil {
 			return werr
@@ -80,12 +118,18 @@ func ScrubConfigureCaches(root string) (removed []string, err error) {
 			if skipDirNames[name] {
 				return filepath.SkipDir
 			}
+			// Top-level out-of-tree build dirs: drop the whole tree.
+			rel, rerr := filepath.Rel(root, p)
+			if rerr != nil {
+				return rerr
+			}
+			rel = filepath.ToSlash(rel)
+			if !strings.Contains(rel, "/") && outOfTreeBuildDirNames[name] {
+				outOfTreeHits = append(outOfTreeHits, rel)
+				return filepath.SkipDir
+			}
 			if configureCacheDirNames[name] {
-				rel, rerr := filepath.Rel(root, p)
-				if rerr != nil {
-					return rerr
-				}
-				dirHits = append(dirHits, filepath.ToSlash(rel))
+				dirHits = append(dirHits, rel)
 				return filepath.SkipDir
 			}
 			return nil
@@ -115,6 +159,13 @@ func ScrubConfigureCaches(root string) (removed []string, err error) {
 		return strings.Count(dirHits[i], "/") > strings.Count(dirHits[j], "/")
 	})
 	for _, rel := range dirHits {
+		p := filepath.Join(root, filepath.FromSlash(rel))
+		if rmErr := os.RemoveAll(p); rmErr != nil && !os.IsNotExist(rmErr) {
+			return removed, rmErr
+		}
+		removed = append(removed, rel)
+	}
+	for _, rel := range outOfTreeHits {
 		p := filepath.Join(root, filepath.FromSlash(rel))
 		if rmErr := os.RemoveAll(p); rmErr != nil && !os.IsNotExist(rmErr) {
 			return removed, rmErr

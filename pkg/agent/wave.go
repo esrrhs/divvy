@@ -160,6 +160,11 @@ func aggregateCommandsFor(proj tools.ProjectType) []string {
 		return []string{"cargo build", "cargo test"}
 	case tools.ProjectPython:
 		return []string{pythonCheckCmd}
+	case tools.ProjectCMake:
+		return []string{
+			"cmake -S . -B build && cmake --build build -j2",
+			"ctest --test-dir build --output-on-failure",
+		}
 	}
 	return nil
 }
@@ -170,6 +175,7 @@ var waveSourceExts = map[tools.ProjectType][]string{
 	tools.ProjectNode:   {".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx"},
 	tools.ProjectRust:   {".rs"},
 	tools.ProjectPython: {".py"},
+	tools.ProjectCMake:  {".c", ".cc", ".cpp", ".cxx", ".h", ".hpp"},
 }
 
 // waveSkipDirs keeps the source scan off dependency trees. Missing one here is

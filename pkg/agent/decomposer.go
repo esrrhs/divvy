@@ -371,11 +371,19 @@ func normalizeChildren(raw []decomposeChild, tree *engine.TaskTree, parent *mode
 }
 
 func ensureDoD(dod *models.DoD, outputs []string, proj tools.ProjectType) {
+	if len(dod.Commands) == 0 {
+		dod.Commands = defaultDoDCommands(outputs, proj)
+	}
+	// Persist ctest rewrites so worker prompts show -R / --timeout, not the
+	// invented --filter-test the planner emitted.
+	dod.Commands = normalizeDoDCommands(dod.Commands)
 	if dod.TimeoutSec <= 0 {
 		dod.TimeoutSec = 60
 	}
-	if len(dod.Commands) == 0 {
-		dod.Commands = defaultDoDCommands(outputs, proj)
+	// CMake/CTest leaves need headroom for configure+build+tests; hanging
+	// server tests previously burned the default 60s + doubled retry.
+	if dod.TimeoutSec < 120 && dodHasCTest(dod.Commands) {
+		dod.TimeoutSec = 120
 	}
 }
 
@@ -384,9 +392,6 @@ func ensureDoD(dod *models.DoD, outputs []string, proj tools.ProjectType) {
 // Go, "go build ." fails when no entry package exists, catching a missing
 // integration leaf, and a whole-tree build backs it up.
 func ensureGoalDoD(dod *models.DoD, proj tools.ProjectType) {
-	if dod.TimeoutSec <= 0 {
-		dod.TimeoutSec = 120
-	}
 	if len(dod.Commands) == 0 {
 		switch proj {
 		case tools.ProjectGo:
@@ -399,9 +404,21 @@ func ensureGoalDoD(dod *models.DoD, proj tools.ProjectType) {
 			dod.Commands = []string{"cargo build"}
 		case tools.ProjectPython:
 			dod.Commands = []string{pythonCheckCmd}
+		case tools.ProjectCMake:
+			dod.Commands = []string{
+				"cmake -S . -B build && cmake --build build -j2",
+				"ctest --test-dir build --output-on-failure",
+			}
 		default:
 			dod.Commands = []string{"ls"}
 		}
+	}
+	dod.Commands = normalizeDoDCommands(dod.Commands)
+	if dod.TimeoutSec <= 0 {
+		dod.TimeoutSec = 120
+	}
+	if dod.TimeoutSec < 180 && dodHasCTest(dod.Commands) {
+		dod.TimeoutSec = 180
 	}
 }
 
@@ -433,11 +450,12 @@ func formatDoD(d models.DoD) string {
 	if d.Description != "" {
 		fmt.Fprintf(&b, "  description: %s\n", d.Description)
 	}
-	if len(d.Commands) == 0 {
+	cmds := normalizeDoDCommands(d.Commands)
+	if len(cmds) == 0 {
 		b.WriteString("  commands: (none)\n")
 	} else {
 		b.WriteString("  commands:\n")
-		for _, c := range d.Commands {
+		for _, c := range cmds {
 			fmt.Fprintf(&b, "    - %s\n", c)
 		}
 	}

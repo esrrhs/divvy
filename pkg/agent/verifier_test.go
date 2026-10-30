@@ -171,6 +171,7 @@ func TestDefaultDoDCommands_ByProject(t *testing.T) {
 		{tools.ProjectNode, "npm test --if-present", nil},
 		{tools.ProjectRust, "cargo test", nil},
 		{tools.ProjectPython, "py_compile", nil},
+		{tools.ProjectCMake, "cmake -S . -B build", nil},
 		{tools.ProjectGeneric, "ls", nil},
 	}
 	for _, c := range cases {
@@ -204,6 +205,7 @@ func TestEnsureGoalDoD_ByProject(t *testing.T) {
 		tools.ProjectNode:    "npm test --if-present",
 		tools.ProjectRust:    "cargo build",
 		tools.ProjectPython:  "py_compile",
+		tools.ProjectCMake:   "cmake -S . -B build",
 		tools.ProjectGeneric: "ls",
 	}
 	for proj, sub := range want {
@@ -335,8 +337,8 @@ func TestNormalizeDoDCommands_CTestFilterTest(t *testing.T) {
 	got := normalizeDoDCommands(in)
 	want := []string{
 		"cmake -S . -B build && cmake --build build -j2",
-		"ctest --test-dir build --output-on-failure -R cli",
-		"ctest -R protocol --output-on-failure",
+		"ctest --timeout 30 --test-dir build --output-on-failure -R cli",
+		"ctest --timeout 30 -R protocol --output-on-failure",
 		"go test ./...",
 	}
 	if len(got) != len(want) {
@@ -353,5 +355,22 @@ func TestNormalizeDoDCommands_CTestFilterTest(t *testing.T) {
 		if again[i] != want[i] {
 			t.Errorf("idempotent[%d]=%q want %q", i, again[i], want[i])
 		}
+	}
+}
+
+func TestEnsureDoD_CTestTimeoutBumpAndNormalize(t *testing.T) {
+	dod := models.DoD{
+		Commands:   []string{"ctest --test-dir build --output-on-failure --filter-test cli"},
+		TimeoutSec: 60,
+	}
+	ensureDoD(&dod, nil, tools.ProjectCMake)
+	if dod.TimeoutSec < 120 {
+		t.Fatalf("TimeoutSec=%d, want >= 120 for ctest DoD", dod.TimeoutSec)
+	}
+	if len(dod.Commands) != 1 || !strings.Contains(dod.Commands[0], "-R cli") {
+		t.Fatalf("expected --filter-test rewritten to -R, got %v", dod.Commands)
+	}
+	if !strings.Contains(dod.Commands[0], "--timeout") {
+		t.Fatalf("expected --timeout injected, got %v", dod.Commands)
 	}
 }

@@ -865,15 +865,9 @@ func TestMirror_ScrubsConfigureCachesOnSnapshotAndMerge(t *testing.T) {
 	}
 	defer m.Close()
 
-	for _, rel := range []string{
-		"build/CMakeCache.txt",
-		"build/CMakeFiles/cmake.check_cache",
-		"build/compile_commands.json",
-		"build/build.ninja",
-	} {
-		if _, statErr := os.Stat(filepath.Join(m.Dir, filepath.FromSlash(rel))); !os.IsNotExist(statErr) {
-			t.Fatalf("mirror still has configure cache %s after snapshot scrub: %v", rel, statErr)
-		}
+	// After snapshot scrub the whole out-of-tree build/ must be gone.
+	if _, statErr := os.Stat(filepath.Join(m.Dir, "build")); !os.IsNotExist(statErr) {
+		t.Fatalf("mirror still has build/ after snapshot scrub: %v", statErr)
 	}
 	// Source files must still be present for the leaf to work.
 	if got := readFile(t, filepath.Join(m.Dir, "CMakeLists.txt")); got != "project(demo)\n" {
@@ -885,6 +879,7 @@ func TestMirror_ScrubsConfigureCachesOnSnapshotAndMerge(t *testing.T) {
 	writeFile(t, filepath.Join(m.Dir, "build", "CMakeCache.txt"), mirrorCache)
 	writeFile(t, filepath.Join(m.Dir, "build", "CMakeFiles", "TargetDirectories.txt"), m.Dir+"/build\n")
 	writeFile(t, filepath.Join(m.Dir, "build", "compile_commands.json"), `[{"directory":"`+m.Dir+`/build"}]`)
+	writeFile(t, filepath.Join(m.Dir, "build", "bin", "demo"), "elf-placeholder\n")
 	writeFile(t, filepath.Join(m.Dir, "src", "main.c"), "int main(){return 1;}\n")
 
 	merged, deleted, err := m.MergeBack()
@@ -895,37 +890,37 @@ func TestMirror_ScrubsConfigureCachesOnSnapshotAndMerge(t *testing.T) {
 		t.Fatalf("unexpected deletions: %v", deleted)
 	}
 	for _, rel := range merged {
-		if isConfigureCacheRel(rel) {
-			t.Fatalf("configure cache %s must not appear in merged list", rel)
+		if shouldSkipMirrorBuildRel(rel) {
+			t.Fatalf("build artifact %s must not appear in merged list", rel)
 		}
 	}
 	if got := readFile(t, filepath.Join(src, "src", "main.c")); got != "int main(){return 1;}\n" {
 		t.Fatalf("source edit not merged: %q", got)
 	}
-	// Post-merge workdir must be free of mirror-poisoned caches so a root DoD
-	// `cmake -S . -B build` starts from a clean configure.
-	for _, rel := range []string{
-		"build/CMakeCache.txt",
-		"build/CMakeFiles",
-		"build/compile_commands.json",
-		"build/build.ninja",
-	} {
-		if _, statErr := os.Stat(filepath.Join(src, filepath.FromSlash(rel))); !os.IsNotExist(statErr) {
-			t.Fatalf("workdir still has configure cache %s after merge: %v", rel, statErr)
-		}
+	// Post-merge workdir must be free of the whole out-of-tree build tree so a
+	// root DoD `cmake -S . -B build` starts from a clean configure.
+	if _, statErr := os.Stat(filepath.Join(src, "build")); !os.IsNotExist(statErr) {
+		t.Fatalf("workdir still has build/ after merge scrub: %v", statErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(src, "build", "bin", "demo")); !os.IsNotExist(statErr) {
+		t.Fatalf("mirror binary must not merge into workdir: %v", statErr)
 	}
 }
 
 func TestScrubConfigureCaches_IdempotentAndSkipsIgnored(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "build", "CMakeCache.txt"), "x\n")
+	writeFile(t, filepath.Join(root, "build", "bin", "x"), "elf\n")
 	writeFile(t, filepath.Join(root, "node_modules", "CMakeCache.txt"), "keep-ignored\n")
 	removed, err := ScrubConfigureCaches(root)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(removed) == 0 {
-		t.Fatal("expected at least CMakeCache.txt removed")
+		t.Fatal("expected at least build/ removed")
+	}
+	if _, err := os.Stat(filepath.Join(root, "build")); !os.IsNotExist(err) {
+		t.Fatalf("out-of-tree build/ must be removed, stat=%v", err)
 	}
 	if _, err := os.Stat(filepath.Join(root, "node_modules", "CMakeCache.txt")); err != nil {
 		t.Fatalf("ignored tree must be left alone: %v", err)
@@ -936,5 +931,20 @@ func TestScrubConfigureCaches_IdempotentAndSkipsIgnored(t *testing.T) {
 	}
 	if len(removed2) != 0 {
 		t.Fatalf("second scrub should be a no-op, got %v", removed2)
+	}
+}
+
+func TestShouldSkipMirrorBuildRel(t *testing.T) {
+	if !shouldSkipMirrorBuildRel("build/bin/demo") {
+		t.Fatal("build/bin/demo must skip")
+	}
+	if !shouldSkipMirrorBuildRel("build/CMakeCache.txt") {
+		t.Fatal("build/CMakeCache.txt must skip")
+	}
+	if shouldSkipMirrorBuildRel("src/build/util.c") {
+		t.Fatal("src/build/util.c is not a top-level out-of-tree dir")
+	}
+	if shouldSkipMirrorBuildRel("CMakeLists.txt") {
+		t.Fatal("sources must not skip")
 	}
 }

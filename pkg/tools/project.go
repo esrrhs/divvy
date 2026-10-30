@@ -16,6 +16,7 @@ const (
 	ProjectNode    ProjectType = "node"
 	ProjectRust    ProjectType = "rust"
 	ProjectPython  ProjectType = "python"
+	ProjectCMake   ProjectType = "cmake"
 	ProjectMake    ProjectType = "make"
 )
 
@@ -36,6 +37,9 @@ func DetectProject(root string) ProjectType {
 		return ProjectRust
 	case exists("pyproject.toml") || exists("requirements.txt") || exists("setup.py"):
 		return ProjectPython
+	case exists("CMakeLists.txt"):
+		// Prefer CMake over a co-located Makefile (FetchContent / ctest projects).
+		return ProjectCMake
 	case exists("Makefile") || exists("makefile"):
 		return ProjectMake
 	default:

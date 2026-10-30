@@ -92,6 +92,7 @@ func (o *Orchestrator) treeHasEntryPoint() bool {
 		tools.ProjectNode:   setOf("index.js", "server.js", "app.js", "main.js"),
 		tools.ProjectPython: setOf("main.py", "app.py", "server.py"),
 		tools.ProjectRust:   setOf("main.rs"),
+		tools.ProjectCMake:  setOf("main.cpp", "main.cc", "main.cxx", "main.c"),
 	}
 	names := entryNames[o.projectType()]
 	if names == nil {
@@ -251,6 +252,8 @@ func (o *Orchestrator) entryPointNames() []string {
 		return []string{"main.py", "app.py", "server.py"}
 	case tools.ProjectRust:
 		return []string{"main.rs"}
+	case tools.ProjectCMake:
+		return []string{"main.cpp", "main.cc", "main.cxx", "main.c"}
 	default:
 		return []string{"main.go"}
 	}
