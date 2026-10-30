@@ -82,12 +82,12 @@ func saveSoloHistory(path string, msgs []llm.Message) error {
 	}
 	tmpName := tmp.Name()
 	if _, err := tmp.WriteString(b.String()); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		os.Remove(tmpName)
 		return err
 	}
 	if err := tmp.Sync(); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		os.Remove(tmpName)
 		return err
 	}

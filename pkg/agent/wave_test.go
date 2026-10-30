@@ -70,7 +70,6 @@ func wroteAlready(req llm.Request) bool {
 	return strings.Contains(joinedContents(req.Messages), "Tool write_file result:")
 }
 
-
 // TestWaveHasRoom_CapsTheFrontier pins the throttle itself: the tree stops
 // growing while the wave still holds unexecuted leaves, and grows anyway when
 // nothing can run (otherwise the run would deadlock).

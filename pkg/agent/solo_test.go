@@ -388,7 +388,7 @@ func TestSaveLoadSoloHistory_ToleratesTornTail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 3 || got[1].ToolCalls[1-1].Function.Name != "read_file" || got[2].ToolCallID != "t1" {
+	if len(got) != 3 || got[1].ToolCalls[0].Function.Name != "read_file" || got[2].ToolCallID != "t1" {
 		t.Fatalf("round trip lost tool calls: %+v", got)
 	}
 

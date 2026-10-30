@@ -544,10 +544,10 @@ func (s *soloSession) checkpoint() error {
 // command that failed is the same, so a changed acceptance resets the streak.
 func (s *soloSession) noteFailure(vr VerifyResult) int {
 	fp := stallFingerprint(s.o.projectType(), vr.Command+"\n"+vr.Output)
-	switch {
-	case fp == "":
+	switch fp {
+	case "":
 		s.failureFP, s.sameFailure = "", 1
-	case fp == s.failureFP:
+	case s.failureFP:
 		s.sameFailure++
 	default:
 		s.failureFP, s.sameFailure = fp, 1

@@ -442,9 +442,9 @@ type EventSummary struct {
 	// Wave loop counters. A run that never aggregates looks exactly like one
 	// that aggregated and always passed unless these are recorded separately,
 	// which hides the distinction the whole loop exists to make.
-	Aggregates     int // whole-workspace build/test checks run
-	AggregateFails int // how many of those failed
-	Repairs        int // repair leaves queued for a broken aggregate
+	Aggregates     int       // whole-workspace build/test checks run
+	AggregateFails int       // how many of those failed
+	Repairs        int       // repair leaves queued for a broken aggregate
 	Outcome        string    // from the newest session_end, "" if the run never ended cleanly
 	DurationMS     int64     // wall clock of the newest session_end
 	FirstTS        time.Time // newest session_start, i.e. the latest entry point
