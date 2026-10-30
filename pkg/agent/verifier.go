@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -29,6 +30,7 @@ func (o *Orchestrator) verify(ctx context.Context, sb *tools.Sandbox, node *mode
 		timeout = 60 * time.Second
 	}
 	cmds = o.retargetCommands(cmds, sb)
+	cmds = normalizeDoDCommands(cmds)
 
 	var combined strings.Builder
 	for _, cmd := range cmds {
@@ -220,6 +222,27 @@ func (o *Orchestrator) withDiagnostics(sb *tools.Sandbox, raw string) string {
 		return compact + "\n" + raw
 	}
 	return raw
+}
+
+// ctestFilterTestFlag matches the non-existent flag weak models invent for
+// leaf-scoped CTest DoD ("ctest --filter-test cli"). Real CTest uses -R /
+// --tests-regex. Without this rewrite a leaf that already builds and whose
+// tests pass under -R can never verify, burns MaxRetries, and never stalls
+// cleanly because the preceding successful cmake lines dominate the fingerprint.
+var ctestFilterTestFlag = regexp.MustCompile(`--filter-test\s+(\S+)`)
+
+// normalizeDoDCommands rewrites known-invalid DoD command shapes emitted by
+// weak planners into the equivalent toolchain-correct form. It is deliberately
+// narrow: only flags that can never succeed as written.
+func normalizeDoDCommands(cmds []string) []string {
+	out := make([]string, 0, len(cmds))
+	for _, cmd := range cmds {
+		if strings.Contains(cmd, "ctest") && strings.Contains(cmd, "--filter-test") {
+			cmd = ctestFilterTestFlag.ReplaceAllString(cmd, `-R $1`)
+		}
+		out = append(out, cmd)
+	}
+	return out
 }
 
 // asFixedStringGrep checks if cmd invokes grep without fixed-string or extended-regex flags,

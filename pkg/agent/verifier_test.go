@@ -324,3 +324,34 @@ func TestVerify_GrepFixedStringFallback(t *testing.T) {
 		t.Fatalf("expected grep fallback with -F to succeed, got: %s", vr.Output)
 	}
 }
+
+func TestNormalizeDoDCommands_CTestFilterTest(t *testing.T) {
+	in := []string{
+		"cmake -S . -B build && cmake --build build -j2",
+		"ctest --test-dir build --output-on-failure --filter-test cli",
+		"ctest --filter-test protocol --output-on-failure",
+		"go test ./...",
+	}
+	got := normalizeDoDCommands(in)
+	want := []string{
+		"cmake -S . -B build && cmake --build build -j2",
+		"ctest --test-dir build --output-on-failure -R cli",
+		"ctest -R protocol --output-on-failure",
+		"go test ./...",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("len=%d want %d: %#v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("[%d]=%q want %q", i, got[i], want[i])
+		}
+	}
+	// Idempotent on already-correct commands.
+	again := normalizeDoDCommands(want)
+	for i := range want {
+		if again[i] != want[i] {
+			t.Errorf("idempotent[%d]=%q want %q", i, again[i], want[i])
+		}
+	}
+}
