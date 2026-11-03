@@ -403,11 +403,12 @@ func (m *Mirror) classifyChanges() (writes []mirrorWrite, removals, conflicts, l
 //
 // Configure/build-system caches (CMakeCache.txt, CMakeFiles/, *.ninja,
 // compile_commands.json, meson-*, …) and conventional out-of-tree build trees
-// (build/, _build/, cmake-build-*, …) are never merged: they embed the
-// mirror's absolute path or are cheap-to-regenerate binaries/objects, and
-// would poison the next cmake/meson run in the shared workdir. After a
-// successful merge, ScrubConfigureCaches also drops any such artifacts that
-// already lived in the source.
+// (build/, _build/, target/, cmake-build-*, …) are never merged: they embed
+// the mirror's absolute path or are cheap-to-regenerate binaries/objects
+// (Cargo incremental *.lock included), and would poison the next cmake/meson/
+// cargo run in the shared workdir. After a successful merge,
+// ScrubConfigureCaches also drops any such artifacts that already lived in
+// the source.
 //
 // The merge is all-or-nothing: if any file this leaf touched was also changed
 // in the source since the snapshot, nothing is written and a

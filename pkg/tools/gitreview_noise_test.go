@@ -9,13 +9,22 @@ import (
 )
 
 func TestReviewNoisePath(t *testing.T) {
-	for _, p := range []string{".divvy/solo.jsonl", "build/CMakeCache.txt", "node_modules/x.js", "a.o"} {
+	for _, p := range []string{
+		".divvy/solo.jsonl",
+		"build/CMakeCache.txt",
+		"target/debug/incremental/foo.lock",
+		"node_modules/x.js",
+		"a.o",
+	} {
 		if !reviewNoisePath(p) {
 			t.Errorf("%q must be noise", p)
 		}
 	}
 	if reviewNoisePath("src/main.cpp") {
 		t.Error("source must not be noise")
+	}
+	if reviewNoisePath("src/main.rs") {
+		t.Error("Rust source must not be noise")
 	}
 }
 

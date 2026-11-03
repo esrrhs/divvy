@@ -941,10 +941,93 @@ func TestShouldSkipMirrorBuildRel(t *testing.T) {
 	if !shouldSkipMirrorBuildRel("build/CMakeCache.txt") {
 		t.Fatal("build/CMakeCache.txt must skip")
 	}
+	if !shouldSkipMirrorBuildRel("target/debug/incremental/foo-bar.lock") {
+		t.Fatal("Cargo target/ incremental lock must skip")
+	}
+	if !shouldSkipMirrorBuildRel("target/release/mini-redis") {
+		t.Fatal("Cargo target/ binary must skip")
+	}
 	if shouldSkipMirrorBuildRel("src/build/util.c") {
 		t.Fatal("src/build/util.c is not a top-level out-of-tree dir")
 	}
+	if shouldSkipMirrorBuildRel("src/target/mod.rs") {
+		t.Fatal("src/target/mod.rs is not a top-level Cargo target/")
+	}
 	if shouldSkipMirrorBuildRel("CMakeLists.txt") {
 		t.Fatal("sources must not skip")
+	}
+	if shouldSkipMirrorBuildRel("Cargo.toml") {
+		t.Fatal("Cargo.toml must not skip")
+	}
+}
+
+// TestMirror_ScrubsCargoTargetOnSnapshotAndMerge pins the Rust isolate merge
+// failure mode: cargo leaves target/debug/incremental/*.lock (and objects) in
+// the mirror; merging them into the shared workdir caused 130+ MergeConflict
+// paths on mini-Redis FreeLLM E2E. target/ must scrub like build/.
+func TestMirror_ScrubsCargoTargetOnSnapshotAndMerge(t *testing.T) {
+	src := t.TempDir()
+	writeFile(t, filepath.Join(src, "Cargo.toml"), "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n")
+	writeFile(t, filepath.Join(src, "src", "main.rs"), "fn main() {}\n")
+	// Pre-existing workdir Cargo artifacts — must not snapshot into the mirror.
+	writeFile(t, filepath.Join(src, "target", "debug", "incremental", "demo-aaaa.lock"), "workdir-lock\n")
+	writeFile(t, filepath.Join(src, "target", "debug", "demo"), "elf-workdir\n")
+
+	m, err := NewMirror(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+
+	if _, statErr := os.Stat(filepath.Join(m.Dir, "target")); !os.IsNotExist(statErr) {
+		t.Fatalf("mirror still has target/ after snapshot scrub: %v", statErr)
+	}
+	if got := readFile(t, filepath.Join(m.Dir, "Cargo.toml")); !strings.Contains(got, "demo") {
+		t.Fatalf("Cargo.toml lost in mirror: %q", got)
+	}
+
+	// Leaf builds inside the mirror and edits a real source file. Also simulate
+	// a concurrent workdir change under target/ that would otherwise conflict.
+	writeFile(t, filepath.Join(m.Dir, "target", "debug", "incremental", "demo-bbbb.lock"), "mirror-lock\n")
+	writeFile(t, filepath.Join(m.Dir, "target", "debug", "demo"), "elf-mirror\n")
+	writeFile(t, filepath.Join(m.Dir, "src", "main.rs"), "fn main() { println!(\"hi\"); }\n")
+	writeFile(t, filepath.Join(src, "target", "debug", "incremental", "demo-cccc.lock"), "sibling-lock\n")
+
+	merged, deleted, err := m.MergeBack()
+	if err != nil {
+		t.Fatalf("MergeBack must ignore target/ conflicts: %v", err)
+	}
+	if len(deleted) != 0 {
+		t.Fatalf("unexpected deletions: %v", deleted)
+	}
+	for _, rel := range merged {
+		if shouldSkipMirrorBuildRel(rel) {
+			t.Fatalf("Cargo target artifact %s must not appear in merged list", rel)
+		}
+	}
+	if got := readFile(t, filepath.Join(src, "src", "main.rs")); !strings.Contains(got, "println") {
+		t.Fatalf("source edit not merged: %q", got)
+	}
+	if _, statErr := os.Stat(filepath.Join(src, "target")); !os.IsNotExist(statErr) {
+		t.Fatalf("workdir still has target/ after merge scrub: %v", statErr)
+	}
+}
+
+func TestScrubConfigureCaches_RemovesCargoTarget(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "target", "debug", "incremental", "x.lock"), "lock\n")
+	writeFile(t, filepath.Join(root, "src", "target", "mod.rs"), "keep\n")
+	removed, err := ScrubConfigureCaches(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(removed) == 0 {
+		t.Fatal("expected target/ removed")
+	}
+	if _, err := os.Stat(filepath.Join(root, "target")); !os.IsNotExist(err) {
+		t.Fatalf("top-level target/ must be removed, stat=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "src", "target", "mod.rs")); err != nil {
+		t.Fatalf("src/target source tree must be left alone: %v", err)
 	}
 }

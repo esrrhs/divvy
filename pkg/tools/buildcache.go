@@ -36,14 +36,16 @@ var configureCacheDirNames = map[string]bool{
 	".mesonpy-native": true,
 }
 
-// outOfTreeBuildDirNames are conventional cmake/meson -B directories. Object
-// files, binaries and Makefiles under them are also mirror-local and must not
-// merge into the shared workdir (Redis E2E merged build/*.o + poisoned caches
-// and left root DoD fighting a half-mirrored tree). Cheap to regenerate via
-// cmake --build.
+// outOfTreeBuildDirNames are conventional out-of-tree build directories
+// (cmake/meson -B, Cargo target/). Object files, binaries, incremental locks
+// and Makefiles under them are mirror-local and must not merge into the shared
+// workdir (C Redis E2E merged build/*.o; Rust mini-Redis E2E hit 130+ conflicts
+// on target/debug/incremental/*.lock). Cheap to regenerate via cmake --build /
+// cargo build.
 var outOfTreeBuildDirNames = map[string]bool{
 	"build":                      true,
 	"_build":                     true,
+	"target":                     true, // Cargo
 	"cmake-build-debug":          true,
 	"cmake-build-release":        true,
 	"cmake-build-relwithdebinfo": true,
@@ -74,7 +76,8 @@ func isConfigureCacheRel(rel string) bool {
 }
 
 // isOutOfTreeBuildRel reports whether rel lives under a conventional out-of-tree
-// build directory (top-level segment only: "build/foo", not "src/build/foo").
+// build directory (top-level segment only: "build/foo" / "target/foo", not
+// "src/build/foo").
 func isOutOfTreeBuildRel(rel string) bool {
 	rel = filepath.ToSlash(rel)
 	if rel == "" {

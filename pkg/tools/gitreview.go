@@ -297,8 +297,9 @@ func (s *Sandbox) PreFinishGate(ctx context.Context) (*FinishGate, error) {
 
 
 // reviewNoisePath reports paths that must never feed review_diff / PreFinishGate:
-// session state (.divvy/), configure/build trees, and other skipDirNames noise.
-// Solo jsonl under .divvy/ used to false-positive as "debugger leftovers".
+// session state (.divvy/), out-of-tree build trees (build/, target/, …), and
+// other skipDirNames noise. Solo jsonl under .divvy/ used to false-positive as
+// "debugger leftovers".
 func reviewNoisePath(rel string) bool {
 	rel = strings.TrimSpace(filepath.ToSlash(rel))
 	if rel == "" {
@@ -309,7 +310,7 @@ func reviewNoisePath(rel string) bool {
 		if seg == "" || seg == "." {
 			continue
 		}
-		if skipDirNames[seg] || seg == "build" {
+		if skipDirNames[seg] || outOfTreeBuildDirNames[seg] {
 			return true
 		}
 	}
