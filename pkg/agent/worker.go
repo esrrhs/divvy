@@ -69,8 +69,8 @@ func (o *Orchestrator) runWorker(ctx context.Context, sb *tools.Sandbox, node *m
 			// without burning MaxRetries. Does not advance the invalid streak
 			// toward hard abort — the model produced a recognizable action.
 			o.events.Record("incomplete_action", node.ID, map[string]any{
-				"step":   step,
-				"hint":   clip(incompleteHint, evReasonChars),
+				"step":    step,
+				"hint":    clip(incompleteHint, evReasonChars),
 				"snippet": clip(resp.Content, evReasonChars),
 			})
 			messages = append(messages,

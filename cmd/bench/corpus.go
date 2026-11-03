@@ -91,7 +91,7 @@ func TestAverage(t *testing.T) {
 			"其它方法返回 405；并写单元测试。只用标准库。",
 	},
 	{
-		Name:   "cmake-add",
+		Name: "cmake-add",
 		Prompt: "用 CMake/C++ 实现 add(int,int)，写 CMakeLists.txt、src/add.cpp、src/add.h、tests/test_add.cpp；" +
 			"用 ctest 跑通（ctest --test-dir build --output-on-failure -R add）。" +
 			"不要依赖网络；构建目录必须是 build/。",
@@ -105,8 +105,8 @@ func TestAverage(t *testing.T) {
 				"add_executable(test_add tests/test_add.cpp)\n" +
 				"target_link_libraries(test_add PRIVATE add)\n" +
 				"add_test(NAME add COMMAND test_add)\n",
-			"src/add.h": "#pragma once\nint add(int a, int b);\n",
-			"src/add.cpp": "#include \"add.h\"\nint add(int a, int b) { return a + b + 1; } // intentional off-by-one for the model to fix\n",
+			"src/add.h":          "#pragma once\nint add(int a, int b);\n",
+			"src/add.cpp":        "#include \"add.h\"\nint add(int a, int b) { return a + b + 1; } // intentional off-by-one for the model to fix\n",
 			"tests/test_add.cpp": "#include \"add.h\"\nint main() {\n  if (add(2, 3) != 5) return 1;\n  if (add(0, 0) != 0) return 2;\n  return 0;\n}\n",
 		},
 	},

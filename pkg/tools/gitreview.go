@@ -295,7 +295,6 @@ func (s *Sandbox) PreFinishGate(ctx context.Context) (*FinishGate, error) {
 	return &FinishGate{Blocking: blocking, Report: report}, nil
 }
 
-
 // reviewNoisePath reports paths that must never feed review_diff / PreFinishGate:
 // session state (.divvy/), out-of-tree build trees (build/, target/, …), and
 // other skipDirNames noise. Solo jsonl under .divvy/ used to false-positive as

@@ -24,11 +24,11 @@ type Config struct {
 	RequestTimeout     time.Duration
 	MinRequestInterval time.Duration
 
-	MaxSteps       int
+	MaxSteps int
 	// HardMaxSteps is the elevated tool-call budget for hard leaves
 	// (integrate/server/cmake+ctest). 0 = DefaultHardMaxSteps (or
 	// DIVVY_HARD_MAX_STEPS). Easy leaves keep MaxSteps.
-	HardMaxSteps int
+	HardMaxSteps   int
 	MaxRetries     int // 0 = retry forever
 	MaxDepth       int
 	MaxSubtasks    int
