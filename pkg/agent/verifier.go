@@ -234,9 +234,55 @@ func (o *Orchestrator) withDiagnostics(sb *tools.Sandbox, raw string) string {
 func normalizeDoDCommands(cmds []string) []string {
 	out := make([]string, 0, len(cmds))
 	for _, cmd := range cmds {
-		out = append(out, tools.NormalizeCTestCommand(cmd))
+		c := tools.NormalizeCTestCommand(cmd)
+		c = normalizeNetCheckCommand(c)
+		out = append(out, c)
 	}
 	return out
+}
+
+// normalizeNetCheckCommand rewrites fragile `nc` / netcat probes into a
+// bash /dev/tcp check that needs no apt-get install. Leaves curl/wget alone.
+func normalizeNetCheckCommand(cmd string) string {
+	trimmed := strings.TrimSpace(cmd)
+	fields := strings.Fields(trimmed)
+	// Skip leading env assignments.
+	i := 0
+	for i < len(fields) && strings.Contains(fields[i], "=") && !strings.HasPrefix(fields[i], "-") {
+		i++
+	}
+	if i >= len(fields) {
+		return cmd
+	}
+	bin := fields[i]
+	base := bin
+	if j := strings.LastIndex(bin, "/"); j >= 0 {
+		base = bin[j+1:]
+	}
+	switch base {
+	case "nc", "ncat", "netcat":
+		// Best-effort: nc -z host port  /  nc host port
+		host, port := "", ""
+		args := fields[i+1:]
+		filtered := make([]string, 0, len(args))
+		for _, a := range args {
+			if strings.HasPrefix(a, "-") {
+				continue
+			}
+			filtered = append(filtered, a)
+		}
+		if len(filtered) >= 2 {
+			host, port = filtered[0], filtered[1]
+		}
+		if host != "" && port != "" {
+			prefix := ""
+			if i > 0 {
+				prefix = strings.Join(fields[:i], " ") + " "
+			}
+			return prefix + "bash -c 'exec 3<>/dev/tcp/" + host + "/" + port + "'"
+		}
+	}
+	return cmd
 }
 
 // dodHasCTest reports whether any DoD command invokes ctest.

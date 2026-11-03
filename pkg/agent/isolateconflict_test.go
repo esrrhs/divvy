@@ -50,14 +50,14 @@ const undeclaredSharedFilePlan = `{
     {
       "id": "alpha",
       "title": "Write shared file (alpha)",
-      "description": "Write shared.txt",
+      "description": "Write the contested shared output (path intentionally omitted from contract)",
       "type": "LEAF",
       "dod": {"commands": ["test -f shared.txt"]}
     },
     {
       "id": "beta",
       "title": "Write shared file (beta)",
-      "description": "Write shared.txt",
+      "description": "Write the contested shared output (path intentionally omitted from contract)",
       "type": "LEAF",
       "dod": {"commands": ["test -f shared.txt"]}
     }

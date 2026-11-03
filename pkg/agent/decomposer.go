@@ -222,6 +222,9 @@ func (o *Orchestrator) applyDecompose(node *models.TaskNode, parsed decomposeRes
 		if err != nil {
 			return err
 		}
+		if nodeType == models.NodeTypeLeaf {
+			ensureOutputs(&ch.Contract, ch.ID, ch.Title, ch.Description)
+		}
 		dod := ch.DoD
 		if nodeType == models.NodeTypeLeaf {
 			ensureDoD(&dod, ch.Contract.Outputs, o.projectType())
@@ -281,6 +284,11 @@ func (o *Orchestrator) applyDecompose(node *models.TaskNode, parsed decomposeRes
 }
 
 func (o *Orchestrator) convertToLeaf(id string, contract models.ContractSpec, dod models.DoD) error {
+	title, desc := id, id
+	if cur, ok := o.tree.CloneNode(id); ok && cur != nil {
+		title, desc = cur.Title, cur.Description
+	}
+	ensureOutputs(&contract, id, title, desc)
 	ensureDoD(&dod, contract.Outputs, o.projectType())
 	if err := o.tree.ConvertToLeaf(id, contract, dod); err != nil {
 		return err

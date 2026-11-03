@@ -106,6 +106,24 @@ var diagRules = []diagRule{
 		},
 	},
 	{
+		project: ProjectCMake,
+		anchored: []*regexp.Regexp{
+			// gcc/clang: src/a.cpp:12:3: error: ...
+			regexp.MustCompile(`^\s*(?:\S*[\\/])?[\w.-]+\.(?:c|cc|cpp|cxx|h|hpp):\d+(?::\d+)?:\s*(?:fatal )?error\b.*$`),
+			// cmake configure: CMake Error at CMakeLists.txt:10 (message):
+			regexp.MustCompile(`^CMake Error at \S+:\d+`),
+		},
+		status: []*regexp.Regexp{
+			regexp.MustCompile(`^CMake Error.*$`),
+			regexp.MustCompile(`^(?:FAILED|\*\*\*Timeout|Timeout)\b.*$`),
+			regexp.MustCompile(`^\d+:\s*Test\s+#\d+:.*\*\*\*Failed`),
+			regexp.MustCompile(`^Errors while running CTest`),
+			regexp.MustCompile(`^fatal error: .+$`),
+			regexp.MustCompile(`^error: .+$`),
+			regexp.MustCompile(`^collect2: error: .+$`),
+		},
+	},
+	{
 		// Make: the recipe output is arbitrary, but make and its tools still
 		// emit recognizable compiler diagnostics, and make's own errors name
 		// the failing target.

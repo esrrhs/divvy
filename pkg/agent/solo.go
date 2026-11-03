@@ -586,7 +586,14 @@ func (s *soloSession) runRound(ctx context.Context, steps int) (summary string, 
 		}
 		o.log.Debugf("solo raw: %s", truncate(resp.Content, 400))
 
-		actions := collectActions(resp)
+		actions, incompleteHint := collectActions(resp)
+		if incompleteHint != "" {
+			s.msgs = append(s.msgs,
+				llm.Message{Role: llm.RoleAssistant, Content: resp.Content},
+				llm.Message{Role: llm.RoleUser, Content: incompleteHint},
+			)
+			continue
+		}
 		if len(actions) == 0 {
 			s.msgs = append(s.msgs,
 				llm.Message{Role: llm.RoleAssistant, Content: resp.Content},

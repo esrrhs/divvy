@@ -9,9 +9,9 @@
 // own failure counters (verify failures, retries, stalls, re-splits).
 //
 // The corpus is intentionally small and versioned in code: a benchmark whose
-// goals drift between runs cannot show regressions. Every goal is a Go task
-// because Go is the stack divvy can verify offline (go build/go test need no
-// network), which keeps runs hermetic and repeatable.
+// goals drift between runs cannot show regressions. Most goals are Go (offline
+// go build/go test); a small CMake/C++ entry exercises ctest normalize, build/
+// scrub, and VERIFY TIMED OUT fingerprint paths.
 package main
 
 import "strings"
@@ -89,6 +89,26 @@ func TestAverage(t *testing.T) {
 		Module: "healthsrv",
 		Prompt: "用 Go 写一个 HTTP 服务：监听 :18080，GET /health 返回 200 和字符串 ok，" +
 			"其它方法返回 405；并写单元测试。只用标准库。",
+	},
+	{
+		Name:   "cmake-add",
+		Prompt: "用 CMake/C++ 实现 add(int,int)，写 CMakeLists.txt、src/add.cpp、src/add.h、tests/test_add.cpp；" +
+			"用 ctest 跑通（ctest --test-dir build --output-on-failure -R add）。" +
+			"不要依赖网络；构建目录必须是 build/。",
+		Seed: map[string]string{
+			"CMakeLists.txt": "cmake_minimum_required(VERSION 3.14)\n" +
+				"project(addlib LANGUAGES CXX)\n" +
+				"set(CMAKE_CXX_STANDARD 17)\n" +
+				"enable_testing()\n" +
+				"add_library(add STATIC src/add.cpp)\n" +
+				"target_include_directories(add PUBLIC src)\n" +
+				"add_executable(test_add tests/test_add.cpp)\n" +
+				"target_link_libraries(test_add PRIVATE add)\n" +
+				"add_test(NAME add COMMAND test_add)\n",
+			"src/add.h": "#pragma once\nint add(int a, int b);\n",
+			"src/add.cpp": "#include \"add.h\"\nint add(int a, int b) { return a + b + 1; } // intentional off-by-one for the model to fix\n",
+			"tests/test_add.cpp": "#include \"add.h\"\nint main() {\n  if (add(2, 3) != 5) return 1;\n  if (add(0, 0) != 0) return 2;\n  return 0;\n}\n",
+		},
 	},
 }
 

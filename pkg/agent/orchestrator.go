@@ -948,6 +948,16 @@ func (o *Orchestrator) executeLeaf(ctx context.Context, leaf *models.TaskNode) e
 				attempt-- // undo the for-loop increment so MaxRetries is not charged
 				continue
 			}
+			// Per-leaf token/cost overrun: fail fast and re-decompose rather than
+			// burning the rest of MaxRetries / the session budget on an oversized leaf.
+			if errors.Is(err, ErrLeafBudget) {
+				o.recordNodeError(leaf.ID, prevErr)
+				o.log.Warnf("leaf budget exceeded for %s: %s", leaf.ID, truncate(prevErr, 200))
+				o.events.Record("leaf_budget", leaf.ID, map[string]any{
+					"reason": clip(prevErr, evReasonChars),
+				})
+				return o.handleLeafFailure(leaf, prevErr)
+			}
 			o.recordNodeError(leaf.ID, prevErr)
 			if err := o.retryOrGiveUp(ctx, leaf, attempt, prevErr); err != nil {
 				return err

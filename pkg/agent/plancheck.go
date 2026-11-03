@@ -239,6 +239,19 @@ func (o *Orchestrator) planBlockers() []string {
 		blockers = append(blockers, fmt.Sprintf(
 			"goal acceptance references %q but no leaf declares it as an output", miss))
 	}
+	// Empty outputs after ensureOutputs should be rare; when they slip through
+	// they break entry-point checks and the parallel mutex. Treat them as
+	// structural defects so -plan -strict / replan can force a fix.
+	for _, leaf := range o.tree.Leaves() {
+		if strings.HasPrefix(leaf.ID, waveRepairPrefix) {
+			continue
+		}
+		if len(leaf.Contract.Outputs) == 0 {
+			blockers = append(blockers, fmt.Sprintf(
+				"%s (%s): no declared outputs (parallel mutex and entry-point checks need concrete paths)",
+				leaf.ID, leaf.Title))
+		}
+	}
 	return blockers
 }
 

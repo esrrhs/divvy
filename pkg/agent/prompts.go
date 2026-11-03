@@ -41,11 +41,12 @@ Rules:
 - ids: lowercase snake_case, unique, stable.
 - Do not create planning-only or documentation-only tasks.
 - Do not assume files exist unless they appear in the workspace snapshot.
-- Outputs should be concrete file paths whenever possible.
+- Outputs MUST be concrete file paths whenever possible. Empty outputs break entry-point checks and parallel isolation — always declare the files a leaf creates or edits.
 - Keep each leaf small enough that a 7B-14B coding model can finish it in a few tool calls.
 - LAYOUT CONTRACT (critical): every output path is relative to the workspace root (-workdir). For a Go goal with module path M, put go.mod at the workspace root and packages at paths like ./pkg/... or ./internal/... — NEVER nest sources under a directory named M (module "physics2d" + package under ./physics is correct; ./physics2d/physics is WRONG and breaks imports). Do not create a second go.mod unless the goal explicitly asks for a nested module.
 - DoD LAYERING: for implementation leaves that produce code, prefer real compile/test gates (go test ./..., go build ./..., cargo test, npm test, python -m py_compile, cmake --build / ctest, …) over soft checks (grep, test -f, ls). Soft greps are allowed only for docs-only or "confirm string exists" leaves; the root/-dod acceptance remains the full end-to-end gate.
 - CMake/CTest (critical): filter tests with -R <regex> or --tests-regex — NEVER --filter-test (that flag does not exist on ctest). Prefer leaf DoD like: ctest --test-dir build --output-on-failure -R <leaf_id> with timeout_sec >= 120. Always include a per-test deadline mentally: hung TCP/server tests must not block forever; tests must shut down listeners (shutdown+close) and join threads with a deadline.
+- DoD PORT CHECKS: do NOT use nc/netcat (leaves waste steps on apt-get install). Prefer bash /dev/tcp/HOST/PORT (bash -c 'exec 3<>/dev/tcp/127.0.0.1/8080') or, when -web is on, the http_request tool / curl. The harness rewrites bare nc -z host port into /dev/tcp automatically, but prefer writing the portable form yourself.
 `
 
 const workerSystemBase = workerMarker + `
@@ -91,6 +92,7 @@ Rules:
 - LAYOUT: create and edit files at the contract's output paths relative to the workspace root. Never nest a Go package under a directory named after the module path. Put go.mod only at the workspace root unless the task explicitly requires a nested module.
 - Prefer finishing only after a compile/test command relevant to the task succeeds, not after a soft grep alone.
 - CMake/CTest: use ctest --test-dir build --output-on-failure -R <name> (NOT --filter-test). Prefer timeout_sec >= 120 for cmake+ctest. Server tests must stop cleanly (shutdown listening socket, close clients, join threads); a hung accept()/join burns the whole attempt.
+- Port readiness: prefer bash -c 'exec 3<>/dev/tcp/HOST/PORT' or curl/http_request — never apt-get install nc/netcat.
 - In a git repository, finish is automatically checked via review_diff: unresolved conflict markers or hard-coded secrets REJECT finish and send the report back to you. Remove them (or call review_diff first) rather than finishing twice.
 - When the task is done and likely to pass the verification commands, call finish.
 - Never wrap JSON in markdown. Reply with exactly one JSON object: {"thought":"...","action":"tool_name","args":{...}}.
@@ -109,6 +111,7 @@ Rules:
 - LAYOUT: create and edit files at the contract's output paths relative to the workspace root. Never nest a Go package under a directory named after the module path. Put go.mod only at the workspace root unless the task explicitly requires a nested module.
 - Prefer finishing only after a compile/test command relevant to the task succeeds, not after a soft grep alone.
 - CMake/CTest: use ctest --test-dir build --output-on-failure -R <name> (NOT --filter-test). Prefer timeout_sec >= 120 for cmake+ctest. Server tests must stop cleanly (shutdown listening socket, close clients, join threads); a hung accept()/join burns the whole attempt.
+- Port readiness: prefer bash -c 'exec 3<>/dev/tcp/HOST/PORT' or curl/http_request — never apt-get install nc/netcat.
 - In a git repository, finish is automatically checked via review_diff: unresolved conflict markers or hard-coded secrets REJECT finish and send the report back to you. Remove them (or call review_diff first) rather than finishing twice.
 - When the task is done and likely to pass the verification commands, call finish.
 - Never wrap JSON in markdown. Reply with exactly one JSON object: {"thought":"...","action":"tool_name","args":{...}}.

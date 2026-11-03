@@ -48,13 +48,13 @@ export OPENAI_MODEL=qwen2.5-coder:14b
 | `-status` | 只打印任务树，不执行 |
 | `-plan` | 只拆解出任务树并保存，不执行（配合 `-resume` 使用） |
 | `-wave` | 一波的配额：最多允许多少个"已规划未执行"的叶子、一波最多发起多少个叶子，默认 `3`。它同时节流拆解与执行——只节流拆解是不够的，弱模型会一次把目标拆成所有叶子 |
-| `-aggregate` | 每波结束对整个工作区跑的聚合检查命令，可重复或用 `;` 分隔；默认按工作区技术栈推断（Go：`go build ./...` + `go test ./...`，两条分开跑） |
+| `-aggregate` | 每波结束对整个工作区跑的聚合检查命令，可重复；单个值内用顶层 `;` 分隔（引号/括号感知，同 `-dod`）；默认按工作区技术栈推断（Go：`go build ./...` + `go test ./...`，两条分开跑） |
 | `-max-aggregate-fails` | 聚合连续失败多少次后放弃，默认 `4`（`0` = 不限） |
 | `-solo` | 整棵树退化为一个叶子：单上下文跑完整个目标，验收失败在同一对话里回喂继续修（目标能装进一个上下文时首选） |
 | `-solo-steps` | 配合 `-solo`：每轮工具调用预算，默认 `80` |
 | `-solo-rounds` | 配合 `-solo`：验收失败后的修复轮数，默认 `3` |
 | `-solo-context` | 配合 `-solo`：每次请求携带的对话字符上限，默认 `100000`（完整历史留在内存，只压缩窗口） |
-| `-dod` | 显式验收命令，可重复，单个值内也可用 `;` 分隔。覆盖规划器与工具链推断出的默认验收（树模式只作用于根节点，`-solo` 下作用于整次运行） |
+| `-dod` | 显式验收命令，可重复；单个值内可用**顶层** `;` 分隔（引号/括号内的 `;` 不会切开，避免拆坏冒烟脚本）。覆盖规划器与工具链推断出的默认验收（树模式只作用于根节点，`-solo` 下作用于整次运行） |
 | `-strict` | 配合 `-plan`：有契约告警或工作区布局告警时以非零码退出（CI 自动把关） |
 | `-git-commit` | 每个叶子合并后自动 `git commit`（workdir 需为 git 仓库），哈希记入叶子摘要 |
 | `-parallel` | 同时执行的叶子数，默认 `1`；>1 时自动开启 `-isolate` |
@@ -67,6 +67,10 @@ export OPENAI_MODEL=qwen2.5-coder:14b
 | `-extra` | 合并进请求体的 JSON，例如 Qwen3：`'{"enable_thinking":false}'` |
 | `-max-cost` | 会话成本上限（美元），含 resume 之前的花费；超限即停并保存，`0` 为不限 |
 | `-budget-tokens` | 会话 token 上限，含 resume 之前的花费；超限即停并保存，`0` 为不限 |
+| `-max-leaf-cost` | **单叶子**成本上限（美元）；超限立即失败并触发重新拆解，避免 integrate 叶子烧光会话预算，`0` 为不限 |
+| `-max-leaf-tokens` | **单叶子** token 上限；超限立即失败并触发重新拆解，`0` 为不限 |
+| `-hard-max-steps` | 难叶子（integrate/server/cmake+ctest）的工具调用预算；`0` = `40` 或环境变量 `DIVVY_HARD_MAX_STEPS`。普通叶子仍用 `-max-steps`（默认 20） |
+| `-hard-timeout` | 难叶子的单次 LLM 请求超时；`0` = `180s` 或 `DIVVY_HARD_TIMEOUT` |
 | `-pricing` | 自定义价目表：JSON 文本或 JSON 文件路径，如 `'{"my-model":{"input":0.15,"output":0.6}}'`（每百万 token 美元价） |
 | `-sessions` | 列出已保存的会话（状态、叶子进度、目标），不执行 |
 | `-report` | 打印某个会话的复盘汇总（目标/进度/成本/重试与停滞/失败原因），不执行 |
@@ -116,7 +120,7 @@ export OPENAI_MODEL=qwen2.5-coder:14b
 验收失败时，Verifier 会按已探测的技术栈从输出里抽取去重、单行截断的根因诊断（最多 25 行）作为**诊断块前置**到错误全文之前；重试叶子只截取错误前缀注入上下文（4000 字符），根因因此一定在最显眼的位置，原始日志完整附在块后。目前覆盖：Go（`x.go:4:2: undefined:`、`--- FAIL`、`panic`）、Python（traceback 的 `File "x", line N`、`XError:`、pytest 的 `E` 行与 `FAILED`）、Rust（`error[E0xxx]:`、`--> file:line:col`、`panicked at`）、Node/TypeScript（tsc 的 `x.ts(10,5): error TS…`、Node 的源码位置行与 `ReferenceError:` 等异常头；刻意不收冗长的 `at …` 栈帧）。
 重试不是无条件的。每次失败都会算一个**指纹**（优先用上面那套根因诊断行，没有诊断规则时取输出头部并把数字统一掩码），连续 `-max-stall` 次（默认 `3`）指纹相同，就判定这个叶子在**原地打转**——它失败得很快，但每次失败都一样，时间闸门永远等不到。此时停止重试，转去重新拆解（拆解预算还有的话）或直接判 `FAILED`，并记一条 `leaf_stall` 事件。失败**各不相同**的叶子不受影响，照旧重试到 `-max-retries` / `-max-elapsed`。这是默认 `-max-retries 0` 下无限重试能真正收敛的关键：在此之前，只有 45 分钟的墙钟能结束一个卡死的叶子。
 
-叶子用完 `-max-steps`（默认 20）还没调用 `finish` **一律算失败**，不会送去验收：模型没有声称完成，文件可能是半截的，finish 前的 `review_diff` 自检也还没跑。（早先这里会直接进验收，碰上 `ls` 这类占位 DoD，一个没干完的叶子会被判成 COMPLETED。）最后 3 次工具调用时 worker 会附一条 `[budget] N tool call(s) left` 提醒——只进当次请求、不写进对话历史，避免后续步骤读到过期的计数。
+叶子用完工具调用预算（普通叶子 `-max-steps` 默认 20；integrate/server/cmake 等难叶子用 `-hard-max-steps`，默认 40）还没调用 `finish` **一律算失败**，不会送去验收：模型没有声称完成，文件可能是半截的，finish 前的 `review_diff` 自检也还没跑。（早先这里会直接进验收，碰上 `ls` 这类占位 DoD，一个没干完的叶子会被判成 COMPLETED。）最后 3 次工具调用时 worker 会附一条 `[budget] N tool call(s) left` 提醒——只进当次请求、不写进对话历史，避免后续步骤读到过期的计数。
 
 没有依赖关系的就绪叶子可以并发执行（`-parallel N`，默认 `1`）；每次 LLM 调用的 token 用量按节点记入任务树并随会话持久化，运行结束打印本次与会话累计（resume 后自动累加），树状进度与 `-status` 里也会显示每个节点的消耗。
 
@@ -328,7 +332,7 @@ sidecar 二进制按 `$GOOS/$GOARCH` 映射命名（`binaries/divvy-sidecar-aarc
 - `-max-cost`（美元）与 `-budget-tokens` 是**会话级硬上限**，计入 resume 之前已持久化的花费；超限立即取消运行、把在途节点复位为 `PENDING` 并保存任务树。提高上限后用 `-resume` 继续即可，不会重试或重复烧钱。
 - 模型在价目表中无对应价格时不显示估算（本地零成本模型的典型情况），token 预算仍然生效。
 
-四层闸门互相独立：会话级 `-max-cost` / `-budget-tokens` 管总量；单叶子 `-max-elapsed`（默认 `45m`）管"一个慢叶子"；`-max-stall`（默认 `3`）管"一个快但在原地打转的叶子"；`-max-steps` 管单次尝试的收尾。
+五层闸门互相独立：会话级 `-max-cost` / `-budget-tokens` 管总量；单叶子 `-max-leaf-cost` / `-max-leaf-tokens` 管"一个过大的叶子"（超限 fail-fast 并重新拆解）；`-max-elapsed`（默认 `45m`）管"一个慢叶子"；`-max-stall`（默认 `3`）管"一个快但在原地打转的叶子"；`-max-steps` / `-hard-max-steps` 管单次尝试的收尾。
 
 > `-max-retries 0`（默认）表示验收失败**无限重试**。这一点必须配合 `-max-elapsed` 与 `-max-stall`：没有闸门时，一个永远无法通过验收的叶子会一直重试下去持续烧 token。超时的叶子直接判 `FAILED` 并写明原因，**不会**触发重新拆解——时间不够不代表任务太大，重拆只会重置时钟；但**停滞**（重复同一失败）的叶子会触发重新拆解，那才是"任务太大/方向不对"的信号。
 
@@ -531,7 +535,10 @@ go run ./cmd/bench \
 - **`-native-tools` 与 JSON 动作模式的成熟度不同。** 默认的 JSON 动作模式是给弱模型准备的；`-native-tools` 走 OpenAI `tool_calls`，历史裁剪已做配对对齐，但对同样本要求更高的模型。
 - **`find_symbol` 的 `references` 是文本级扫描**，不做类型分析：注释和字符串里的同名提及也会出现，别名与动态调用会漏掉。Go 的**定义**定位走真实 AST，是准确的。
 - **验收命令由模型生成，默认值只是兜底。** 根目标验收的兜底命令（各栈的 build / `npm test`）远弱于模型显式给出的端到端命令（启动服务 + `curl -f`）。若计划里没有集成叶子，根会直接 `FAILED` 而不是假装完成。
-- **多语言诊断按语言的规则表抽取**（Go/Python/Rust/Node 各自的专用规则，外加 Makefile 与通用工作区的兜底规则），新语言需要在 `pkg/tools/diagnostics.go` 的 `diagRules` 里加一条；未覆盖的工具链会退回通用规则，不会完全没有压缩。
+- **多语言诊断按语言的规则表抽取**（Go/Python/Rust/Node/CMake 各自的专用规则，外加 Makefile 与通用工作区的兜底规则），新语言需要在 `pkg/tools/diagnostics.go` 的 `diagRules` 里加一条；未覆盖的工具链会退回通用规则，不会完全没有压缩。
+- **DoD 端口探测不要用 `nc`**：叶子会浪费步骤去 `apt-get install`。优先 `bash -c 'exec 3<>/dev/tcp/HOST/PORT'`、`curl`，或开 `-web` 后用 `http_request`。裸 `nc -z host port` 会被 harness 改写成 `/dev/tcp`。
+- **`review_diff` / finish 门永远忽略 `.divvy/`**（以及 `build/`、`node_modules` 等噪声），避免 solo jsonl 被当成调试残留。
+- **`-dod` / `-aggregate` 的 `;` 是顶层分隔**：括号内冒烟脚本里的分号不会被切开。
 - **`-max-elapsed` 是单叶子预算，不是全局预算。** 全局请用 `-max-cost` / `-budget-tokens`。
 - **`-max-stall` 靠指纹比对，太宽的指纹会误伤。** 指纹优先取根因诊断行（已去重、已剥离易变细节），没有诊断规则时才回退到"输出头部 + 数字掩码"——这意味着只有数字变化的失败会被视为同一个。若某个工具链的输出结构特殊导致误判，可以 `-max-stall 0` 关掉，只用 `-max-elapsed` 兜底。
 - **`-prune` 会真删文件**（会话 JSON + 日志 + 事件流），只保留 `-keep` 个最近的会话。它永不删 `LATEST` 指向的会话，但先跑一次 `-prune -dry-run` 看看清单永远是值得的。

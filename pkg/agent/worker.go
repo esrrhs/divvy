@@ -28,10 +28,8 @@ func (o *Orchestrator) runWorker(ctx context.Context, sb *tools.Sandbox, node *m
 		native = nativeToolDefs(sb)
 	}
 
-	maxSteps := o.cfg.MaxSteps
-	if maxSteps < 1 {
-		maxSteps = 12
-	}
+	maxSteps := o.leafMaxSteps(node)
+	reqTimeout := o.leafRequestTimeout(node)
 
 	summary := ""
 	invalidRounds := 0
@@ -39,9 +37,17 @@ func (o *Orchestrator) runWorker(ctx context.Context, sb *tools.Sandbox, node *m
 		if err := ctx.Err(); err != nil {
 			return summary, err
 		}
+		if err := o.checkLeafBudget(node.ID); err != nil {
+			return summary, err
+		}
 		o.log.Actionf("worker %s step %d/%d", node.ID, step, maxSteps)
 
-		resp, err := o.chat(ctx, "worker", node.ID, llm.Request{
+		stepCtx := ctx
+		var cancel context.CancelFunc
+		if _, hasDeadline := ctx.Deadline(); !hasDeadline && reqTimeout > 0 {
+			stepCtx, cancel = context.WithTimeout(ctx, reqTimeout)
+		}
+		resp, err := o.chat(stepCtx, "worker", node.ID, llm.Request{
 			Model:       o.cfg.Model,
 			Messages:    o.stepBudgetMessages(messages, step, maxSteps),
 			Tools:       native,
@@ -49,12 +55,31 @@ func (o *Orchestrator) runWorker(ctx context.Context, sb *tools.Sandbox, node *m
 			MaxTokens:   o.cfg.MaxTokens,
 			Stream:      o.cfg.Stream,
 		})
+		if cancel != nil {
+			cancel()
+		}
 		if err != nil {
 			return summary, err
 		}
 		o.log.Debugf("worker raw: %s", truncate(resp.Content, 400))
 
-		actions := collectActions(resp)
+		actions, incompleteHint := collectActions(resp)
+		if incompleteHint != "" {
+			// Same-turn re-ask: truncated/missing-field JSON is recoverable
+			// without burning MaxRetries. Does not advance the invalid streak
+			// toward hard abort — the model produced a recognizable action.
+			o.events.Record("incomplete_action", node.ID, map[string]any{
+				"step":   step,
+				"hint":   clip(incompleteHint, evReasonChars),
+				"snippet": clip(resp.Content, evReasonChars),
+			})
+			messages = append(messages,
+				llm.Message{Role: llm.RoleAssistant, Content: resp.Content},
+				llm.Message{Role: llm.RoleUser, Content: incompleteHint},
+			)
+			step-- // re-ask does not consume the tool-call budget
+			continue
+		}
 		if len(actions) == 0 {
 			invalidRounds++
 			o.events.Record("invalid_json", node.ID, map[string]any{
@@ -256,7 +281,7 @@ type taggedAction struct {
 	Args    map[string]any
 }
 
-func collectActions(resp *llm.Response) []taggedAction {
+func collectActions(resp *llm.Response) (actions []taggedAction, incompleteHint string) {
 	var out []taggedAction
 	for _, tc := range resp.ToolCalls {
 		args := map[string]any{}
@@ -270,16 +295,97 @@ func collectActions(resp *llm.Response) []taggedAction {
 		})
 	}
 	if len(out) > 0 {
-		return out
+		// Native tool_calls are already structured by the provider; missing
+		// optional args are the tool's problem, not a same-turn re-ask.
+		return out, ""
 	}
 	if strings.TrimSpace(resp.Content) == "" {
-		return nil
+		return nil, ""
 	}
 	act, err := llm.ParseAction(resp.Content)
 	if err != nil {
-		return nil
+		// Truncated / half JSON: ask for a complete action in the same turn.
+		if hint := incompleteActionHint(resp.Content, err); hint != "" {
+			return nil, hint
+		}
+		return nil, ""
 	}
-	return []taggedAction{{Name: act.Name, Thought: act.Thought, Args: act.Args}}
+	tagged := taggedAction{Name: act.Name, Thought: act.Thought, Args: act.Args}
+	if hint := missingActionFieldsHint(tagged); hint != "" {
+		return nil, hint
+	}
+	return []taggedAction{tagged}, ""
+}
+
+// incompleteActionHint detects half-parsed / truncated tool JSON and returns a
+// same-turn re-ask prompt. Empty means "treat as plain invalid JSON".
+func incompleteActionHint(raw string, parseErr error) string {
+	s := strings.TrimSpace(raw)
+	if s == "" || parseErr == nil {
+		return ""
+	}
+	low := strings.ToLower(s)
+	errText := parseErr.Error()
+	hasActionKey := strings.Contains(s, `"action"`) || strings.Contains(s, `"tool"`) || strings.Contains(low, `"write_file"`)
+	braceImbalance := strings.Count(s, "{") > strings.Count(s, "}") || !strings.HasSuffix(strings.TrimSpace(s), "}")
+	looksTruncated := strings.Contains(errText, "unterminated") ||
+		strings.Contains(errText, "unexpected end") ||
+		strings.Contains(errText, "invalid JSON") ||
+		(hasActionKey && braceImbalance)
+	if !looksTruncated && !hasActionKey {
+		return ""
+	}
+	return "Your previous reply was truncated or incomplete JSON. " +
+		"Re-send ONE complete JSON object with every required field filled " +
+		`(example write_file: {"thought":"...","action":"write_file","args":{"path":"file.go","content":"full file contents"}}). ` +
+		"Do not wrap in markdown. Do not omit content/path/command fields."
+}
+
+// missingActionFieldsHint returns a same-turn re-ask when a parsed action is
+// missing fields the tool cannot run without (write_file without content, …).
+func missingActionFieldsHint(act taggedAction) string {
+	need := func(keys ...string) string {
+		for _, k := range keys {
+			v, _ := stringFromArgs(act.Args, k)
+			if strings.TrimSpace(v) == "" {
+				return k
+			}
+		}
+		return ""
+	}
+	switch act.Name {
+	case tools.ToolWriteFile:
+		if m := need("path", "content"); m != "" {
+			return fmt.Sprintf(
+				`Action write_file is missing required %q. Re-send complete JSON: {"thought":"...","action":"write_file","args":{"path":"...","content":"..."}}`, m)
+		}
+	case tools.ToolReadFile:
+		if _, ok := act.Args["paths"]; !ok {
+			if m := need("path"); m != "" {
+				return `Action read_file needs "path" (or "paths"). Re-send complete JSON with the path filled.`
+			}
+		}
+	case tools.ToolRunBash:
+		if m := need("command"); m != "" {
+			return `Action run_bash is missing "command". Re-send complete JSON with the shell command filled.`
+		}
+	case tools.ToolReplaceLines:
+		hasOld, _ := stringFromArgs(act.Args, "old_string")
+		hasPath, _ := stringFromArgs(act.Args, "path")
+		if strings.TrimSpace(hasPath) == "" {
+			return `Action replace_lines is missing "path". Re-send complete JSON.`
+		}
+		if strings.TrimSpace(hasOld) == "" {
+			if _, ok := act.Args["start_line"]; !ok {
+				if _, ok := act.Args["edits"]; !ok {
+					return `Action replace_lines needs old_string/new_string, start_line/end_line, or edits. Re-send complete JSON.`
+				}
+			}
+		}
+	case tools.ToolFinish:
+		// summary is optional (falls back to thought)
+	}
+	return ""
 }
 
 func nativeToolDefs(sb *tools.Sandbox) []llm.Tool {

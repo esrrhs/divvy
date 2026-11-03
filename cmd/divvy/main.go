@@ -41,7 +41,9 @@ func run(args []string) error {
 	baseURL := fs.String("base-url", cfg.BaseURL, "OpenAI-compatible API base URL")
 	apiKey := fs.String("api-key", cfg.APIKey, "API key (or OPENAI_API_KEY / LLM_API_KEY)")
 	extra := fs.String("extra", "", "extra JSON merged into chat request body")
-	maxSteps := fs.Int("max-steps", cfg.MaxSteps, "max tool calls per leaf attempt")
+	maxSteps := fs.Int("max-steps", cfg.MaxSteps, "max tool calls per easy leaf attempt (hard integrate/server/cmake leaves use -hard-max-steps)")
+	hardMaxSteps := fs.Int("hard-max-steps", cfg.HardMaxSteps, "max tool calls for hard leaves (integrate/server/cmake+ctest); 0 = 40 or DIVVY_HARD_MAX_STEPS")
+	hardTimeout := fs.Duration("hard-timeout", cfg.HardRequestTimeout, "per-request timeout for hard leaves; 0 = 180s or DIVVY_HARD_TIMEOUT")
 	maxRetries := fs.Int("max-retries", cfg.MaxRetries, "max verify retries per leaf (0 = unlimited)")
 	maxStall := fs.Int("max-stall", cfg.MaxStall, "give up after this many identical failures in a row (leaf attempt, or -solo round); 0 = never")
 	maxElapsed := fs.Duration("max-elapsed", cfg.MaxElapsed, "wall-clock budget for one leaf across all attempts (0 = unlimited)")
@@ -57,21 +59,13 @@ func run(args []string) error {
 	soloRounds := fs.Int("solo-rounds", 0, "with -solo: repair rounds after a failed acceptance (default 3)")
 	soloContext := fs.Int("solo-context", 0, "with -solo: conversation characters sent per request (default 100000)")
 	var dodFlags []string
-	fs.Func("dod", "explicit acceptance `command`; repeatable, and one value may hold several separated by ';'. Overrides the planner's and the toolchain's defaults (tree: root only; -solo: the whole run)", func(v string) error {
-		for _, c := range strings.Split(v, ";") {
-			if c = strings.TrimSpace(c); c != "" {
-				dodFlags = append(dodFlags, c)
-			}
-		}
+	fs.Func("dod", "explicit acceptance `command`; repeatable, and one value may hold several top-level ';' separators (quotes/parentheses preserved so smoke scripts stay intact). Overrides the planner's and the toolchain's defaults (tree: root only; -solo: the whole run)", func(v string) error {
+		dodFlags = append(dodFlags, splitCommandList(v)...)
 		return nil
 	})
 	var aggregateFlags []string
-	fs.Func("aggregate", "whole-workspace `command` run at every wave boundary (build+tests); repeatable, and one value may hold several separated by ';'. Empty = derive from the toolchain", func(v string) error {
-		for _, c := range strings.Split(v, ";") {
-			if c = strings.TrimSpace(c); c != "" {
-				aggregateFlags = append(aggregateFlags, c)
-			}
-		}
+	fs.Func("aggregate", "whole-workspace `command` run at every wave boundary (build+tests); repeatable, and one value may hold several top-level ';' separators (quotes/parentheses preserved). Empty = derive from the toolchain", func(v string) error {
+		aggregateFlags = append(aggregateFlags, splitCommandList(v)...)
 		return nil
 	})
 	wave := fs.Int("wave", cfg.Wave, "leaves that may be planned but not yet executed; decomposition stops there so the planner sees real code before thinking further (0 = old flat behaviour, no throttle and no aggregate)")
@@ -85,6 +79,8 @@ func run(args []string) error {
 	noStream := fs.Bool("no-stream", false, "disable SSE streaming")
 	maxCost := fs.Float64("max-cost", cfg.MaxCost, "session cost ceiling in USD, incl. pre-resume spend (0 = unlimited)")
 	budgetTokens := fs.Int("budget-tokens", cfg.BudgetTokens, "session token ceiling, incl. pre-resume spend (0 = unlimited)")
+	maxLeafCost := fs.Float64("max-leaf-cost", cfg.MaxLeafCost, "per-leaf cost ceiling in USD; on overrun fail fast and re-decompose (0 = unlimited)")
+	maxLeafTokens := fs.Int("max-leaf-tokens", cfg.MaxLeafTokens, "per-leaf token ceiling; on overrun fail fast and re-decompose (0 = unlimited)")
 	pricing := fs.String("pricing", cfg.PricingJSON, "custom price table as JSON text or path to a JSON file ({\"model\":{\"input\":0.15,\"output\":0.6}} per 1M tokens)")
 	resume := fs.Bool("resume", false, "resume a previous session")
 	serve := fs.Bool("serve", false, "start the local web UI server (loopback HTTP + SSE) and open the browser")
@@ -117,6 +113,8 @@ func run(args []string) error {
 	cfg.APIKey = *apiKey
 	cfg.ExtraJSON = *extra
 	cfg.MaxSteps = *maxSteps
+	cfg.HardMaxSteps = *hardMaxSteps
+	cfg.HardRequestTimeout = *hardTimeout
 	cfg.MaxRetries = *maxRetries
 	cfg.Solo = *solo
 	cfg.SoloSteps = *soloSteps
@@ -143,6 +141,8 @@ func run(args []string) error {
 	cfg.Strict = *strict
 	cfg.MaxCost = *maxCost
 	cfg.BudgetTokens = *budgetTokens
+	cfg.MaxLeafCost = *maxLeafCost
+	cfg.MaxLeafTokens = *maxLeafTokens
 	cfg.PricingJSON = *pricing
 	cfg.Goal = strings.TrimSpace(strings.Join(fs.Args(), " "))
 
@@ -336,6 +336,15 @@ func run(args []string) error {
 	if cfg.BudgetTokens < 0 {
 		return fmt.Errorf("-budget-tokens must be >= 0")
 	}
+	if cfg.MaxLeafCost < 0 {
+		return fmt.Errorf("-max-leaf-cost must be >= 0")
+	}
+	if cfg.MaxLeafTokens < 0 {
+		return fmt.Errorf("-max-leaf-tokens must be >= 0")
+	}
+	if cfg.HardMaxSteps < 0 {
+		return fmt.Errorf("-hard-max-steps must be >= 0")
+	}
 	if cfg.MaxElapsed < 0 {
 		return fmt.Errorf("-max-elapsed must be >= 0")
 	}
@@ -513,6 +522,8 @@ Environment:
   OPENAI_BASE_URL / LLM_BASE_URL   (OpenAI-compatible, include /v1)
   OPENAI_MODEL / LLM_MODEL
   LLM_PRICING                      (custom price table JSON text or file path)
+  DIVVY_HARD_MAX_STEPS             (default hard-leaf tool-call budget when -hard-max-steps=0)
+  DIVVY_HARD_TIMEOUT               (default hard-leaf per-request timeout, e.g. 180s)
 
 Flags:
 `

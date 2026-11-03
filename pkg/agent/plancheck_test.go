@@ -73,7 +73,6 @@ func TestOrchestrator_PlanWarnings(t *testing.T) {
 	joined := strings.Join(warns, "\n")
 	for _, want := range []string{
 		"weak (Weak leaf): verification is only a placeholder (ls)",
-		"weak (Weak leaf): no declared outputs",
 		"x and y (siblings) both declare output shared.go",
 		"x (Writer x): verification is soft-only",
 		"y (Writer y): verification is soft-only",
@@ -81,6 +80,15 @@ func TestOrchestrator_PlanWarnings(t *testing.T) {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("missing warning %q in:\n%s", want, joined)
 		}
+	}
+	// Empty outputs are backfilled during decompose so the parallel mutex and
+	// entry-point checks have something to claim.
+	weak, ok := o.tree.CloneNode("weak")
+	if !ok || len(weak.Contract.Outputs) == 0 {
+		t.Fatalf("weak leaf outputs should be backfilled, got %#v ok=%v", weak, ok)
+	}
+	if strings.Contains(joined, "no declared outputs") {
+		t.Fatalf("backfilled outputs should not warn as empty:\n%s", joined)
 	}
 }
 

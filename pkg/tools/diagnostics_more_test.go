@@ -11,7 +11,7 @@ import (
 // which is exactly the context bloat the compact block exists to prevent.
 func TestDiagRuleForCoversEveryProjectType(t *testing.T) {
 	all := []ProjectType{
-		ProjectGo, ProjectNode, ProjectRust, ProjectPython, ProjectMake, ProjectGeneric,
+		ProjectGo, ProjectNode, ProjectRust, ProjectPython, ProjectCMake, ProjectMake, ProjectGeneric,
 	}
 	for _, pt := range all {
 		if _, ok := diagRuleFor(pt); !ok {
@@ -35,7 +35,7 @@ func TestSupportedDiagnosticProjects(t *testing.T) {
 		}
 		seen[pt] = true
 	}
-	for _, want := range []ProjectType{ProjectGo, ProjectNode, ProjectRust, ProjectPython, ProjectMake, ProjectGeneric} {
+	for _, want := range []ProjectType{ProjectGo, ProjectNode, ProjectRust, ProjectPython, ProjectCMake, ProjectMake, ProjectGeneric} {
 		if !seen[want] {
 			t.Errorf("SupportedDiagnosticProjects is missing %q", want)
 		}

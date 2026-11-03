@@ -135,7 +135,7 @@ func TestCollectActionsToolCalls(t *testing.T) {
 		{ID: "c1", Function: llm.ToolFunction{Name: "Write_File", Arguments: `{"path":"a.txt"}`}},
 		{ID: "c2", Function: llm.ToolFunction{Name: "finish", Arguments: `not json`}},
 	}}
-	acts := collectActions(resp)
+	acts, _ := collectActions(resp)
 	if len(acts) != 2 {
 		t.Fatalf("got %d actions", len(acts))
 	}
@@ -150,11 +150,11 @@ func TestCollectActionsToolCalls(t *testing.T) {
 
 func TestCollectActionFallbacks(t *testing.T) {
 	// Empty content: nothing to act on.
-	if acts := collectActions(&llm.Response{Content: "   "}); acts != nil {
+	if acts, _ := collectActions(&llm.Response{Content: "   "}); acts != nil {
 		t.Fatalf("empty content must give no actions, got %+v", acts)
 	}
 	// Content without any JSON: unparseable, no actions.
-	if acts := collectActions(&llm.Response{Content: "I cannot help with that."}); acts != nil {
+	if acts, _ := collectActions(&llm.Response{Content: "I cannot help with that."}); acts != nil {
 		t.Fatalf("prose must give no actions, got %+v", acts)
 	}
 }

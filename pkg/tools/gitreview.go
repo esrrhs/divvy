@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -116,6 +117,10 @@ func (r *reviewResult) parseTrackedDiff(diff string) {
 		switch {
 		case strings.HasPrefix(raw, "+++ b/"):
 			file = strings.TrimPrefix(raw, "+++ b/")
+			if reviewNoisePath(file) {
+				file = ""
+				continue
+			}
 			r.files[file] = true
 		case strings.HasPrefix(raw, "+++ /dev/null"):
 			// Deleted file: it contributes no new lines.
@@ -141,7 +146,7 @@ func (r *reviewResult) parseTrackedDiff(diff string) {
 func (r *reviewResult) scanUntracked(sb *Sandbox, paths []string) {
 	for _, rel := range paths {
 		rel = strings.TrimSpace(rel)
-		if rel == "" {
+		if rel == "" || reviewNoisePath(rel) {
 			continue
 		}
 		abs, err := sb.Resolve(rel)
@@ -288,6 +293,33 @@ func (s *Sandbox) PreFinishGate(ctx context.Context) (*FinishGate, error) {
 	}
 	blocking := r.has("conflict") || r.has("secret")
 	return &FinishGate{Blocking: blocking, Report: report}, nil
+}
+
+
+// reviewNoisePath reports paths that must never feed review_diff / PreFinishGate:
+// session state (.divvy/), configure/build trees, and other skipDirNames noise.
+// Solo jsonl under .divvy/ used to false-positive as "debugger leftovers".
+func reviewNoisePath(rel string) bool {
+	rel = strings.TrimSpace(filepath.ToSlash(rel))
+	if rel == "" {
+		return true
+	}
+	parts := strings.Split(rel, "/")
+	for _, seg := range parts {
+		if seg == "" || seg == "." {
+			continue
+		}
+		if skipDirNames[seg] || seg == "build" {
+			return true
+		}
+	}
+	base := parts[len(parts)-1]
+	for _, suf := range []string{".o", ".obj", ".a", ".so", ".dylib", ".exe", ".pcm"} {
+		if strings.HasSuffix(strings.ToLower(base), suf) {
+			return true
+		}
+	}
+	return false
 }
 
 func clipReviewText(s string) string {

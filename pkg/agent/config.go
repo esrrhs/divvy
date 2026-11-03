@@ -25,6 +25,10 @@ type Config struct {
 	MinRequestInterval time.Duration
 
 	MaxSteps       int
+	// HardMaxSteps is the elevated tool-call budget for hard leaves
+	// (integrate/server/cmake+ctest). 0 = DefaultHardMaxSteps (or
+	// DIVVY_HARD_MAX_STEPS). Easy leaves keep MaxSteps.
+	HardMaxSteps int
 	MaxRetries     int // 0 = retry forever
 	MaxDepth       int
 	MaxSubtasks    int
@@ -32,6 +36,10 @@ type Config struct {
 	DecomposeTries int  // 0 = retry forever
 	Parallel       int  // concurrent leaf executions; <= 1 means serial
 	Isolate        bool // run each leaf in a mirror copy of the workspace; merge only on success
+
+	// HardRequestTimeout elevates the per-LLM-request timeout while a hard
+	// leaf is executing (0 = DefaultHardRequestTimeout / DIVVY_HARD_TIMEOUT).
+	HardRequestTimeout time.Duration
 
 	// MaxElapsed bounds the wall-clock time a single leaf may spend across
 	// all of its attempts (0 = unlimited). It is the safety net for
@@ -119,6 +127,13 @@ type Config struct {
 	PricingJSON  string
 	MaxCost      float64 // USD
 	BudgetTokens int
+
+	// Per-leaf ceilings. Global MaxCost/BudgetTokens are too coarse when one
+	// integrate leaf burns ~1M tokens while siblings stay under 100k. On
+	// overrun the leaf fails fast and is signaled for re-decompose rather
+	// than consuming the rest of the session budget. 0 = unlimited.
+	MaxLeafCost   float64 // USD
+	MaxLeafTokens int
 }
 
 // DefaultConfig fills in usable defaults.
@@ -133,6 +148,7 @@ func DefaultConfig() Config {
 		MaxTokens:         4096,
 		RequestTimeout:    120 * time.Second,
 		MaxSteps:          20,
+		HardMaxSteps:      0, // DefaultHardMaxSteps / DIVVY_HARD_MAX_STEPS when hard
 		MaxRetries:        0,
 		MaxStall:          3,
 		MaxElapsed:        45 * time.Minute,
