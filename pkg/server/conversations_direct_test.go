@@ -577,16 +577,12 @@ func TestConversation_DirectStreamDeltasArriveInChunks(t *testing.T) {
 				continue
 			}
 			text := anyString(ev["text"])
-			if text == want && ev["live"] != true {
-				// A single non-live packet of the full text would be a fake flush.
-			}
+			// A single non-live packet of the full text would be a fake flush;
+			// arrivals are recorded for every delta and checked after the stream.
 			mu.Lock()
 			deltas = append(deltas, text)
 			arrivals = append(arrivals, time.Now())
 			mu.Unlock()
-			if text == want && len(deltas) == 1 {
-				// recorded below after join check
-			}
 		}
 	}()
 

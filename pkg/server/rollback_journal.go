@@ -250,11 +250,6 @@ func removeRollbackJournal(dataDir, convID string) error {
 	return nil
 }
 
-func listRollbackJournals(dataDir string) ([]*rollbackJournal, error) {
-	journals, _, err := inspectRollbackJournals(dataDir)
-	return journals, err
-}
-
 func journalUnreadableMessage(detail string) string {
 	msg := "撤销操作日志无法读取（读取或解析失败，不是文件不存在）。已阻止新的写入，以免覆盖可能未完成的恢复。请检查操作日志后再试恢复。"
 	detail = strings.TrimSpace(detail)
@@ -412,7 +407,7 @@ func copyWorkdirBackup(workdir, rel, dest string) error {
 	if err != nil {
 		return err
 	}
-	defer src.Close()
+	defer func() { _ = src.Close() }()
 	tmp, err := os.CreateTemp(filepath.Dir(dest), ".bak-*.tmp")
 	if err != nil {
 		return err

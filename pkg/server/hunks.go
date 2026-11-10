@@ -28,11 +28,7 @@ func splitDiffLines(s string) []string {
 	if s == "" {
 		return nil
 	}
-	t := s
-	if strings.HasSuffix(t, "\n") {
-		t = t[:len(t)-1]
-	}
-	return strings.Split(t, "\n")
+	return strings.Split(strings.TrimSuffix(s, "\n"), "\n")
 }
 
 func keepTrailingNL(oldText, newText, result string) string {
@@ -181,7 +177,7 @@ func applyHunkDecisions(oldText, newText string, decisions []bool) (string, []di
 	var b strings.Builder
 	for i, l := range lines {
 		hi := hunkIndexAt(hunks, i)
-		keep := true
+		var keep bool
 		switch l.Type {
 		case "context":
 			keep = true
@@ -232,20 +228,6 @@ func parseHunkDecisions(n int, items []hunkDecision, all string) ([]bool, error)
 type hunkDecision struct {
 	Index  int  `json:"index"`
 	Accept bool `json:"accept"`
-}
-
-func decisionsFromStored(n int, stored []string) []bool {
-	out := make([]bool, n)
-	for i := range out {
-		out[i] = true
-		if i < len(stored) {
-			switch stored[i] {
-			case "reject", "rejected":
-				out[i] = false
-			}
-		}
-	}
-	return out
 }
 
 func storeDecisions(dec []bool) []string {

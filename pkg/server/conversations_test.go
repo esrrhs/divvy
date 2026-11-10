@@ -404,9 +404,7 @@ func TestConversation_QueueStartsAfterCurrentRun(t *testing.T) {
 	apiDo(t, http.MethodPost, apiBase(ts)+"/sessions/"+sid2+"/plan/approve?token=test-token", map[string]any{})
 	waitConvPhase(t, func() string {
 		_, got := apiDo(t, http.MethodGet, apiBase(ts)+"/conversations/"+id+"?token=test-token", nil)
-		if p := anyString(got["run_phase"]); p == string(agent.PhaseDone) || p == string(agent.PhasePlanReview) || p == string(agent.PhaseRunning) {
-			// Wait until the second run is finished and no queue remains.
-		}
+		// Wait until the second run is finished and no queue remains.
 		if got["queue"] != nil {
 			return "queued"
 		}

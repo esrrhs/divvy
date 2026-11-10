@@ -286,13 +286,6 @@ func recordedTurnModeChange(ch turnChange) bool {
 	return ch.OldMode != 0 && ch.NewMode != 0 && ch.OldMode != ch.NewMode
 }
 
-func applyRollbackOp(workdir string, op rollbackOp) error {
-	if op.delete {
-		return writeTurnResultDelete(workdir, op.path, "", true)
-	}
-	return writeWorkdirFile(workdir, op.path, op.restore)
-}
-
 // preTurnContent is the file body before this turn (empty = did not exist).
 // preTurnContent is the file body before this turn. existed is false when
 // the file was created by this turn (restore must delete it).

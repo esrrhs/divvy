@@ -14,11 +14,12 @@ func TestApplyHunkDecisionsPartial(t *testing.T) {
 	var oldB, newB strings.Builder
 	for i := 0; i < 12; i++ {
 		fmt.Fprintf(&oldB, "L%d\n", i)
-		if i == 1 {
+		switch i {
+		case 1:
 			newB.WriteString("X1\n")
-		} else if i == 10 {
+		case 10:
 			newB.WriteString("X10\n")
-		} else {
+		default:
 			fmt.Fprintf(&newB, "L%d\n", i)
 		}
 	}

@@ -1147,12 +1147,12 @@ func saveDirectState(path string, st *directState, secrets ...string) error {
 	}
 	tmpPath := tmp.Name()
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		os.Remove(tmpPath)
 		return err
 	}
 	if err := tmp.Sync(); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		os.Remove(tmpPath)
 		return err
 	}

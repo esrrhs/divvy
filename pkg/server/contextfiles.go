@@ -499,7 +499,7 @@ func saveTurnChanges(dataDir, convID, sessionID string, changes []turnChange, se
 	}
 	tmpPath := tmp.Name()
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		os.Remove(tmpPath)
 		return err
 	}

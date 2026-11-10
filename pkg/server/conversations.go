@@ -1339,7 +1339,7 @@ func (s *Server) forwardDirectEvents(convID string, evs <-chan map[string]any) {
 				_ = saveConversation(s.dataDir, c, secrets)
 			}
 		case "ask_timeout":
-			text := "提问已超时未答。"
+			var text string
 			if evString(ev["risk"]) == "consent" {
 				text = "提问已超时，未作同意；已暂停。审批、破坏性或对外发送的操作不会因此自动执行。"
 			} else {

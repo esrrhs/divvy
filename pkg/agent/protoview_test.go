@@ -92,7 +92,7 @@ func TestProtocolView_CodeFenceAndInvalidDoNotLeak(t *testing.T) {
 		t.Fatalf("fence/protocol leaked on half JSON: %q", v.Visible())
 	}
 	v.Append(`","action":"finish","args":{"summary":"done"}}` + "\n```")
-	if v.Visible() != "Hi\n\ndone" && v.Visible() != "Hi\n\ndone" {
+	if v.Visible() != "Hi\n\ndone" {
 		if !strings.Contains(v.Visible(), "Hi") || !strings.Contains(v.Visible(), "done") {
 			t.Fatalf("visible=%q", v.Visible())
 		}

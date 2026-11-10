@@ -20,6 +20,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+
       - name: Set up Go ${{ matrix.go }}
         uses: actions/setup-go@v5
         with:
@@ -64,6 +67,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
@@ -103,6 +109,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -234,6 +243,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
 
       - name: Set up Node
         uses: actions/setup-node@v4

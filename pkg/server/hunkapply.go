@@ -258,12 +258,6 @@ func isNotExistish(err error) bool {
 	return os.IsNotExist(err) || strings.Contains(strings.ToLower(err.Error()), "no such file")
 }
 
-func writeTurnResult(workdir, rel, content string) error {
-	// Backward-compatible helper: empty content deletes. New callers that
-	// must preserve an empty file should use applyTurnResult or writeWorkdirFile.
-	return writeTurnResultDelete(workdir, rel, content, content == "")
-}
-
 func writeTurnResultDelete(workdir, rel, content string, deleteFile bool) error {
 	sb, err := tools.NewSandbox(workdir)
 	if err != nil {
@@ -277,10 +271,6 @@ func writeTurnResultDelete(workdir, rel, content string, deleteFile bool) error 
 		return nil
 	}
 	return sb.WriteFile(rel, content)
-}
-
-func writeWorkdirFile(workdir, rel, content string) error {
-	return writeTurnResultDelete(workdir, rel, content, false)
 }
 
 // applyTurnResult writes or deletes based on the turn change's status, so an
