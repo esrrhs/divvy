@@ -1,0 +1,18 @@
+//go:build !linux
+
+package tools
+
+import (
+	"context"
+	"fmt"
+	"os/exec"
+)
+
+func isolateShellCommand(ctx context.Context, root, command string, env []string) (*exec.Cmd, error) {
+	return nil, fmt.Errorf("run_bash requires filesystem isolation (bubblewrap/landlock) and is not available on this platform; the command was not executed")
+}
+
+// ProbeShellIsolation always reports run_bash unavailable off Linux.
+func ProbeShellIsolation(root string) (bool, string) {
+	return false, "run_bash is unavailable on this platform: filesystem isolation (bubblewrap) is only supported on Linux"
+}

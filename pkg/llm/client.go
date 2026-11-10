@@ -199,7 +199,7 @@ func (c *OpenAIClient) do(ctx context.Context, req Request, stream bool) (*Respo
 	}
 
 	if stream {
-		return c.readStream(httpResp.Body)
+		return c.readStream(httpResp.Body, req.OnToken)
 	}
 
 	raw, err := io.ReadAll(httpResp.Body)
@@ -222,7 +222,7 @@ func (c *OpenAIClient) do(ctx context.Context, req Request, stream bool) (*Respo
 	}, nil
 }
 
-func (c *OpenAIClient) readStream(r io.Reader) (*Response, error) {
+func (c *OpenAIClient) readStream(r io.Reader, onToken func(string)) (*Response, error) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
@@ -262,6 +262,9 @@ func (c *OpenAIClient) readStream(r io.Reader) (*Response, error) {
 			content.WriteString(deltaText)
 			if c.OnToken != nil {
 				c.OnToken(deltaText)
+			}
+			if onToken != nil {
+				onToken(deltaText)
 			}
 		}
 		// Some providers send the full message in stream mode.

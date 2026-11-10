@@ -45,6 +45,7 @@ type sessionParams struct {
 	MaxStall     int     `json:"max_stall"`
 	MaxTokens    int     `json:"max_tokens"`
 	Temperature  float64 `json:"temperature"`
+	AgentMode    string  `json:"agent_mode"`
 }
 
 const maxLogPageLines = 2000
@@ -60,6 +61,10 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cfg := s.configFromParams(p)
+	if reason, blocked := s.rollbackPendingForWorkdir(cfg.WorkDir); blocked {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": reason})
+		return
+	}
 	client := s.newClient(cfg)
 	h, err := s.mgr.Start(cfg, client, agent.SilentLogger())
 	if err != nil {
@@ -85,6 +90,11 @@ func (s *Server) handleResumeSession(w http.ResponseWriter, r *http.Request) {
 	cfg := s.configFromParams(p)
 	cfg.SessionID = id
 	cfg.Goal = "" // Load restores the goal from the persisted tree.
+	wd := persistedSessionWorkdir(s.dataDir, id, cfg.WorkDir)
+	if reason, blocked := s.rollbackPendingForWorkdir(wd); blocked {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": reason})
+		return
+	}
 	client := s.newClient(cfg)
 	h, err := s.mgr.Resume(cfg, client, agent.SilentLogger())
 	if err != nil {
@@ -100,6 +110,21 @@ func (s *Server) handleResumeSession(w http.ResponseWriter, r *http.Request) {
 		"workdir":    h.Workdir(),
 		"phase":      h.Snapshot(),
 	})
+}
+
+func persistedSessionWorkdir(dataDir, sessionID, fallback string) string {
+	if strings.TrimSpace(sessionID) == "" {
+		return fallback
+	}
+	st, err := engine.NewStorage(dataDir)
+	if err != nil {
+		return fallback
+	}
+	tree, err := st.LoadTree(sessionID)
+	if err != nil || tree == nil || strings.TrimSpace(tree.WorkDir) == "" {
+		return fallback
+	}
+	return tree.WorkDir
 }
 
 // configFromParams layers request parameters over DefaultConfig (env-driven),
@@ -140,6 +165,9 @@ func (s *Server) configFromParams(p sessionParams) agent.Config {
 	// rather than rejecting the request, and note it on the config.
 	if cfg.LeafApprovalMode() == agent.LeafApprovalManual {
 		cfg.Isolate = true
+	}
+	if strings.TrimSpace(p.AgentMode) != "" {
+		cfg.AgentLoop = p.AgentMode
 	}
 	if p.BudgetTokens > 0 {
 		cfg.BudgetTokens = p.BudgetTokens
@@ -423,7 +451,7 @@ func (s *Server) handleGetApproval(w http.ResponseWriter, r *http.Request) {
 		"session_id": h.SessionID(),
 		"node_id":    req.NodeID,
 		"title":      req.Title,
-		"changes":    req.Changes,
+		"changes":    viewApprovalChanges(req.Changes),
 	}
 	data, merr := json.Marshal(payload)
 	if merr != nil {
@@ -445,8 +473,9 @@ func (s *Server) handleDecideApproval(w http.ResponseWriter, r *http.Request) {
 	}
 	leafID := r.PathValue("leafID")
 	var body struct {
-		Decision string `json:"decision"` // "approve" | "reject"
-		Comment  string `json:"comment"`
+		Decision string                      `json:"decision"` // "approve" | "reject"
+		Comment  string                      `json:"comment"`
+		Hunks    map[string]applyHunkRequest `json:"hunks"`
 	}
 	if err := decodeBody(r, &body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -461,6 +490,25 @@ func (s *Server) handleDecideApproval(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": `decision must be "approve" or "reject"`,
 		})
+		return
+	}
+	var patches map[string]string
+	var deletes []string
+	if approved && len(body.Hunks) > 0 {
+		req, found := h.PendingApproval(leafID)
+		if !found {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no pending approval for leaf " + leafID})
+			return
+		}
+		var err error
+		patches, deletes, err = patchesFromApprovalHunks(req.Changes, body.Hunks)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+	}
+	if patches != nil || len(deletes) > 0 {
+		writeActionResult(w, h, h.DecideLeafPatched(leafID, approved, body.Comment, patches, deletes))
 		return
 	}
 	writeActionResult(w, h, h.DecideLeaf(leafID, approved, body.Comment))

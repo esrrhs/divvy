@@ -82,6 +82,10 @@ func NewMirror(src string) (*Mirror, error) {
 		os.RemoveAll(dir)
 		return nil, fmt.Errorf("snapshot %s: %w", src, err)
 	}
+	if err := overlayProjectDeps(src, dir); err != nil {
+		os.RemoveAll(dir)
+		return nil, err
+	}
 	// Drop CMake/Meson/Ninja caches that embed the source workdir's absolute
 	// paths: a leaf cmake in this mirror would otherwise fail with cache
 	// directory mismatch. Digests are taken after the scrub so MergeBack
@@ -96,6 +100,100 @@ func NewMirror(src string) (*Mirror, error) {
 		return nil, fmt.Errorf("digest mirror %s: %w", dir, err)
 	}
 	return &Mirror{Dir: dir, base: base, baseMode: baseMode, src: src}, nil
+}
+
+// NewMirrorAt is NewMirror, but the snapshot lives at dir so a paused or
+// restarted session can reopen the same tree. dir is replaced if it already
+// exists; the caller should persist Mirror.State after a successful snapshot.
+func NewMirrorAt(src, dir string) (*Mirror, error) {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return nil, fmt.Errorf("mirror dir is empty")
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		return nil, fmt.Errorf("clear mirror dir: %w", err)
+	}
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, fmt.Errorf("create mirror dir: %w", err)
+	}
+	if repoReadyForWorktree(src) {
+		m, werr := newWorktreeMirror(src, dir)
+		if werr != nil {
+			os.RemoveAll(dir)
+			return nil, werr
+		}
+		return m, nil
+	}
+	if _, _, err := copyTree(src, dir); err != nil {
+		os.RemoveAll(dir)
+		return nil, fmt.Errorf("snapshot %s: %w", src, err)
+	}
+	if err := overlayProjectDeps(src, dir); err != nil {
+		os.RemoveAll(dir)
+		return nil, err
+	}
+	if _, err := ScrubConfigureCaches(dir); err != nil {
+		os.RemoveAll(dir)
+		return nil, fmt.Errorf("scrub configure caches in mirror: %w", err)
+	}
+	base, baseMode, err := snapshotDigests(dir)
+	if err != nil {
+		os.RemoveAll(dir)
+		return nil, fmt.Errorf("digest mirror %s: %w", dir, err)
+	}
+	return &Mirror{Dir: dir, base: base, baseMode: baseMode, src: src}, nil
+}
+
+// MirrorState is a persistable snapshot of Mirror so a restart can reopen
+// the same isolated tree and still detect external workdir edits.
+type MirrorState struct {
+	Dir      string            `json:"dir"`
+	Src      string            `json:"src"`
+	Base     map[string]string `json:"base,omitempty"`
+	BaseMode map[string]uint32 `json:"base_mode,omitempty"`
+	Worktree bool              `json:"worktree,omitempty"`
+}
+
+// State returns a deep copy of the digest maps used by MergeBack.
+func (m *Mirror) State() MirrorState {
+	if m == nil {
+		return MirrorState{}
+	}
+	st := MirrorState{Dir: m.Dir, Src: m.src, Worktree: m.worktree}
+	if m.base != nil {
+		st.Base = make(map[string]string, len(m.base))
+		for k, v := range m.base {
+			st.Base[k] = v
+		}
+	}
+	if m.baseMode != nil {
+		st.BaseMode = make(map[string]uint32, len(m.baseMode))
+		for k, v := range m.baseMode {
+			st.BaseMode[k] = v
+		}
+	}
+	return st
+}
+
+// OpenMirror reattaches a previously persisted isolated tree. The directory
+// and digest maps must still match the snapshot taken at NewMirror/NewMirrorAt.
+func OpenMirror(st MirrorState) (*Mirror, error) {
+	if strings.TrimSpace(st.Dir) == "" || strings.TrimSpace(st.Src) == "" {
+		return nil, fmt.Errorf("mirror state is missing dir or src")
+	}
+	info, err := os.Stat(st.Dir)
+	if err != nil || !info.IsDir() {
+		return nil, fmt.Errorf("mirror dir %s is not available: %w", st.Dir, err)
+	}
+	base := st.Base
+	if base == nil {
+		base = map[string]string{}
+	}
+	baseMode := st.BaseMode
+	if baseMode == nil {
+		baseMode = map[string]uint32{}
+	}
+	return &Mirror{Dir: st.Dir, base: base, baseMode: baseMode, src: st.Src, worktree: st.Worktree}, nil
 }
 
 // repoReadyForWorktree reports whether src is a git repository whose HEAD
@@ -124,6 +222,10 @@ func newWorktreeMirror(src, dir string) (*Mirror, error) {
 		_ = os.RemoveAll(dir)
 	}
 	if err := overlayWorktreeState(src, dir); err != nil {
+		cleanup()
+		return nil, err
+	}
+	if err := overlayProjectDeps(src, dir); err != nil {
 		cleanup()
 		return nil, err
 	}
@@ -255,8 +357,9 @@ func (e *MirrorLayoutError) Error() string {
 
 // mirrorWrite is one file the leaf created or modified, pending merge.
 type mirrorWrite struct {
-	rel string
-	dst string
+	rel     string
+	dst     string
+	baseSum string // digest at snapshot time; empty if the file did not exist
 }
 
 // symlinkSegment reports whether any path segment of rel under root is a
@@ -358,11 +461,11 @@ func (m *Mirror) classifyChanges() (writes []mirrorWrite, removals, conflicts, l
 			if currentSum != "" {
 				conflicts = append(conflicts, rel)
 			} else {
-				writes = append(writes, mirrorWrite{rel: rel, dst: dstPath})
+				writes = append(writes, mirrorWrite{rel: rel, dst: dstPath, baseSum: currentSum})
 			}
 		case currentSum == baseSum && currentMode == m.baseMode[rel]:
 			// Source untouched since the snapshot: a clean fast-forward.
-			writes = append(writes, mirrorWrite{rel: rel, dst: dstPath})
+			writes = append(writes, mirrorWrite{rel: rel, dst: dstPath, baseSum: baseSum})
 		default:
 			// Both this leaf and a sibling changed the file.
 			conflicts = append(conflicts, rel)
@@ -410,10 +513,19 @@ func (m *Mirror) classifyChanges() (writes []mirrorWrite, removals, conflicts, l
 // ScrubConfigureCaches also drops any such artifacts that already lived in
 // the source.
 //
-// The merge is all-or-nothing: if any file this leaf touched was also changed
-// in the source since the snapshot, nothing is written and a
-// *MergeConflictError naming the paths is returned. It returns
-// workspace-relative paths of merged and deleted files on success.
+// MergeBack re-checks each destination immediately before writing it. A
+// preflight conflict still refuses the whole merge with nothing written. A
+// change that appears after preflight (for example while a large file is
+// being copied) aborts the remaining files and attempts to restore any
+// already-written destinations from backups taken at the start of the apply
+// phase. This does not claim to eliminate every race with an external
+// process. It returns workspace-relative paths of merged and deleted files
+// on success, or a *MergeConflictError naming conflicting paths.
+// mergeWriteHook, if set, runs immediately before the write-time conflict
+// check for each destination (tests use this to inject a deterministic
+// mid-merge edit). It must not be used in production.
+var mergeWriteHook func(rel string)
+
 func (m *Mirror) MergeBack() (merged, deleted []string, err error) {
 	writes, removals, conflicts, layout, err := m.classifyChanges()
 	if err != nil {
@@ -429,35 +541,169 @@ func (m *Mirror) MergeBack() (merged, deleted []string, err error) {
 		return nil, nil, &MergeConflictError{Paths: conflicts}
 	}
 
+	// Back up destination files we will overwrite so a mid-merge conflict
+	// can be compensated. This is not a claim that every file switches in
+	// one instant; it is a best-effort restore of the pre-merge bytes.
+	backupDir, berr := os.MkdirTemp("", "divvy-merge-*")
+	if berr != nil {
+		return nil, nil, fmt.Errorf("merge backup dir: %w", berr)
+	}
+	defer os.RemoveAll(backupDir)
+	type backupFile struct {
+		rel, path string
+		missing   bool
+		mode      os.FileMode
+		written   string // digest of bytes this merge wrote, if it wrote
+	}
+	var backups []backupFile
+	backupByRel := map[string]int{}
 	for _, w := range writes {
-		// Never copy configure caches or out-of-tree build artifacts into the
-		// shared workdir: they embed the mirror's absolute path / are cheap to
-		// regenerate and break the next cmake/meson run there.
 		if shouldSkipMirrorBuildRel(w.rel) {
 			continue
+		}
+		info, err := os.Lstat(w.dst)
+		if err != nil {
+			if os.IsNotExist(err) {
+				backups = append(backups, backupFile{rel: w.rel, missing: true})
+				backupByRel[w.rel] = len(backups) - 1
+				continue
+			}
+			return nil, nil, err
+		}
+		data, err := os.ReadFile(w.dst)
+		if err != nil {
+			return nil, nil, fmt.Errorf("backup %s: %w", w.rel, err)
+		}
+		bp := filepath.Join(backupDir, filepath.FromSlash(w.rel))
+		if err := os.MkdirAll(filepath.Dir(bp), 0755); err != nil {
+			return nil, nil, err
+		}
+		if err := os.WriteFile(bp, data, info.Mode().Perm()); err != nil {
+			return nil, nil, err
+		}
+		backups = append(backups, backupFile{rel: w.rel, path: bp, mode: info.Mode().Perm()})
+		backupByRel[w.rel] = len(backups) - 1
+	}
+
+	compensate := func() (kept []string, err error) {
+		restore := map[string]bool{}
+		for _, rel := range merged {
+			restore[rel] = true
+		}
+		var first error
+		for i := len(backups) - 1; i >= 0; i-- {
+			b := backups[i]
+			if !restore[b.rel] {
+				continue
+			}
+			dst := filepath.Join(m.src, filepath.FromSlash(b.rel))
+			// Only roll back a file still equal to what this merge wrote.
+			// A later external edit is left in place and reported.
+			if b.written != "" {
+				cur, derr := fileDigest(dst)
+				if derr != nil && !os.IsNotExist(derr) {
+					if first == nil {
+						first = derr
+					}
+					kept = append(kept, b.rel)
+					continue
+				}
+				if cur != b.written {
+					kept = append(kept, b.rel)
+					continue
+				}
+			}
+			if b.missing {
+				if err := os.Remove(dst); err != nil && !os.IsNotExist(err) && first == nil {
+					first = err
+				}
+				continue
+			}
+			data, err := os.ReadFile(b.path)
+			if err != nil {
+				if first == nil {
+					first = err
+				}
+				continue
+			}
+			if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+				if first == nil {
+					first = err
+				}
+				continue
+			}
+			if err := os.WriteFile(dst, data, b.mode); err != nil && first == nil {
+				first = err
+			}
+		}
+		return kept, first
+	}
+
+	conflictAt := func(rel string) error {
+		kept, rerr := compensate()
+		paths := uniqueStrings(append([]string{rel}, kept...))
+		cErr := &MergeConflictError{Paths: paths}
+		if rerr != nil {
+			return fmt.Errorf("%w (also failed to restore already-written files: %v)", cErr, rerr)
+		}
+		if len(kept) > 0 {
+			return fmt.Errorf("%w (left later external edits untouched for manual recovery: %s)", cErr, strings.Join(kept, ", "))
+		}
+		return cErr
+	}
+
+	for _, w := range writes {
+		if shouldSkipMirrorBuildRel(w.rel) {
+			continue
+		}
+		if mergeWriteHook != nil {
+			mergeWriteHook(w.rel)
+		}
+		cur, err := fileDigest(w.dst)
+		if err != nil && !os.IsNotExist(err) {
+			_, _ = compensate()
+			return nil, nil, fmt.Errorf("recheck %s: %w", w.rel, err)
+		}
+		if cur != w.baseSum {
+			return nil, nil, conflictAt(w.rel)
 		}
 		mpath := filepath.Join(m.Dir, filepath.FromSlash(w.rel))
 		data, err := os.ReadFile(mpath)
 		if err != nil {
+			_, _ = compensate()
 			return nil, nil, fmt.Errorf("read mirrored %s: %w", w.rel, err)
 		}
 		if err := os.MkdirAll(filepath.Dir(w.dst), 0755); err != nil {
+			_, _ = compensate()
 			return nil, nil, err
 		}
 		if err := os.WriteFile(w.dst, data, 0644); err != nil {
+			_, _ = compensate()
 			return nil, nil, err
 		}
-		// Preserve the executable bit (and any other permission bits) the
-		// leaf set inside the mirror; a verified ./script must stay runnable
-		// after the merge.
 		if info, statErr := os.Stat(mpath); statErr == nil {
 			_ = os.Chmod(w.dst, info.Mode().Perm())
+		}
+		if idx, ok := backupByRel[w.rel]; ok {
+			if sum, derr := fileDigest(w.dst); derr == nil {
+				backups[idx].written = sum
+			}
 		}
 		merged = append(merged, w.rel)
 	}
 	for _, rel := range removals {
 		dstPath := filepath.Join(m.src, filepath.FromSlash(rel))
+		cur, err := fileDigest(dstPath)
+		if err != nil && !os.IsNotExist(err) {
+			_, _ = compensate()
+			return nil, nil, fmt.Errorf("recheck delete %s: %w", rel, err)
+		}
+		baseSum := m.base[rel]
+		if cur != baseSum {
+			return nil, nil, conflictAt(rel)
+		}
 		if rmErr := os.Remove(dstPath); rmErr != nil && !os.IsNotExist(rmErr) {
+			_, _ = compensate()
 			return merged, nil, fmt.Errorf("delete %s: %w", rel, rmErr)
 		}
 		deleted = append(deleted, rel)
@@ -670,12 +916,12 @@ func copyTree(src, dst string) (map[string]string, map[string]uint32, error) {
 			return err
 		}
 		if d.IsDir() {
-			if skipDirNames[d.Name()] {
+			if copySkipDirNames[d.Name()] {
 				return filepath.SkipDir
 			}
 			return os.MkdirAll(filepath.Join(dst, rel), 0755)
 		}
-		if skipDirNames[d.Name()] || !d.Type().IsRegular() {
+		if copySkipDirNames[d.Name()] || !d.Type().IsRegular() {
 			return nil
 		}
 		if err := copyFile(p, filepath.Join(dst, rel)); err != nil {
@@ -780,4 +1026,36 @@ func TrimPath(p string) string {
 		return p[:i] + "(isolated workspace)"
 	}
 	return p
+}
+
+// overlayProjectDeps copies ignored project dependency trees (node_modules,
+// vendor) into the isolated mirror so existing tests can run. They remain
+// in skipDirNames for search and MergeBack so they are not treated as
+// source changes to write back.
+func overlayProjectDeps(src, dst string) error {
+	for _, name := range []string{"node_modules", "vendor"} {
+		sp := filepath.Join(src, name)
+		info, err := os.Lstat(sp)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+		if _, _, err := copyTree(sp, filepath.Join(dst, name)); err != nil {
+			return fmt.Errorf("copy project dependency tree %s: %w", name, err)
+		}
+	}
+	return nil
+}
+
+func uniqueStrings(in []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, s := range in {
+		s = strings.TrimSpace(s)
+		if s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
 }

@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/esrrhs/divvy/pkg/agent"
@@ -36,6 +37,17 @@ type Server struct {
 	heartbeat time.Duration
 	logf      func(format string, args ...any)
 	addr      string
+
+	// apiKeys holds per-conversation API keys in process memory only.
+	// sessionConv maps a live/recent session id back to its conversation.
+	mu             sync.Mutex
+	apiKeys        map[string]string
+	sessionConv    map[string]string
+	snaps          map[string][]snapFile
+	watchDone      map[string]chan struct{}
+	skipQueue      map[string]bool
+	steerWait      map[string]chan struct{}
+	queuedAfterRun map[string]*QueuedTurn
 
 	// newClient builds the LLM client for a session. The default talks to
 	// the configured OpenAI-compatible endpoint; tests inject scripted
@@ -89,18 +101,26 @@ func New(mgr *agent.RunManager, dataDir string, opts ...Option) (*Server, error)
 		return nil, err
 	}
 	s := &Server{
-		mgr:       mgr,
-		dataDir:   dataDir,
-		workdir:   ".",
-		token:     token,
-		static:    defaultStaticFS(),
-		heartbeat: defaultHeartbeat,
-		logf:      func(string, ...any) {},
-		newClient: newLLMClient,
+		mgr:            mgr,
+		dataDir:        dataDir,
+		workdir:        ".",
+		token:          token,
+		static:         defaultStaticFS(),
+		heartbeat:      defaultHeartbeat,
+		logf:           func(string, ...any) {},
+		newClient:      newLLMClient,
+		apiKeys:        map[string]string{},
+		sessionConv:    map[string]string{},
+		snaps:          map[string][]snapFile{},
+		watchDone:      map[string]chan struct{}{},
+		skipQueue:      map[string]bool{},
+		steerWait:      map[string]chan struct{}{},
+		queuedAfterRun: map[string]*QueuedTurn{},
 	}
 	for _, opt := range opts {
 		opt(s)
 	}
+	s.recoverAllRollbackJournals()
 	return s, nil
 }
 
@@ -141,6 +161,23 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/sessions/{id}/approvals/{leafID}", s.handleDecideApproval)
 	mux.HandleFunc("GET /api/fs/list", s.handleFSList)
 	mux.HandleFunc("GET /api/fs/file", s.handleFSFile)
+	mux.HandleFunc("PUT /api/fs/file", s.handleFSWrite)
+	mux.HandleFunc("GET /api/fs/search", s.handleFSSearch)
+	mux.HandleFunc("GET /api/browse", s.handleBrowse)
+	mux.HandleFunc("GET /api/conversations", s.handleListConversations)
+	mux.HandleFunc("POST /api/conversations", s.handleCreateConversation)
+	mux.HandleFunc("GET /api/conversations/{id}", s.handleGetConversation)
+	mux.HandleFunc("DELETE /api/conversations/{id}", s.handleDeleteConversation)
+	mux.HandleFunc("POST /api/conversations/{id}/messages", s.handlePostMessage)
+	mux.HandleFunc("POST /api/conversations/{id}/key", s.handleSetConversationKey)
+	mux.HandleFunc("POST /api/conversations/{id}/resume", s.handleResumeConversation)
+	mux.HandleFunc("DELETE /api/conversations/{id}/queue", s.handleCancelQueue)
+	mux.HandleFunc("DELETE /api/conversations/{id}/steer", s.handleCancelSteer)
+	mux.HandleFunc("GET /api/conversations/{id}/files", s.handleConversationFiles)
+	mux.HandleFunc("GET /api/conversations/{id}/turns/{sessionId}/changes", s.handleTurnChanges)
+	mux.HandleFunc("POST /api/conversations/{id}/turns/{sessionId}/changes", s.handleApplyTurnHunks)
+	mux.HandleFunc("POST /api/conversations/{id}/turns/{sessionId}/rollback", s.handleRollbackTurn)
+	mux.HandleFunc("POST /api/conversations/{id}/rollback/recover", s.handleRecoverRollback)
 
 	// Static frontend (or placeholder) for everything else, including SPA
 	// client routes, with unknown paths falling back to index.html.

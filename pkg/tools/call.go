@@ -336,6 +336,12 @@ func NativeWebTools() []map[string]any {
 // Call executes a named tool. Returns a string result for the model.
 func (s *Sandbox) Call(ctx context.Context, name string, args map[string]any) (string, error) {
 	name = strings.ToLower(strings.TrimSpace(name))
+	if reason, disabled := s.ToolDisabled(name); disabled {
+		return "", fmt.Errorf("%s", reason)
+	}
+	if err := s.checkActionConsent(name, args); err != nil {
+		return "", err
+	}
 	switch name {
 	case ToolListDir:
 		path, _ := stringArg(args, "path")
@@ -833,4 +839,84 @@ func intArg(args map[string]any, key string) (int, error) {
 	default:
 		return 0, fmt.Errorf("invalid %s", key)
 	}
+}
+
+// checkActionConsent enforces that network/browser side effects are not
+// performed in manual mode unless a distinct action hook approved them.
+// File merge approval is not this consent; ask is not authorization.
+func (s *Sandbox) checkActionConsent(name string, args map[string]any) error {
+	if s == nil || !s.RequireActionConsent || !externalSideEffectTool(name) {
+		return nil
+	}
+	if s.ActionConsent == nil {
+		return fmt.Errorf("%s has external side effects and is blocked in manual approval mode: merging or rejecting files is not authorization for network or browser actions, and ask is not authorization. Grant a distinct action consent or disable this tool combination", name)
+	}
+	ok, reason, err := s.ActionConsent(name, args)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		if strings.TrimSpace(reason) == "" {
+			reason = "action consent was not granted"
+		}
+		return fmt.Errorf("%s: %s", name, reason)
+	}
+	return nil
+}
+
+func externalSideEffectTool(name string) bool {
+	switch name {
+	case ToolHTTPRequest, ToolDownloadFile, ToolWebFetch, ToolWebSearch,
+		ToolBrowserNavigate, ToolBrowserClick, ToolBrowserType, ToolBrowserText, ToolBrowserScreenshot:
+		return true
+	default:
+		return false
+	}
+}
+
+// ToolGuide is the system-prompt tool list with unavailable tools removed
+// and a stable notice so the model does not spend its step budget retrying.
+func (s *Sandbox) ToolGuide() string {
+	d := Descriptions()
+	if s == nil {
+		return d
+	}
+	if reason, ok := s.ToolDisabled(ToolRunBash); ok {
+		d = stripPrefixedToolBlock(d, "- run_bash:")
+		d += "\n\nUNAVAILABLE: run_bash cannot be used in this environment: " + reason + " Do not call it or retry it; it will not become available later in this session."
+	}
+	if s.RequireActionConsent {
+		d += "\n\nManual approval is on: approving or rejecting file merges is not authorization for network or browser side effects. http_request, download_file, web_*, and browser_* require a distinct action consent; without it they are refused. ask is not authorization."
+	}
+	if n := s.UnavailableNotice(); n != "" && !strings.Contains(d, "UNAVAILABLE:") {
+		d += "\n\n" + n
+	}
+	return d
+}
+
+func stripPrefixedToolBlock(desc, prefix string) string {
+	lines := strings.Split(desc, "\n")
+	var out []string
+	skipping := false
+	for _, line := range lines {
+		trim := strings.TrimSpace(line)
+		if strings.HasPrefix(trim, prefix) {
+			skipping = true
+			continue
+		}
+		if skipping {
+			if strings.HasPrefix(trim, "- ") {
+				skipping = false
+			} else if trim == "" {
+				skipping = false
+			} else {
+				continue
+			}
+		}
+		if skipping {
+			continue
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
 }

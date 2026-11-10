@@ -53,6 +53,9 @@ type Request struct {
 	Temperature float64   `json:"temperature,omitempty"`
 	MaxTokens   int       `json:"max_tokens,omitempty"`
 	Stream      bool      `json:"stream,omitempty"`
+	// OnToken, if set, receives each incremental text delta as the
+	// provider streams it. It is never serialized to the HTTP payload.
+	OnToken func(string) `json:"-"`
 }
 
 // Usage reports token usage when the provider returns it.

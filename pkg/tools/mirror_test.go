@@ -51,8 +51,10 @@ func TestMirror_SnapshotCopiesNestedAndSkipsIgnored(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(m.Dir, ".git")); !os.IsNotExist(err) {
 		t.Fatal(".git should not be copied")
 	}
-	if _, err := os.Stat(filepath.Join(m.Dir, "node_modules")); !os.IsNotExist(err) {
-		t.Fatal("node_modules should not be copied")
+	// Project deps (node_modules/vendor) must be available inside the
+	// isolate mirror; VCS metadata (.git) stays skipped.
+	if got := readFile(t, filepath.Join(m.Dir, "node_modules", "x.js")); got != "ignored" {
+		t.Fatalf("node_modules should be copied for project deps, got %q", got)
 	}
 }
 

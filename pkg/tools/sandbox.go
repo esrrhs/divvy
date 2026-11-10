@@ -1,6 +1,8 @@
 package tools
 
 import (
+	"sort"
+
 	"bytes"
 	"context"
 	"fmt"
@@ -33,6 +35,16 @@ var skipDirNames = map[string]bool{
 	"coverage":     true,
 }
 
+// copySkipDirNames is the narrower set skipped when snapshotting a project
+// into an isolated mirror. node_modules and vendor are copied so the
+// isolated tree can run existing project tests, but they stay in
+// skipDirNames for search/merge so dependency trees are not merged back
+// or listed as project source.
+var copySkipDirNames = map[string]bool{
+	".git":   true,
+	".divvy": true,
+}
+
 // IsSkippedName reports whether a directory/file name is hidden from the
 // workspace snapshot, mirror listing and web file browser (.git,
 // node_modules, ...). It is exported so the read-only web API applies the
@@ -47,6 +59,17 @@ type Sandbox struct {
 	MaxWrite  int
 	MaxList   int
 	MaxOutput int
+
+	// RequireActionConsent refuses tools with external side effects
+	// (HTTP, downloads, browser) unless ActionConsent approves them.
+	// File merge approval is not treated as this consent. If the hook
+	// is nil, those tools are denied. Ask is not authorization.
+	RequireActionConsent bool
+	ActionConsent        func(name string, args map[string]any) (bool, string, error)
+
+	// disabledTools maps a tool name to a stable reason it must not be
+	// offered or retried in this environment (e.g. no bubblewrap).
+	disabledTools map[string]string
 
 	// Web, when set, enables outbound web_search/web_fetch. Nil keeps the
 	// sandbox fully offline. Shared across mirror sandboxes (read-only).
@@ -123,25 +146,6 @@ func NewSandbox(root string) (*Sandbox, error) {
 		MaxList:   defaultMaxList,
 		MaxOutput: defaultMaxOutput,
 	}, nil
-}
-
-// Resolve maps a user path onto the workspace and rejects escapes.
-func (s *Sandbox) Resolve(rel string) (string, error) {
-	if rel == "" {
-		rel = "."
-	}
-	rel = filepath.Clean(rel)
-	var candidate string
-	if filepath.IsAbs(rel) {
-		candidate = filepath.Clean(rel)
-	} else {
-		candidate = filepath.Clean(filepath.Join(s.Root, rel))
-	}
-	relToRoot, err := filepath.Rel(s.Root, candidate)
-	if err != nil || relToRoot == ".." || strings.HasPrefix(relToRoot, ".."+string(os.PathSeparator)) {
-		return "", fmt.Errorf("path escapes workspace: %s", rel)
-	}
-	return candidate, nil
 }
 
 // Rel returns a workspace-relative path for display.
@@ -323,7 +327,10 @@ func (s *Sandbox) WriteFile(path, content string) error {
 	if err := os.MkdirAll(filepath.Dir(abs), 0755); err != nil {
 		return err
 	}
-	return os.WriteFile(abs, []byte(content), 0644)
+	if err := os.WriteFile(abs, []byte(content), 0644); err != nil {
+		return err
+	}
+	return s.verifyStillConfined(abs)
 }
 
 // ReplaceLines replaces an inclusive 1-indexed line range with content.
@@ -617,17 +624,12 @@ func (s *Sandbox) RunBash(ctx context.Context, command string, timeout time.Dura
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cmd, err := newLeafCommand(ctx, command)
-	if err != nil {
-		return nil, err
-	}
-	cmd.Dir = s.Root
+	env := os.Environ()
 	if len(s.hiddenEnv) > 0 {
 		drop := make(map[string]bool, len(s.hiddenEnv))
 		for _, k := range s.hiddenEnv {
 			drop[k] = true
 		}
-		env := os.Environ()
 		filtered := make([]string, 0, len(env))
 		for _, kv := range env {
 			if i := strings.IndexByte(kv, '='); i >= 0 && drop[kv[:i]] {
@@ -635,7 +637,11 @@ func (s *Sandbox) RunBash(ctx context.Context, command string, timeout time.Dura
 			}
 			filtered = append(filtered, kv)
 		}
-		cmd.Env = filtered
+		env = filtered
+	}
+	cmd, err := isolateShellCommand(ctx, s.Root, command, env)
+	if err != nil {
+		return nil, err
 	}
 	// Run the shell in its own process group (POSIX) / hidden console
 	// (Windows) so a timeout can kill the whole shell tree, including
@@ -719,4 +725,84 @@ func (c capWriter) Write(p []byte) (int, error) {
 		return len(p), nil
 	}
 	return c.w.Write(p)
+}
+
+// DisableTool removes a tool from this sandbox's advertised set and makes
+// Call refuse it with a stable reason. Use this after a real capability
+// probe, not as a substitute for isolation.
+func (s *Sandbox) DisableTool(name, reason string) {
+	if s == nil {
+		return
+	}
+	name = strings.ToLower(strings.TrimSpace(name))
+	if name == "" {
+		return
+	}
+	if s.disabledTools == nil {
+		s.disabledTools = map[string]string{}
+	}
+	if strings.TrimSpace(reason) == "" {
+		reason = name + " is unavailable in this environment"
+	}
+	s.disabledTools[name] = reason
+}
+
+// ToolDisabled reports whether name was disabled and why.
+func (s *Sandbox) ToolDisabled(name string) (string, bool) {
+	if s == nil || s.disabledTools == nil {
+		return "", false
+	}
+	reason, ok := s.disabledTools[strings.ToLower(strings.TrimSpace(name))]
+	return reason, ok
+}
+
+// UnavailableNotice is a message for the model/UI listing tools that will
+// not work in this environment, so the loop should not spend its budget
+// retrying them.
+func (s *Sandbox) UnavailableNotice() string {
+	if s == nil || len(s.disabledTools) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(s.disabledTools))
+	for n := range s.disabledTools {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	var b strings.Builder
+	b.WriteString("The following tools are unavailable in this environment and must not be called or retried:")
+	for _, n := range names {
+		fmt.Fprintf(&b, "\n- %s: %s", n, s.disabledTools[n])
+	}
+	return b.String()
+}
+
+func (s *Sandbox) FilterNativeTools(raw []map[string]any) []map[string]any {
+	if s == nil || len(s.disabledTools) == 0 {
+		return raw
+	}
+	out := make([]map[string]any, 0, len(raw))
+	for _, m := range raw {
+		fn, _ := m["function"].(map[string]any)
+		name, _ := fn["name"].(string)
+		if _, disabled := s.ToolDisabled(name); disabled {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// CopyLimits copies capability and consent policy onto dst (used when
+// adopting a manual-approval mirror sandbox).
+func (s *Sandbox) CopyLimits(dst *Sandbox) {
+	if s == nil || dst == nil {
+		return
+	}
+	for name, reason := range s.disabledTools {
+		dst.DisableTool(name, reason)
+	}
+	dst.RequireActionConsent = s.RequireActionConsent
+	if s.ActionConsent != nil {
+		dst.ActionConsent = s.ActionConsent
+	}
 }

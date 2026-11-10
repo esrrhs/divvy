@@ -90,11 +90,16 @@ func TestSandbox_PathEscapeAndCRUD(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !res.TimedOut {
-		t.Fatalf("orphaned child holding the pipe should also hit timeout: %+v", res)
-	}
+	// Isolated execution tears down the pid/mount namespace when the
+	// outer shell exits, so the wait may return immediately (no hang) as
+	// long as the child does not leak on the host. If isolation is not
+	// able to reap the orphan, the timeout + process-group kill still
+	// applies.
 	if leaked := pgrepSleep(49); leaked != "" {
 		t.Fatalf("orphaned child leaked: %s", leaked)
+	}
+	if !res.TimedOut && res.ExitCode != 0 {
+		t.Fatalf("orphaned child left an unexpected result: %+v", res)
 	}
 }
 

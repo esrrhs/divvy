@@ -305,6 +305,46 @@ func TestRunManager_AddInstruction(t *testing.T) {
 	}
 }
 
+func TestRunManager_SteerNowInterruptsLeaf(t *testing.T) {
+	work, data := t.TempDir(), t.TempDir()
+	gate := make(chan struct{})
+	mgr := NewRunManager()
+	h, err := mgr.Start(mgrCfg(work, data, "test_mgr_steer"),
+		fileWritingScript(mgrTwoLeafPlan, gate), SilentLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitPhase(t, h, PhasePlanReview, 5*time.Second)
+	if err := h.ApprovePlan(); err != nil {
+		t.Fatal(err)
+	}
+	waitPhase(t, h, PhaseRunning, 5*time.Second)
+	if err := h.SteerNow("also write an extra marker file"); err != nil {
+		t.Fatalf("steer: %v", err)
+	}
+	// The current leaf is cancelled immediately; do not wait on the gate first.
+	// Closing it lets the follow-up (and any retried leaf) finish.
+	close(gate)
+	if err := h.Wait(); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(work, "extra.txt")); err != nil {
+		t.Fatalf("expected extra.txt after immediate steer: %v", err)
+	}
+	tree := h.Orchestrator().Tree()
+	found := false
+	if tree != nil {
+		for _, n := range tree.Leaves() {
+			if strings.Contains(n.Title, "extra marker") || strings.Contains(n.Description, "extra marker") {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatal("steer instruction should appear as a new leaf in the tree")
+	}
+}
+
 // TR-3.3 redo: a /redo queued during execution resets the finished leaf so it
 // runs one more time, then the run completes.
 func TestRunManager_RedoQueued(t *testing.T) {
@@ -465,5 +505,150 @@ func TestRunManager_PhaseGuards(t *testing.T) {
 	}
 	if err := h.Abort(); !errors.Is(err, ErrRunFinished) {
 		t.Fatalf("post-finish abort: want ErrRunFinished, got %v", err)
+	}
+}
+
+// SteerNow must deliver the follow-up into a later worker/architect prompt,
+// and an isolated leaf cancelled after writing but before verify/merge must
+// not leak that attempt into the shared workdir.
+func TestRunManager_SteerNowDiscardsUnmergedIsolateWork(t *testing.T) {
+	work, data := t.TempDir(), t.TempDir()
+	gate := make(chan struct{})
+	var inFinish, sawSteer atomic.Bool
+	plan := `{
+  "is_atomic": true,
+  "reason": "one file",
+  "contract": {"outputs": ["leak.txt"]},
+  "dod": {"commands": ["true"]},
+  "subtasks": []
+}`
+	client := &llm.ScriptedClient{
+		Handle: func(ctx context.Context, req llm.Request) (*llm.Response, error) {
+			joined := joinReqMessages(req)
+			sys := ""
+			if len(req.Messages) > 0 {
+				sys = req.Messages[0].Content
+			}
+			if strings.Contains(joined, "extra marker") || strings.Contains(joined, "also write an extra") {
+				sawSteer.Store(true)
+			}
+			if strings.Contains(sys, architectMarker) {
+				return &llm.Response{Content: plan}, nil
+			}
+			isSteerLeaf := strings.Contains(joined, "extra marker") || strings.Contains(joined, "also write an extra")
+			isRetry := strings.Contains(joined, "incomplete attempt was stopped") || strings.Contains(joined, "Follow-up:")
+			if reqHasToolResult(req) {
+				if !isSteerLeaf && !isRetry {
+					inFinish.Store(true)
+					select {
+					case <-gate:
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					}
+				}
+				return jsonAction("finish", map[string]string{"summary": "done"}), nil
+			}
+			if isSteerLeaf {
+				return jsonAction("write_file", map[string]string{"path": "extra.txt", "content": "from-steer\n"}), nil
+			}
+			if isRetry {
+				return jsonAction("write_file", map[string]string{"path": "retry.txt", "content": "retry-ok\n"}), nil
+			}
+			return jsonAction("write_file", map[string]string{"path": "leak.txt", "content": "FROM_CANCELLED_ATTEMPT\n"}), nil
+		},
+	}
+	cfg := mgrCfg(work, data, "test_mgr_steer_isolate")
+	cfg.Isolate = true
+	cfg.MaxRetries = 1
+	mgr := NewRunManager()
+	h, err := mgr.Start(cfg, client, SilentLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = h.Abort(); _ = h.Wait() })
+	waitPhase(t, h, PhasePlanReview, 5*time.Second)
+	if err := h.ApprovePlan(); err != nil {
+		t.Fatal(err)
+	}
+	waitPhase(t, h, PhaseRunning, 5*time.Second)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && !inFinish.Load() {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !inFinish.Load() {
+		t.Fatal("worker never reached the post-write finish gate")
+	}
+	if err := h.SteerNow("also write an extra marker file"); err != nil {
+		t.Fatalf("steer: %v", err)
+	}
+	// Let the cancel win over a late finish; then release the gate in case
+	// the worker is still sitting on it.
+	time.Sleep(20 * time.Millisecond)
+	close(gate)
+	done := make(chan error, 1)
+	go func() { done <- h.Wait() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("run: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		_ = h.Abort()
+		t.Fatal("run did not finish within 15s after SteerNow")
+	}
+	if !sawSteer.Load() {
+		t.Fatal("steer instruction never appeared in a later LLM request")
+	}
+	if _, err := os.Stat(filepath.Join(work, "extra.txt")); err != nil {
+		t.Fatalf("expected extra.txt from the steered leaf: %v", err)
+	}
+	if b, err := os.ReadFile(filepath.Join(work, "leak.txt")); err == nil && string(b) == "FROM_CANCELLED_ATTEMPT\n" {
+		t.Fatalf("cancelled leaf's unmerged isolate write leaked into the workdir")
+	}
+}
+
+func joinReqMessages(req llm.Request) string {
+	var b strings.Builder
+	for _, m := range req.Messages {
+		b.WriteString(m.Content)
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+// A /steer already accepted by SteerNow/Submit must still be applied even if
+// it arrives after the last leaf has finished (the doneCh-vs-Lines race).
+func TestGuider_ExecuteDrainsSteerWhenTreeWouldComplete(t *testing.T) {
+	work, data := t.TempDir(), t.TempDir()
+	cfg := mgrCfg(work, data, "test_drain_steer")
+	cfg.Isolate = true
+	client := fileWritingScript(mgrAtomicPlan, nil)
+	o, err := NewFromGoal(cfg, client, SilentLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(o.Close)
+	if err := o.tree.UpdateNode(o.tree.RootID, func(n *models.TaskNode) error {
+		n.State = models.TaskStateCompleted
+		n.IntegrationVerified = true
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !o.sched.IsComplete() {
+		t.Fatal("precondition: tree should look complete")
+	}
+	gio := newChanGuided()
+	g := NewGuider(o, gio)
+	select {
+	case gio.ch <- "/steer also write an extra marker file":
+	default:
+		t.Fatal("test channel is not buffered")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	err = g.execute(ctx)
+	if _, stat := os.Stat(filepath.Join(work, "extra.txt")); stat != nil {
+		t.Fatalf("pending /steer was dropped after the tree looked complete (execute err=%v): %v", err, stat)
 	}
 }

@@ -3,6 +3,7 @@ package agent
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -186,11 +187,46 @@ func (g *Guider) review(ctx context.Context) error {
 
 // execute runs ready leaves serially, with goal-level acceptance at the
 // end, decomposition of nodes that appear mid-run, and interjection.
+// drainPendingInput applies command lines already sitting on the IO
+// channel (for example a /steer that arrived in the same instant the
+// current leaf finished). Without this, execute can see a complete tree
+// and return while SteerNow has already reported success, dropping the
+// follow-up. Non-blocking: if nothing is queued, this is a no-op.
+func (g *Guider) drainPendingInput(ctx context.Context) error {
+	for {
+		var line string
+		var ok bool
+		select {
+		case line, ok = <-g.io.Lines():
+			if !ok {
+				return errStdinClosed
+			}
+		default:
+			return nil
+		}
+		if err := g.handleExecLine(ctx, line); err != nil {
+			return err
+		}
+	}
+}
+
 func (g *Guider) execute(ctx context.Context) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			_ = g.o.checkpoint()
 			return err
+		}
+		if err := g.drainPendingInput(ctx); err != nil {
+			if err == ErrPaused {
+				_ = g.o.checkpoint()
+				return err
+			}
+			if err == errStdinClosed {
+				_ = g.o.checkpoint()
+				g.io.Printf("input closed — progress saved; continue with -guided -resume\n")
+				return err
+			}
+			g.io.Printf("%v\n", err)
 		}
 
 		// A node may need (re)decomposition, e.g. a failed leaf re-split
@@ -307,6 +343,23 @@ func (g *Guider) runLeafInteractive(ctx context.Context, leaf *models.TaskNode) 
 				g.o.printTree()
 				continue
 			}
+			if isSteer(line) {
+				g.unblockAsker("leaf interrupted to apply user follow-up")
+				cancel()
+				err := <-doneCh
+				if err != nil && err != context.Canceled && !errors.Is(err, context.Canceled) {
+					g.io.Printf("stopped current leaf: %v\n", err)
+				}
+				if e := g.handleExecLine(ctx, line); e != nil && e != ErrPaused {
+					g.io.Printf("%v\n", e)
+				}
+				for _, q := range queued {
+					if e := g.handleExecLine(ctx, q); e != nil && e != ErrPaused {
+						g.io.Printf("%v\n", e)
+					}
+				}
+				return nil
+			}
 			// Queue plan edits and plain notes; they apply after the leaf.
 			queued = append(queued, line)
 			if isPlanEdit(line) {
@@ -388,8 +441,11 @@ func (g *Guider) handleExecLine(ctx context.Context, line string) error {
 	case strings.HasPrefix(line, "/add"):
 		instruction := strings.TrimSpace(strings.TrimPrefix(line, "/add"))
 		return g.addLeaf(ctx, instruction)
+	case isSteer(line):
+		instruction := strings.TrimSpace(strings.TrimPrefix(line, "/steer"))
+		return g.steerIntoCurrent(ctx, instruction)
 	case strings.HasPrefix(line, "/"):
-		return fmt.Errorf("unknown command %q (available: /add, /redo, /pause, /plan)", line)
+		return fmt.Errorf("unknown command %q (available: /add, /steer, /redo, /pause, /plan)", line)
 	default:
 		// Free text during a no-leaf-ready prompt: treat as a new leaf.
 		return g.addLeaf(ctx, line)
@@ -420,7 +476,40 @@ func (g *Guider) addLeaf(ctx context.Context, instruction string) error {
 }
 
 func isPlanEdit(s string) bool {
-	return strings.HasPrefix(s, "/add") || strings.HasPrefix(s, "/redo")
+	return strings.HasPrefix(s, "/add") || strings.HasPrefix(s, "/redo") || isSteer(s)
+}
+
+func isSteer(s string) bool {
+	s = strings.TrimSpace(s)
+	return s == "/steer" || strings.HasPrefix(s, "/steer ")
+}
+
+// steerIntoCurrent adds a new leaf for the follow-up and annotates the
+// most recent interrupted (pending) leaf so a retry sees the new request.
+func (g *Guider) steerIntoCurrent(ctx context.Context, instruction string) error {
+	instruction = strings.TrimSpace(instruction)
+	if instruction == "" {
+		return fmt.Errorf("/steer needs an instruction")
+	}
+	for _, id := range g.o.tree.NodeIDsInStates(models.TaskStatePending, models.TaskStateRunning) {
+		live, ok := g.o.tree.CloneNode(id)
+		if !ok || live.Type != models.NodeTypeLeaf {
+			continue
+		}
+		if live.ErrorMsg != "interrupted" && !strings.Contains(live.ErrorMsg, "interrupted") {
+			continue
+		}
+		note := "User follow-up arrived while this leaf was running; the incomplete attempt was stopped. Follow-up: " + instruction
+		_ = g.o.tree.UpdateNode(id, func(n *models.TaskNode) error {
+			if !strings.Contains(n.Description, note) {
+				n.Description = strings.TrimSpace(n.Description + "\n\n" + note)
+			}
+			return nil
+		})
+	}
+	g.o.events.Record("user_steer", "", map[string]any{"instruction": instruction})
+	g.io.Printf("current leaf stopped; adding follow-up now: %s\n", instruction)
+	return g.addLeaf(ctx, instruction)
 }
 
 func isApprove(s string) bool {

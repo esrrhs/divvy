@@ -14,8 +14,24 @@ import (
 const (
 	defaultMaxMatches = 100
 	maxMatchedLineLen = 200
-	maxSearchFileSize = 1 << 20 // skip individual files larger than 1MB
+	maxKeptSearchLine = 16 << 10 // keep enough of a long line for later redaction
+	maxSearchFileSize = 1 << 20  // skip individual files larger than 1MB
 )
+
+// SearchHit is one content match inside the workspace. Path is always a
+// slash-relative path under the sandbox root; it is never an absolute path.
+type SearchHit struct {
+	Path    string `json:"path"`
+	Line    int    `json:"line"`
+	Preview string `json:"preview"`
+}
+
+// SearchFilesResult is the structured form of a workspace content search.
+type SearchFilesResult struct {
+	Hits      []SearchHit `json:"hits"`
+	Scanned   int         `json:"scanned"`
+	Truncated bool        `json:"truncated"`
+}
 
 // SearchFiles walks the workspace and reports regex matches as compact
 // "relative/path:line: matched text" lines. It lets a leaf locate a symbol
@@ -26,9 +42,34 @@ const (
 // (e.g. "*.go" or "pkg/*_test.go"). Search is case-insensitive unless
 // caseSensitive is set.
 func (s *Sandbox) SearchFiles(pattern, rootDir, glob string, caseSensitive bool) (string, error) {
+	res, err := s.SearchFilesHits(pattern, rootDir, glob, caseSensitive, defaultMaxMatches)
+	if err != nil {
+		return "", err
+	}
+	if len(res.Hits) == 0 {
+		return fmt.Sprintf("(no matches for %q in %d files)", pattern, res.Scanned), nil
+	}
+	var b strings.Builder
+	for _, hit := range res.Hits {
+		fmt.Fprintf(&b, "%s:%d: %s\n", hit.Path, hit.Line, ClipSearchPreview(hit.Preview))
+	}
+	if res.Truncated {
+		b.WriteString(fmt.Sprintf("[more than %d matches; refine pattern or glob]\n", defaultMaxMatches))
+	}
+	return b.String(), nil
+}
+
+// SearchFilesHits is the structured counterpart of SearchFiles. The HTTP
+// project-search API reuses this so the UI and the agent tool share the
+// same sandbox walk, ignore list, size/binary caps, and path confinement.
+// limit <= 0 uses defaultMaxMatches; the cap is never raised above that.
+func (s *Sandbox) SearchFilesHits(pattern, rootDir, glob string, caseSensitive bool, limit int) (*SearchFilesResult, error) {
 	pattern = strings.TrimSpace(pattern)
 	if pattern == "" {
-		return "", fmt.Errorf("search_files needs a pattern")
+		return nil, fmt.Errorf("search_files needs a pattern")
+	}
+	if limit <= 0 || limit > defaultMaxMatches {
+		limit = defaultMaxMatches
 	}
 	flag := ""
 	if !caseSensitive {
@@ -36,7 +77,7 @@ func (s *Sandbox) SearchFiles(pattern, rootDir, glob string, caseSensitive bool)
 	}
 	re, err := regexp.Compile(flag + pattern)
 	if err != nil {
-		return "", fmt.Errorf("invalid pattern %q: %w", pattern, err)
+		return nil, fmt.Errorf("invalid pattern %q: %w", pattern, err)
 	}
 	rootDir = strings.TrimSpace(rootDir)
 	if rootDir == "" {
@@ -44,7 +85,7 @@ func (s *Sandbox) SearchFiles(pattern, rootDir, glob string, caseSensitive bool)
 	}
 	absRoot, err := s.Resolve(rootDir)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	var matcher func(relSlash string) bool
@@ -54,17 +95,12 @@ func (s *Sandbox) SearchFiles(pattern, rootDir, glob string, caseSensitive bool)
 			if ok {
 				return true
 			}
-			// Also allow a bare pattern like "*.go" to match by basename.
 			ok, _ = path.Match(gl, path.Base(relSlash))
 			return ok
 		}
 	}
 
-	var b strings.Builder
-	matches := 0
-	filesScanned := 0
-	truncated := false
-
+	out := &SearchFilesResult{Hits: []SearchHit{}}
 	walkErr := filepath.WalkDir(absRoot, func(p string, d fs.DirEntry, werr error) error {
 		if werr != nil {
 			return nil // skip unreadable entries
@@ -83,46 +119,66 @@ func (s *Sandbox) SearchFiles(pattern, rootDir, glob string, caseSensitive bool)
 			return nil
 		}
 		rel, err := filepath.Rel(s.Root, p)
-		if err != nil {
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 			return nil
 		}
 		relSlash := filepath.ToSlash(rel)
+		if relSlash == ".." || strings.HasPrefix(relSlash, "../") {
+			return nil
+		}
+		// Re-resolve so a walk entry that somehow escaped is dropped
+		// rather than returned as an outside path.
+		if _, rerr := s.Resolve(relSlash); rerr != nil {
+			return nil
+		}
 		if matcher != nil && !matcher(relSlash) {
 			return nil
 		}
-		filesScanned++
+		out.Scanned++
 		data, err := os.ReadFile(p)
 		if err != nil {
 			return nil
 		}
-		if !utf8.Valid(data) {
+		if IsBinarySniff(data) || !utf8.Valid(data) {
 			return nil
 		}
 		for lineNo, line := range strings.Split(string(data), "\n") {
 			if !re.MatchString(line) {
 				continue
 			}
-			matches++
-			if matches > defaultMaxMatches {
-				truncated = true
-				return nil
+			if len(out.Hits) >= limit {
+				out.Truncated = true
+				return fs.SkipAll
 			}
-			fmt.Fprintf(&b, "%s:%d: %s\n", relSlash, lineNo+1, clipLine(line))
+			out.Hits = append(out.Hits, SearchHit{
+				Path:    relSlash,
+				Line:    lineNo + 1,
+				Preview: keepSearchLine(line),
+			})
 		}
 		return nil
 	})
 	if walkErr != nil {
-		return "", walkErr
-	}
-
-	if matches == 0 {
-		return fmt.Sprintf("(no matches for %q in %d files)", pattern, filesScanned), nil
-	}
-	out := b.String()
-	if truncated {
-		out += fmt.Sprintf("[more than %d matches; refine pattern or glob]\n", defaultMaxMatches)
+		return nil, walkErr
 	}
 	return out, nil
+}
+
+func DefaultMaxMatches() int { return defaultMaxMatches }
+
+// ClipSearchPreview trims a matched line for display. Callers that mask
+// secrets must redact the full kept line first, then clip, so a key that
+// crosses the 200-byte cut is not partially exposed.
+func ClipSearchPreview(s string) string {
+	return clipLine(s)
+}
+
+func keepSearchLine(s string) string {
+	s = strings.TrimSuffix(s, "\r")
+	if len(s) > maxKeptSearchLine {
+		return s[:maxKeptSearchLine]
+	}
+	return s
 }
 
 func clipLine(s string) string {

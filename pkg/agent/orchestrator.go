@@ -99,6 +99,10 @@ func New(cfg Config, tree *engine.TaskTree, client llm.Client, log *Logger) (*Or
 	if cfg.LeafApprovalMode() == LeafApprovalManual && !cfg.Isolate {
 		return nil, fmt.Errorf("manual leaf approval requires isolate mode (-isolate): rejected changes must be discardable")
 	}
+	tools.ApplyRuntimePolicy(sandbox)
+	if cfg.LeafApprovalMode() == LeafApprovalManual {
+		sandbox.RequireActionConsent = true
+	}
 	storage, err := engine.NewStorage(cfg.DataDir)
 	if err != nil {
 		return nil, err
@@ -107,6 +111,7 @@ func New(cfg Config, tree *engine.TaskTree, client llm.Client, log *Logger) (*Or
 	if err != nil {
 		return nil, err
 	}
+	cfg.Goal = scrubSecret(cfg.Goal, cfg.APIKey)
 	tree.WorkDir = sandbox.Root
 	tree.Goal = cfg.Goal
 	tree.ModelName = cfg.Model
@@ -151,6 +156,7 @@ func (o *Orchestrator) openSinks() {
 		// persisted (tool output previews, messages): the on-disk secrecy
 		// invariant must not depend on every call site remembering to mask.
 		rec.AddSecret(o.cfg.APIKey)
+		o.log.SetRedact(func(s string) string { return rec.RedactString(s) })
 		o.treeBC = newTreeBroadcaster(o)
 		o.treeBC.start()
 	} else {
@@ -202,6 +208,7 @@ func NewFromGoal(cfg Config, client llm.Client, log *Logger) (*Orchestrator, err
 	if cfg.Goal == "" {
 		return nil, fmt.Errorf("goal is required")
 	}
+	cfg.Goal = scrubSecret(cfg.Goal, cfg.APIKey)
 	tree := engine.NewTaskTree(cfg.SessionID, cfg.Goal, cfg.Goal)
 	o, err := New(cfg, tree, client, log)
 	if err != nil {
@@ -1044,6 +1051,9 @@ func (o *Orchestrator) executeLeaf(ctx context.Context, leaf *models.TaskNode) e
 						continue
 					}
 					o.events.Record("leaf_approval", leaf.ID, map[string]any{"phase": "approved"})
+					if err := applyLeafApprovalPatches(mirror, changes, decision); err != nil {
+						return fmt.Errorf("apply hunk patches before merge: %w", err)
+					}
 				}
 			}
 			if mirror != nil || o.cfg.GitCommit {
@@ -1370,9 +1380,31 @@ func (o *Orchestrator) handleLeafFailure(leaf *models.TaskNode, errMsg string) e
 	return nil
 }
 
+func scrubSecret(s, secret string) string {
+	secret = strings.TrimSpace(secret)
+	if len(secret) < 4 || s == "" {
+		return s
+	}
+	return strings.ReplaceAll(s, secret, "***REDACTED***")
+}
+
+func (o *Orchestrator) redactTreeSecrets() {
+	if o == nil || o.tree == nil {
+		return
+	}
+	redact := func(s string) string {
+		if o.events != nil {
+			return o.events.RedactString(s)
+		}
+		return scrubSecret(s, o.cfg.APIKey)
+	}
+	o.tree.MapStrings(redact)
+}
+
 func (o *Orchestrator) checkpoint() error {
 	o.cpMu.Lock()
 	defer o.cpMu.Unlock()
+	o.redactTreeSecrets()
 	if err := o.storage.SaveTree(o.tree); err != nil {
 		return err
 	}

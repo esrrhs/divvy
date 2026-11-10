@@ -27,14 +27,18 @@ func apiServer(t *testing.T, work, data string) *httptest.Server {
 func apiServerWithClient(t *testing.T, work, data string,
 	factory func(agent.Config) llm.Client) *httptest.Server {
 	t.Helper()
-	s, err := New(agent.NewRunManager(), data,
+	mgr := agent.NewRunManager()
+	s, err := New(mgr, data,
 		WithToken("test-token"), WithHeartbeat(50*time.Millisecond),
 		WithWorkdir(work), WithClientFactory(factory))
 	if err != nil {
 		t.Fatal(err)
 	}
 	ts := httptest.NewServer(s.Handler())
-	t.Cleanup(ts.Close)
+	t.Cleanup(func() {
+		ts.Close()
+		mgr.Shutdown(3 * time.Second)
+	})
 	return ts
 }
 

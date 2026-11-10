@@ -40,6 +40,13 @@ func (s *Storage) GetSoloHistoryPath(sessionID string) string {
 	return filepath.Join(s.baseDir, fmt.Sprintf("%s.solo.jsonl", sessionID))
 }
 
+// GetDirectHistoryPath is the default per-session transcript for direct mode.
+// Conversations may override this with a shared path so follow-up turns
+// keep the same tool context.
+func (s *Storage) GetDirectHistoryPath(sessionID string) string {
+	return filepath.Join(s.baseDir, fmt.Sprintf("%s.direct.json", sessionID))
+}
+
 // SaveTree saves the task tree atomically to avoid corruption on crash.
 func (s *Storage) SaveTree(tree *TaskTree) error {
 	if tree == nil {

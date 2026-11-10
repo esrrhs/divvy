@@ -90,6 +90,24 @@ type Config struct {
 	// characters). The full history stays in memory; only the window shrinks.
 	SoloContextChars int
 
+	// AgentLoop selects the execution kernel for a managed run: "guided"
+	// (default, task-tree with plan/leaf approval) or "direct" (one
+	// persistent tool-call loop: read/search, edit, verify, repair from
+	// real tool results, then a model-written summary).
+	AgentLoop string
+	// TranscriptPath is the direct-mode tool transcript. Empty uses
+	// <DataDir>/<SessionID>.direct.json.
+	TranscriptPath string
+	// DirectSteps is the per-turn tool-call budget in direct mode (0 = 40).
+	DirectSteps int
+	// DirectContextChars bounds the window sent to the model in direct
+	// mode (0 = 100k characters). The full transcript stays on disk.
+	DirectContextChars int
+	// AskTimeout bounds how long a direct-mode ask waits for a user
+	// answer (0 = 15 minutes). After the deadline the loop continues
+	// with a "make a reasonable assumption" reply instead of hanging.
+	AskTimeout time.Duration
+
 	// DoDCommands is an operator-supplied acceptance ("what counts as done").
 	// When set it wins over anything the planner or the toolchain defaults
 	// produce, for the root in tree mode and for the whole run in solo mode.
@@ -134,6 +152,12 @@ type Config struct {
 	// than consuming the rest of the session budget. 0 = unlimited.
 	MaxLeafCost   float64 // USD
 	MaxLeafTokens int
+
+	// HoldServe reserves the workdir and registers the handle, but does
+	// not start the agent loop until Launch is called. Conversation
+	// turns use this so the pre-turn snapshot and persistence hook are
+	// installed before any write or terminal phase can appear.
+	HoldServe bool
 }
 
 // DefaultConfig fills in usable defaults.
@@ -185,6 +209,22 @@ func (c Config) LeafApprovalMode() string {
 		return LeafApprovalManual
 	}
 	return LeafApprovalAuto
+}
+
+// Agent loop modes. Anything other than the explicit direct setting
+// stays on the existing guided task-tree path.
+const (
+	AgentLoopGuided = "guided"
+	AgentLoopDirect = "direct"
+)
+
+// AgentLoopMode returns the normalized loop; unknown values degrade to guided
+// so existing sessions and tests keep the task-tree kernel.
+func (c Config) AgentLoopMode() string {
+	if strings.EqualFold(strings.TrimSpace(c.AgentLoop), AgentLoopDirect) {
+		return AgentLoopDirect
+	}
+	return AgentLoopGuided
 }
 
 func firstEnv(keys ...string) string {

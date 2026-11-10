@@ -95,6 +95,42 @@ func (t *TaskTree) AddChild(parentID, childID, title, desc string, nodeType mode
 
 // GetNode safely retrieves a node by ID. The pointer aliases the live node;
 // prefer CloneNode when reading without intending to mutate under the tree lock.
+func (t *TaskTree) ForEach(fn func(*models.TaskNode)) {
+	if t == nil || fn == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, n := range t.Nodes {
+		if n != nil {
+			fn(n)
+		}
+	}
+}
+
+// MapStrings rewrites tree-level and per-node string fields under the
+// write lock so checkpoint redaction cannot race with ToJSON.
+func (t *TaskTree) MapStrings(fn func(string) string) {
+	if t == nil || fn == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.Goal = fn(t.Goal)
+	for _, n := range t.Nodes {
+		if n == nil {
+			continue
+		}
+		n.Title = fn(n.Title)
+		n.Description = fn(n.Description)
+		n.ErrorMsg = fn(n.ErrorMsg)
+		n.ResultSummary = fn(n.ResultSummary)
+		for i := range n.ErrorHistory {
+			n.ErrorHistory[i].Error = fn(n.ErrorHistory[i].Error)
+		}
+	}
+}
+
 func (t *TaskTree) GetNode(id string) (*models.TaskNode, bool) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()

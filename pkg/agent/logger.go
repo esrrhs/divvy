@@ -35,6 +35,7 @@ type Logger struct {
 	color   bool
 	verbose bool
 	file    io.Writer
+	redact  func(string) string
 
 	wMu   sync.Mutex
 	watch map[int]chan string
@@ -101,6 +102,17 @@ func (l *Logger) Tee(w io.Writer) {
 	l.mu.Unlock()
 }
 
+// SetRedact installs a secret-masking function applied to every log line
+// (screen, session file, and subscribers) before it is written.
+func (l *Logger) SetRedact(fn func(string) string) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	l.redact = fn
+	l.mu.Unlock()
+}
+
 func isTTY(f *os.File) bool {
 	fi, err := f.Stat()
 	return err == nil && fi.Mode()&os.ModeCharDevice != 0
@@ -117,10 +129,12 @@ func (l *Logger) paint(code, s string) string {
 // de-colored "LEVEL message" line to the session log file.
 func (l *Logger) emit(w io.Writer, colorCode, icon, level, format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
+	l.mu.Lock()
+	if l.redact != nil {
+		msg = l.redact(msg)
+	}
 	screen := l.paint(colorCode, icon) + msg
 	plain := ansiRE.ReplaceAllString(msg, "")
-
-	l.mu.Lock()
 	defer l.mu.Unlock()
 	fmt.Fprintln(w, screen)
 	line := fmt.Sprintf("%s %-7s %s",

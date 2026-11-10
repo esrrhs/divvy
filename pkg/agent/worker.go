@@ -390,6 +390,9 @@ func missingActionFieldsHint(act taggedAction) string {
 
 func nativeToolDefs(sb *tools.Sandbox) []llm.Tool {
 	raw := tools.NativeTools()
+	if sb != nil {
+		raw = sb.FilterNativeTools(raw)
+	}
 	raw = append(raw, tools.NativeCodeTools()...)
 	if tools.IsRepo(sb.Root) {
 		raw = append(raw, tools.NativeGitTools()...)
@@ -401,6 +404,9 @@ func nativeToolDefs(sb *tools.Sandbox) []llm.Tool {
 	}
 	if sb.Browser != nil {
 		raw = append(raw, tools.NativeBrowserTools()...)
+	}
+	if sb != nil {
+		raw = sb.FilterNativeTools(raw)
 	}
 	out := make([]llm.Tool, 0, len(raw))
 	for _, m := range raw {

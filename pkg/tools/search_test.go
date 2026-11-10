@@ -1,7 +1,10 @@
 package tools
 
 import (
+	"bytes"
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -178,5 +181,150 @@ func TestFindFilesCall(t *testing.T) {
 	}
 	if _, err := sb.Call(context.Background(), ToolFindFiles, map[string]any{}); err == nil {
 		t.Fatal("expected missing-pattern error")
+	}
+}
+
+func TestSearchFilesHitsStructuredAndCaps(t *testing.T) {
+	dir := t.TempDir()
+	sb, err := NewSandbox(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sb.WriteFile("pkg/add.go", "package pkg\n\nfunc Add(a, b int) int {\n\treturn a + b\n}\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := sb.WriteFile("notes.txt", "func not really code\n"); err != nil {
+		t.Fatal(err)
+	}
+	// Ignored directory must not appear.
+	if err := os.MkdirAll(filepath.Join(dir, "node_modules"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "node_modules", "dep.js"), []byte("func Add hidden\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Binary / invalid UTF-8 is skipped.
+	if err := os.WriteFile(filepath.Join(dir, "blob.bin"), []byte{0x00, 0xff, 0xfe, 'A', 'd', 'd'}, 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Oversized file is skipped (limit is 1 MiB).
+	big := filepath.Join(dir, "huge.txt")
+	if err := os.WriteFile(big, append(bytes.Repeat([]byte("x"), maxSearchFileSize+8), []byte("func Add\n")...), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := sb.SearchFilesHits("func Add", "", "", false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Hits) != 1 || res.Hits[0].Path != "pkg/add.go" || res.Hits[0].Line != 3 {
+		t.Fatalf("hits=%+v", res.Hits)
+	}
+	if strings.Contains(res.Hits[0].Path, "/") && (filepath.IsAbs(res.Hits[0].Path) || strings.Contains(res.Hits[0].Path, dir)) {
+		t.Fatalf("absolute or workdir path leaked: %q", res.Hits[0].Path)
+	}
+	for _, h := range res.Hits {
+		if strings.Contains(h.Path, "node_modules") || strings.Contains(h.Path, "blob.bin") || h.Path == "huge.txt" {
+			t.Fatalf("ignored/binary/oversized leak: %+v", h)
+		}
+	}
+
+	// Result budget: stop after the cap and mark truncated.
+	var many strings.Builder
+	for i := 0; i < 30; i++ {
+		many.WriteString("match-line\n")
+	}
+	if err := sb.WriteFile("many.txt", many.String()); err != nil {
+		t.Fatal(err)
+	}
+	capped, err := sb.SearchFilesHits("match-line", "", "", true, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(capped.Hits) != 10 || !capped.Truncated {
+		t.Fatalf("cap: n=%d truncated=%v", len(capped.Hits), capped.Truncated)
+	}
+}
+
+func TestSearchFilesHitsSkipsSymlinkEscape(t *testing.T) {
+	dir := t.TempDir()
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("func Add outside\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	sb, err := NewSandbox(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sb.WriteFile("ok.go", "package ok\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(outside, "secret.txt"), filepath.Join(dir, "link.txt")); err != nil {
+		t.Fatal(err)
+	}
+	res, err := sb.SearchFilesHits("func Add", "", "", false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range res.Hits {
+		if strings.Contains(h.Path, "secret") || strings.Contains(h.Path, "link") || strings.Contains(h.Preview, "outside") {
+			t.Fatalf("symlink escape leaked: %+v", h)
+		}
+		if filepath.IsAbs(h.Path) {
+			t.Fatalf("absolute path: %q", h.Path)
+		}
+	}
+}
+
+func TestSearchFilesHitsSkipsNULBinary(t *testing.T) {
+	dir := t.TempDir()
+	sb, err := NewSandbox(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// NUL is valid UTF-8; the file viewer rejects it as binary, so search must too.
+	if err := os.WriteFile(filepath.Join(dir, "mixed.bin"), []byte("func Add\x00more text"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := sb.WriteFile("ok.txt", "func Add is fine\n"); err != nil {
+		t.Fatal(err)
+	}
+	res, err := sb.SearchFilesHits("func Add", "", "", false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Hits) != 1 || res.Hits[0].Path != "ok.txt" {
+		t.Fatalf("NUL binary leaked into hits: %+v", res.Hits)
+	}
+}
+
+func TestSearchFilesHitsKeepsLongLineForLaterRedaction(t *testing.T) {
+	dir := t.TempDir()
+	sb, err := NewSandbox(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A 240-byte line must not be clipped inside SearchFilesHits; the HTTP
+	// layer redacts the kept line first, then clips for display.
+	long := strings.Repeat("x", 220) + "TARGET" + strings.Repeat("y", 20)
+	if err := sb.WriteFile("long.txt", long+"\n"); err != nil {
+		t.Fatal(err)
+	}
+	res, err := sb.SearchFilesHits("TARGET", "", "", true, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Hits) != 1 {
+		t.Fatalf("hits=%+v", res.Hits)
+	}
+	if !strings.Contains(res.Hits[0].Preview, "TARGET") {
+		t.Fatalf("kept preview lost the match past 200 bytes: %q", res.Hits[0].Preview)
+	}
+	clipped := ClipSearchPreview(res.Hits[0].Preview)
+	if strings.Contains(clipped, "TARGET") {
+		t.Fatalf("display clip should not reach TARGET: %q", clipped)
+	}
+	if !strings.HasSuffix(clipped, "...") {
+		t.Fatalf("expected clipped suffix, got %q", clipped)
 	}
 }

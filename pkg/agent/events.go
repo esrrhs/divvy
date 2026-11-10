@@ -62,6 +62,31 @@ func (r *EventRecorder) AddSecret(v string) {
 	r.mu.Unlock()
 }
 
+// Secrets returns a copy of registered credential values for stream hold-back.
+func (r *EventRecorder) Secrets() []string {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.secrets...)
+}
+
+// RedactString replaces registered secrets in s. Used for live UI buffers
+// that never go through Record/Live.
+func (r *EventRecorder) RedactString(s string) string {
+	if r == nil || s == "" {
+		return s
+	}
+	r.mu.Lock()
+	secrets := append([]string(nil), r.secrets...)
+	r.mu.Unlock()
+	if len(secrets) == 0 {
+		return s
+	}
+	return scrubSecrets(s, secrets).(string)
+}
+
 // scrubSecrets recursively replaces registered secret values inside an event
 // (strings, nested maps/slices, map keys, and RawMessage bytes) before
 // persistence, returning the cleaned value.
@@ -87,11 +112,31 @@ func scrubSecrets(v any, secrets []string) any {
 			t[i] = scrubSecrets(val, secrets)
 		}
 		return t
-	case []byte: // json.RawMessage payloads (embedded tree snapshots)
+	case []map[string]any:
+		for i, val := range t {
+			if scrubbed, ok := scrubSecrets(val, secrets).(map[string]any); ok {
+				t[i] = scrubbed
+			}
+		}
+		return t
+	case []string:
+		for i, val := range t {
+			t[i] = scrubSecrets(val, secrets).(string)
+		}
+		return t
+	case []byte: // unnamed byte payloads
 		for _, s := range secrets {
 			t = bytes.ReplaceAll(t, []byte(s), []byte(secretMask))
 		}
 		return t
+	case json.RawMessage:
+		// json.RawMessage is a named []byte type and does not match the
+		// []byte case; tree_snapshot events use this encoding.
+		b := []byte(t)
+		for _, s := range secrets {
+			b = bytes.ReplaceAll(b, []byte(s), []byte(secretMask))
+		}
+		return json.RawMessage(b)
 	}
 	return v
 }
@@ -298,6 +343,32 @@ func (r *EventRecorder) Close() error {
 }
 
 // Record appends one event. Fields may override the built-in ts/kind keys.
+// Live fans a redacted event to subscribers without writing the JSONL
+// file or advancing the persisted sequence. Used for high-frequency
+// assistant token deltas so a reconnect can resume from Snapshot/GET
+// rather than replaying every character.
+func (r *EventRecorder) Live(kind, nodeID string, fields map[string]any) {
+	if r == nil {
+		return
+	}
+	ev := make(map[string]any, len(fields)+4)
+	ev["ts"] = time.Now().Format(time.RFC3339Nano)
+	ev["kind"] = kind
+	ev["live"] = true
+	if nodeID != "" {
+		ev["node_id"] = nodeID
+	}
+	for k, v := range fields {
+		ev[k] = v
+	}
+	r.mu.Lock()
+	if len(r.secrets) > 0 {
+		ev = scrubSecrets(ev, r.secrets).(map[string]any)
+	}
+	r.mu.Unlock()
+	r.fanOut(ev)
+}
+
 func (r *EventRecorder) Record(kind, nodeID string, fields map[string]any) {
 	if r == nil {
 		return

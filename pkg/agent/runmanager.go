@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -48,9 +50,11 @@ var (
 // registered (in a terminal phase) until the manager is shut down; historical
 // sessions that never ran here are read straight from storage.
 type RunManager struct {
-	mu     sync.Mutex
-	active map[string]*RunHandle // session id -> handle
-	busy   map[string]string     // absolute workdir -> session id
+	mu        sync.Mutex
+	active    map[string]*RunHandle // session id -> handle
+	busy      map[string]string     // absolute workdir -> session id (live run)
+	writers   map[string]int        // short editor/hunk write leases
+	exclusive map[string]string     // abs workdir -> owner of an exclusive write (rollback)
 
 	// baseCtx is cancelled by Shutdown (process signal). Every handle's run
 	// context derives from it, so Ctrl+C unwinds and checkpoints all runs.
@@ -69,6 +73,8 @@ func NewRunManagerWithContext(ctx context.Context) *RunManager {
 	return &RunManager{
 		active:     make(map[string]*RunHandle),
 		busy:       make(map[string]string),
+		writers:    make(map[string]int),
+		exclusive:  make(map[string]string),
 		baseCtx:    baseCtx,
 		baseCancel: cancel,
 	}
@@ -105,6 +111,34 @@ func (m *RunManager) Get(sessionID string) *RunHandle {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.active[sessionID]
+}
+
+// HandleForWorkdir returns a non-finished run that currently owns workdir
+// (including a paused one whose reservation was already released).
+func (m *RunManager) HandleForWorkdir(abs string) *RunHandle {
+	if m == nil || abs == "" {
+		return nil
+	}
+	m.mu.Lock()
+	var cands []*RunHandle
+	if sid, ok := m.busy[abs]; ok {
+		if h := m.active[sid]; h != nil {
+			cands = append(cands, h)
+		}
+	}
+	for _, h := range m.active {
+		if h != nil && h.workdir == abs {
+			cands = append(cands, h)
+		}
+	}
+	m.mu.Unlock()
+	for _, h := range cands {
+		p := h.Phase()
+		if p != PhaseDone && p != PhaseFailed {
+			return h
+		}
+	}
+	return nil
 }
 
 // ActiveSessions lists live session ids.
@@ -239,6 +273,9 @@ func (m *RunManager) reserve(absWorkdir, sessionID string) error {
 	if _, ok := m.busy[absWorkdir]; ok {
 		return fmt.Errorf("%w: %s", ErrWorkdirBusy, m.busy[absWorkdir])
 	}
+	if m.writers[absWorkdir] > 0 {
+		return fmt.Errorf("%w: write in progress", ErrWorkdirBusy)
+	}
 	if sessionID != startingReservation {
 		if h, ok := m.active[sessionID]; ok && !h.Phase().Terminal() {
 			return fmt.Errorf("%w: %s", ErrSessionActive, sessionID)
@@ -252,6 +289,98 @@ func (m *RunManager) release(absWorkdir string) {
 	m.mu.Lock()
 	delete(m.busy, absWorkdir)
 	m.mu.Unlock()
+}
+
+// BeginWorkdirWrite takes a short write lease on the workdir, shared with
+// Start/Resume: a live run cannot start while a write is in progress, and
+// a write cannot start while a run holds the directory. Multiple writes
+// may overlap (for example two hunk applies on different files) unless an
+// exclusive lease is held. The caller must invoke the returned unlock.
+func (m *RunManager) BeginWorkdirWrite(abs, owner string) (func(), error) {
+	return m.beginWorkdirWrite(abs, owner, false)
+}
+
+// BeginWorkdirWriteExclusive is the same workdir coordination used by
+// Start/hunk writes, but it refuses to overlap any other writer. Rollback
+// uses this so a journaled multi-file restore is not interleaved with a
+// hunk or editor write. It is not a second lock namespace.
+func (m *RunManager) BeginWorkdirWriteExclusive(abs, owner string) (func(), error) {
+	return m.beginWorkdirWrite(abs, owner, true)
+}
+
+func (m *RunManager) beginWorkdirWrite(abs, owner string, exclusive bool) (func(), error) {
+	if m == nil {
+		return func() {}, nil
+	}
+	if abs == "" {
+		return nil, fmt.Errorf("workdir write lease requires a path")
+	}
+	abs, err := filepath.Abs(abs)
+	if err != nil {
+		return nil, err
+	}
+	if owner == "" {
+		owner = "write"
+	}
+	m.mu.Lock()
+	if sid, ok := m.busy[abs]; ok {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: %s", ErrWorkdirBusy, sid)
+	}
+	if m.writers == nil {
+		m.writers = make(map[string]int)
+	}
+	if m.exclusive == nil {
+		m.exclusive = make(map[string]string)
+	}
+	if m.exclusive[abs] != "" {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: exclusive write in progress", ErrWorkdirBusy)
+	}
+	if exclusive && m.writers[abs] > 0 {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: write in progress", ErrWorkdirBusy)
+	}
+	m.writers[abs]++
+	if exclusive {
+		m.exclusive[abs] = owner
+	}
+	held := exclusive
+	m.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			m.mu.Lock()
+			if held && m.exclusive[abs] == owner {
+				delete(m.exclusive, abs)
+			}
+			m.writers[abs]--
+			if m.writers[abs] <= 0 {
+				delete(m.writers, abs)
+				delete(m.exclusive, abs)
+			}
+			m.mu.Unlock()
+		})
+	}, nil
+}
+
+// WorkdirBusy reports whether a run or write lease currently owns abs.
+func (m *RunManager) WorkdirBusy(abs string) (string, bool) {
+	if m == nil || abs == "" {
+		return "", false
+	}
+	if resolved, err := filepath.Abs(abs); err == nil {
+		abs = resolved
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if sid, ok := m.busy[abs]; ok {
+		return sid, true
+	}
+	if m.writers[abs] > 0 {
+		return "write", true
+	}
+	return "", false
 }
 
 // attach wires orchestrator + channel IO into a handle and launches it. On a
@@ -269,19 +398,27 @@ func (m *RunManager) attach(o *Orchestrator, absWorkdir string) (*RunHandle, err
 		leafApprovals: make(map[string]*pendingApproval),
 	}
 	h.phase = PhasePlanning
-	if done, _, _ := o.tree.GetLeafProgress(); done > 0 {
-		// Resumed mid-execution: Guider skips planning/review.
+	if o.cfg.AgentLoopMode() == AgentLoopDirect {
+		// Direct mode never enters plan review; the tool loop starts immediately.
 		h.phase = PhaseRunning
-	}
-
-	io := newChannelGuided(nil)
-	g := NewGuider(o, io)
-	g.askNotice = h.onWorkerQuestion
-	h.io = io
-	h.g = g
-
-	if o.cfg.LeafApprovalMode() == LeafApprovalManual {
-		o.SetLeafApprovalHook(h.handleLeafApproval)
+		h.direct = NewDirect(o, h)
+		o.askHook = h.directAskHook
+		if o.cfg.LeafApprovalMode() == LeafApprovalManual {
+			o.SetLeafApprovalHook(h.handleLeafApproval)
+		}
+	} else {
+		if done, _, _ := o.tree.GetLeafProgress(); done > 0 {
+			// Resumed mid-execution: Guider skips planning/review.
+			h.phase = PhaseRunning
+		}
+		io := newChannelGuided(nil)
+		g := NewGuider(o, io)
+		g.askNotice = h.onWorkerQuestion
+		h.io = io
+		h.g = g
+		if o.cfg.LeafApprovalMode() == LeafApprovalManual {
+			o.SetLeafApprovalHook(h.handleLeafApproval)
+		}
 	}
 
 	m.mu.Lock()
@@ -296,17 +433,22 @@ func (m *RunManager) attach(o *Orchestrator, absWorkdir string) (*RunHandle, err
 	m.busy[absWorkdir] = o.SessionID()
 	m.mu.Unlock()
 
+	h.launchCh = make(chan struct{})
 	go h.serve()
+	if !o.cfg.HoldServe {
+		h.Launch()
+	}
 	return h, nil
 }
 
 // RunHandle is one live guided run plus the control surface the web layer
 // drives with POSTs. All action methods are safe for concurrent use.
 type RunHandle struct {
-	mgr *RunManager
-	o   *Orchestrator
-	g   *Guider
-	io  *channelGuided
+	mgr    *RunManager
+	o      *Orchestrator
+	g      *Guider
+	direct *DirectAgent
+	io     *channelGuided
 
 	workdir string
 
@@ -324,9 +466,42 @@ type RunHandle struct {
 	aborted       bool
 	leafApprovals map[string]*pendingApproval
 
+	// Direct-mode mid-run control. pauseReq is honored at the next tool or
+	// model-step boundary (a running tool is not cancelled). pendingInject
+	// is drained into the same loop before the next model call.
+	pauseReq        bool
+	pendingInject   string
+	pendingInjectID string
+	injectAppliedAt time.Time
+	inTool          bool
+	lastSummary     string
+
+	// Live token buffer for Snapshot/GET reconnect. Not persisted to JSONL.
+	liveStreamID  string
+	liveAssistant string
+
+	// Direct-mode ask: Answer sends on askCh; Pause/Abort wake askWake or ctx.
+	askCh   chan string
+	askWake chan struct{}
+
 	// eventCancel detaches the phase-tracking subscription.
 	eventCancel func()
+
+	// launchCh is closed by Launch (or immediately when HoldServe is
+	// false) so serve can wait for snapshots and hooks to be installed.
+	launchCh   chan struct{}
+	launchOnce sync.Once
+
+	// beforeTerminal runs after the agent loop ends and before the
+	// terminal phase is published or the workdir is released.
+	beforeTerminal func(RunPhase)
 }
+
+// AfterTerminalPublished, if set, is called after the terminal phase is
+// visible and the workdir is released, before Done is closed. Tests use
+// it to observe the first moment clients can see Done. Production code
+// must leave it nil.
+var AfterTerminalPublished func(*RunHandle)
 
 // pendingApproval is one leaf parked after verify, before merge: the review
 // request (node, title, file changes for the diff UI) and the decision
@@ -345,6 +520,12 @@ type PhaseSnapshot struct {
 	SessionID     string   `json:"session_id"`
 	Workdir       string   `json:"workdir"`
 	Error         string   `json:"error,omitempty"`
+	AgentLoop     string   `json:"agent_loop,omitempty"`
+	PendingInject string   `json:"pending_inject,omitempty"`
+	InTool        bool     `json:"in_tool,omitempty"`
+	Summary       string   `json:"summary,omitempty"`
+	LiveAssistant string   `json:"live_assistant,omitempty"`
+	LiveStreamID  string   `json:"live_stream_id,omitempty"`
 }
 
 // Snapshot returns the current externally visible state.
@@ -352,11 +533,17 @@ func (h *RunHandle) Snapshot() PhaseSnapshot {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	s := PhaseSnapshot{
-		Phase:        h.phase,
-		PendingAsk:   h.pendingAsk,
-		ApprovalMode: h.o.cfg.LeafApprovalMode(),
-		SessionID:    h.o.SessionID(),
-		Workdir:      h.workdir,
+		Phase:         h.phase,
+		PendingAsk:    h.pendingAsk,
+		ApprovalMode:  h.o.cfg.LeafApprovalMode(),
+		SessionID:     h.o.SessionID(),
+		Workdir:       h.workdir,
+		AgentLoop:     h.o.cfg.AgentLoopMode(),
+		PendingInject: h.pendingInject,
+		InTool:        h.inTool,
+		Summary:       h.lastSummary,
+		LiveAssistant: h.liveAssistant,
+		LiveStreamID:  h.liveStreamID,
 	}
 	// Serially executed leaves park at most one approval; pick the smallest
 	// id deterministically without re-locking (Snapshot already holds h.mu).
@@ -368,7 +555,25 @@ func (h *RunHandle) Snapshot() PhaseSnapshot {
 	if h.runErr != nil {
 		s.Error = h.runErr.Error()
 	}
+	s.PendingAsk = h.redactSnapshot(s.PendingAsk)
+	s.PendingInject = h.redactSnapshot(s.PendingInject)
+	s.Summary = h.redactSnapshot(s.Summary)
+	s.LiveAssistant = h.redactSnapshot(s.LiveAssistant)
+	s.Error = h.redactSnapshot(s.Error)
 	return s
+}
+
+func (h *RunHandle) redactSnapshot(v string) string {
+	if v == "" || h == nil {
+		return v
+	}
+	if h.o != nil && h.o.events != nil {
+		return h.o.events.RedactString(v)
+	}
+	if h.o != nil {
+		return scrubSecret(v, h.o.cfg.APIKey)
+	}
+	return v
 }
 
 // Phase returns just the run phase.
@@ -395,6 +600,30 @@ func (h *RunHandle) Wait() error {
 // Done returns the completion channel.
 func (h *RunHandle) Done() <-chan struct{} { return h.done }
 
+// Launch starts a handle created with HoldServe. It is safe to call more
+// than once. A handle started without HoldServe is launched automatically.
+func (h *RunHandle) Launch() {
+	if h == nil {
+		return
+	}
+	h.launchOnce.Do(func() {
+		if h.launchCh != nil {
+			close(h.launchCh)
+		}
+	})
+}
+
+// SetBeforeTerminal installs a hook that runs after the agent loop ends
+// and before the terminal phase is published or the workdir is released.
+func (h *RunHandle) SetBeforeTerminal(fn func(RunPhase)) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.beforeTerminal = fn
+	h.mu.Unlock()
+}
+
 // SessionID and Workdir identify the run.
 func (h *RunHandle) SessionID() string { return h.o.SessionID() }
 func (h *RunHandle) Workdir() string   { return h.workdir }
@@ -419,6 +648,10 @@ func (h *RunHandle) SecretValues() []string {
 
 // serve runs the guided lifecycle and records the terminal phase.
 func (h *RunHandle) serve() {
+	if !h.waitForLaunch() {
+		h.finishUnlaunched()
+		return
+	}
 	events, cancelSub := h.o.events.Subscribe()
 	h.mu.Lock()
 	h.eventCancel = cancelSub
@@ -431,7 +664,12 @@ func (h *RunHandle) serve() {
 		}
 	}()
 
-	err := h.g.Run(h.ctx)
+	var err error
+	if h.direct != nil {
+		err = h.direct.Run(h.ctx)
+	} else {
+		err = h.g.Run(h.ctx)
+	}
 
 	cancelSub()
 	<-eventsDone
@@ -445,35 +683,100 @@ func (h *RunHandle) serve() {
 		_ = h.o.checkpoint()
 	}
 
-	// Free the workdir slot and publish the terminal phase in one critical
-	// section: phase is what waiters (UI/SSE, tests) poll, so a terminal
-	// phase must imply the workdir is bookable again. Releasing after the
-	// phase left a window where a paused run looked resumable but Resume
-	// still got ErrWorkdirBusy. Lock order is manager -> handle; no handle
-	// method ever takes the manager lock, so the nesting is deadlock-free.
+	// Persistence (conversation changes / run_finished) must run while
+	// the workdir is still reserved and before the terminal phase is
+	// visible. Publishing Done first let clients observe completion and
+	// start a new write before the previous turn's undo snapshot landed.
+	// finish() still publishes the phase and releases the workdir in one
+	// critical section so a visible terminal phase is bookable again.
+	term := terminalPhaseFor(err, h.aborted)
+	h.mu.Lock()
+	// Record the terminal error before the hook so Snapshot().Error and
+	// abort detection are available, but leave the phase and workdir
+	// reservation unchanged until finish().
+	h.runErr = err
+	before := h.beforeTerminal
+	h.mu.Unlock()
+	if before != nil {
+		before(term)
+	}
 	h.mgr.finish(h, func() {
 		h.runErr = err
-		switch {
-		case err == nil:
-			h.phase = PhaseDone
-		case errors.Is(err, ErrPaused):
-			h.phase = PhasePaused
-		case errors.Is(err, context.Canceled) && !h.aborted:
-			// Process-level interrupt: stopped but fully resumable.
-			h.phase = PhasePaused
-		default:
-			h.phase = PhaseFailed
+		h.phase = term
+		if h.phase != PhasePaused || h.pendingAsk == "" {
+			h.pendingAsk = ""
 		}
-		h.pendingAsk = ""
+		h.liveAssistant = ""
+		h.liveStreamID = ""
 		h.leafApprovals = make(map[string]*pendingApproval)
 	})
 
 	h.o.Close()
+	if hook := AfterTerminalPublished; hook != nil {
+		hook(h)
+	}
+	close(h.done)
+}
+
+func terminalPhaseFor(err error, aborted bool) RunPhase {
+	switch {
+	case err == nil:
+		return PhaseDone
+	case errors.Is(err, ErrPaused):
+		return PhasePaused
+	case errors.Is(err, context.Canceled) && !aborted:
+		return PhasePaused
+	default:
+		return PhaseFailed
+	}
+}
+
+// waitForLaunch blocks until Launch or a cancel before the loop starts.
+// It returns false if the handle was aborted without being launched.
+func (h *RunHandle) waitForLaunch() bool {
+	if h.launchCh == nil {
+		return true
+	}
+	select {
+	case <-h.launchCh:
+		return true
+	default:
+	}
+	select {
+	case <-h.launchCh:
+		return true
+	case <-h.ctx.Done():
+		return false
+	}
+}
+
+func (h *RunHandle) finishUnlaunched() {
+	err := h.ctx.Err()
+	if err == nil {
+		err = context.Canceled
+	}
+	term := terminalPhaseFor(err, h.aborted)
+	h.mgr.finish(h, func() {
+		h.runErr = err
+		h.phase = term
+		h.pendingAsk = ""
+		h.liveAssistant = ""
+		h.liveStreamID = ""
+		h.leafApprovals = make(map[string]*pendingApproval)
+	})
+	if h.o != nil {
+		h.o.Close()
+	}
+	if hook := AfterTerminalPublished; hook != nil {
+		hook(h)
+	}
 	close(h.done)
 }
 
 // finish releases the workdir reservation and applies the terminal phase
-// transition atomically with respect to reserve().
+// transition atomically with respect to reserve(). Callers must run any
+// persistence hook before this so a visible terminal phase implies the
+// turn record is already readable.
 func (m *RunManager) finish(h *RunHandle, setPhase func()) {
 	m.mu.Lock()
 	delete(m.busy, h.workdir)
@@ -570,9 +873,18 @@ func (h *RunHandle) handleLeafApproval(ctx context.Context, req LeafApprovalRequ
 		delete(h.leafApprovals, req.NodeID)
 		h.mu.Unlock()
 	}()
+	h.mu.Lock()
+	h.askWake = make(chan struct{}, 1)
+	wake := h.askWake
+	h.mu.Unlock()
 	select {
 	case d := <-ch:
 		return d, nil
+	case <-wake:
+		if h.PauseRequested() {
+			return LeafApprovalDecision{}, ErrPaused
+		}
+		return LeafApprovalDecision{}, ErrPaused
 	case <-ctx.Done():
 		return LeafApprovalDecision{}, ctx.Err()
 	}
@@ -622,19 +934,271 @@ func (h *RunHandle) Pause() error {
 	if p.Terminal() {
 		return ErrRunFinished
 	}
-	if p != PhaseRunning && p != PhaseAsk {
-		return fmt.Errorf("%w: pause only while running or answering a question", ErrWrongPhase)
+	if p != PhaseRunning && p != PhaseAsk && p != PhaseLeafApproval {
+		return fmt.Errorf("%w: pause only while running, answering a question, or reviewing changes", ErrWrongPhase)
+	}
+	if h.direct != nil {
+		h.mu.Lock()
+		h.pauseReq = true
+		wake := h.askWake
+		h.mu.Unlock()
+		h.wakeAsk(wake)
+		return nil
 	}
 	return h.submitAt(p, "/pause", true)
 }
 
-// AddInstruction appends a new leaf while the run executes.
+// AddInstruction appends a new leaf while the run executes. If a leaf is
+// currently running, the addition waits until that leaf finishes.
 func (h *RunHandle) AddInstruction(instruction string) error {
 	instruction = strings.TrimSpace(instruction)
 	if instruction == "" {
 		return fmt.Errorf("instruction is empty")
 	}
 	return h.submitAt(PhaseRunning, "/add "+instruction, false)
+}
+
+// SteerNow injects a follow-up into the current turn immediately: if a leaf
+// is running it is cancelled (unmerged work is dropped, completed leaves are
+// kept) and the instruction is added before execution continues.
+func (h *RunHandle) SteerNow(instruction string) error {
+	instruction = strings.TrimSpace(instruction)
+	if instruction == "" {
+		return fmt.Errorf("instruction is empty")
+	}
+	if h.direct != nil {
+		return h.InjectAtBoundary(instruction)
+	}
+	return h.submitAt(PhaseRunning, "/steer "+instruction, false)
+}
+
+// InjectAtBoundary queues a follow-up to be merged into the current direct
+// loop at the next model step. A tool that is already running is not
+// cancelled; the instruction waits until that call returns.
+func (h *RunHandle) InjectAtBoundary(instruction string) error {
+	_, err := h.InjectAtBoundaryID(instruction)
+	return err
+}
+
+// InjectAtBoundaryID queues a follow-up and returns a durable request id
+// that acknowledgements must match before clearing persisted Steer state.
+func (h *RunHandle) InjectAtBoundaryID(instruction string) (string, error) {
+	instruction = strings.TrimSpace(instruction)
+	if instruction == "" {
+		return "", fmt.Errorf("instruction is empty")
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.phase.Terminal() {
+		return "", ErrRunFinished
+	}
+	if h.phase != PhaseRunning && h.phase != PhaseAsk {
+		return "", fmt.Errorf("%w: currently %s, need %s", ErrWrongPhase, h.phase, PhaseRunning)
+	}
+	id := newInjectID()
+	h.pendingInject = instruction
+	h.pendingInjectID = id
+	h.injectAppliedAt = time.Time{}
+	return id, nil
+}
+
+func newInjectID() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("inj_%d", time.Now().UnixNano())
+	}
+	return "inj_" + hex.EncodeToString(b[:])
+}
+
+// LastInjectID is the id of the most recently queued boundary inject.
+func (h *RunHandle) LastInjectID() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.pendingInjectID
+}
+
+// ClearPendingInject drops a follow-up that has not yet been drained.
+func (h *RunHandle) ClearPendingInject() {
+	h.mu.Lock()
+	h.pendingInject = ""
+	h.pendingInjectID = ""
+	h.mu.Unlock()
+}
+
+func (h *RunHandle) TakePendingInject() (string, string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	s := h.pendingInject
+	id := h.pendingInjectID
+	h.pendingInject = ""
+	h.pendingInjectID = ""
+	if s != "" {
+		h.injectAppliedAt = time.Now()
+	}
+	return s, id
+}
+
+func (h *RunHandle) PauseRequested() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.pauseReq
+}
+
+func (h *RunHandle) SetInTool(v bool) {
+	h.mu.Lock()
+	h.inTool = v
+	h.mu.Unlock()
+}
+
+func (h *RunHandle) SetSummary(s string) {
+	if h.o != nil && h.o.events != nil {
+		s = h.o.events.RedactString(s)
+	}
+	h.mu.Lock()
+	h.lastSummary = s
+	h.mu.Unlock()
+}
+
+func (h *RunHandle) LastSummary() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.lastSummary
+}
+
+func (h *RunHandle) BeginStream(id string) {
+	h.mu.Lock()
+	h.liveStreamID = id
+	h.liveAssistant = ""
+	h.mu.Unlock()
+}
+
+func (h *RunHandle) AppendStream(delta string) {
+	if delta == "" {
+		return
+	}
+	if h.o != nil && h.o.events != nil {
+		delta = h.o.events.RedactString(delta)
+	}
+	h.mu.Lock()
+	h.liveAssistant += delta
+	h.mu.Unlock()
+}
+
+func (h *RunHandle) ReplaceStream(full string) {
+	if h.o != nil && h.o.events != nil {
+		full = h.o.events.RedactString(full)
+	}
+	h.mu.Lock()
+	h.liveAssistant = full
+	h.mu.Unlock()
+}
+
+func (h *RunHandle) EndStream(full string) {
+	if h.o != nil && h.o.events != nil {
+		full = h.o.events.RedactString(full)
+	}
+	h.mu.Lock()
+	if full != "" {
+		h.liveAssistant = full
+	}
+	h.mu.Unlock()
+}
+
+// directAskHook parks the direct loop until Answer, timeout, pause, or cancel.
+// A timeout continues the loop with a "make a reasonable assumption" reply;
+// pause and cancel do not treat the wake as a user answer.
+func (h *RunHandle) directAskHook(question string) string {
+	timeout := time.Duration(0)
+	if h.o != nil {
+		timeout = h.o.cfg.AskTimeout
+	}
+	if timeout <= 0 {
+		timeout = 15 * time.Minute
+	}
+	h.mu.Lock()
+	if h.phase.Terminal() {
+		h.mu.Unlock()
+		return "The run is no longer active. Make a reasonable assumption and continue; do not call ask again."
+	}
+	h.phase = PhaseAsk
+	h.pendingAsk = question
+	h.askCh = make(chan string, 1)
+	h.askWake = make(chan struct{}, 1)
+	ch, wake := h.askCh, h.askWake
+	h.mu.Unlock()
+	if h.o != nil && h.o.events != nil {
+		h.o.events.Record("ask_pending", "", map[string]any{"question": clip(question, evReasonChars)})
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case ans := <-ch:
+		return ans
+	case <-timer.C:
+		if askRequiresConsent(question) {
+			// Timeout is not consent. Pause and keep the question so a
+			// resume re-surfaces it; the model never receives a yes.
+			h.mu.Lock()
+			h.pauseReq = true
+			h.mu.Unlock()
+			if h.o != nil && h.o.events != nil {
+				h.o.events.Record("ask_timeout", "", map[string]any{
+					"question": clip(question, evReasonChars),
+					"risk":     "consent",
+					"paused":   true,
+				})
+			}
+			return ""
+		}
+		h.mu.Lock()
+		if h.phase == PhaseAsk {
+			h.phase = PhaseRunning
+			h.pendingAsk = ""
+		}
+		h.mu.Unlock()
+		if h.o != nil && h.o.events != nil {
+			h.o.events.Record("ask_timeout", "", map[string]any{
+				"question": clip(question, evReasonChars),
+				"risk":     "clarify",
+				"paused":   false,
+			})
+		}
+		return askTimeoutClarifyReply
+	case <-wake:
+		return ""
+	case <-h.ctx.Done():
+		return ""
+	}
+}
+
+func (h *RunHandle) wakeAsk(wake chan struct{}) {
+	if wake == nil {
+		return
+	}
+	select {
+	case wake <- struct{}{}:
+	default:
+	}
+}
+
+func (h *RunHandle) PendingInject() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.pendingInject
+}
+
+func (h *RunHandle) InTool() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.inTool
+}
+
+func (h *RunHandle) AgentLoop() string {
+	if h == nil || h.o == nil {
+		return AgentLoopGuided
+	}
+	return h.o.cfg.AgentLoopMode()
 }
 
 // Redo resets a node to PENDING so the scheduler runs it again.
@@ -651,6 +1215,30 @@ func (h *RunHandle) Answer(text string) error {
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return fmt.Errorf("answer is empty")
+	}
+	if h.direct != nil {
+		h.mu.Lock()
+		if h.phase.Terminal() {
+			h.mu.Unlock()
+			return ErrRunFinished
+		}
+		if h.phase != PhaseAsk {
+			h.mu.Unlock()
+			return fmt.Errorf("%w: currently %s, need %s", ErrWrongPhase, h.phase, PhaseAsk)
+		}
+		ch := h.askCh
+		h.phase = PhaseRunning
+		h.pendingAsk = ""
+		h.mu.Unlock()
+		if ch == nil {
+			return fmt.Errorf("%w: no pending question", ErrWrongPhase)
+		}
+		select {
+		case ch <- text:
+			return nil
+		default:
+			return fmt.Errorf("%w: no pending question", ErrWrongPhase)
+		}
 	}
 	if err := h.submitAt(PhaseAsk, text, true); err != nil {
 		return err
@@ -691,8 +1279,41 @@ func (h *RunHandle) DecideLeaf(nodeID string, approved bool, comment string) err
 	// Answer(), which flips back to running together with the submission.
 	h.phase = PhaseRunning
 	h.mu.Unlock()
+	return h.sendLeafDecision(pa, LeafApprovalDecision{Approved: approved, Comment: comment})
+}
+
+// DecideLeafPatched is DecideLeaf plus optional hunk patches applied to the
+// isolated mirror after approval and before MergeBack.
+func (h *RunHandle) DecideLeafPatched(nodeID string, approved bool, comment string, patches map[string]string, deletes []string) error {
+	comment = strings.TrimSpace(comment)
+	h.mu.Lock()
+	if h.phase.Terminal() {
+		h.mu.Unlock()
+		return ErrRunFinished
+	}
+	if h.phase != PhaseLeafApproval {
+		h.mu.Unlock()
+		return fmt.Errorf("%w: no leaf is awaiting approval", ErrWrongPhase)
+	}
+	pa, ok := h.leafApprovals[nodeID]
+	if !ok {
+		h.mu.Unlock()
+		return fmt.Errorf("%w: leaf %s is not awaiting approval", ErrWrongPhase, nodeID)
+	}
+	if !approved && comment == "" {
+		h.mu.Unlock()
+		return fmt.Errorf("rejection comment is required")
+	}
+	h.phase = PhaseRunning
+	h.mu.Unlock()
+	return h.sendLeafDecision(pa, LeafApprovalDecision{
+		Approved: approved, Comment: comment, Patches: patches, Deletes: deletes,
+	})
+}
+
+func (h *RunHandle) sendLeafDecision(pa *pendingApproval, d LeafApprovalDecision) error {
 	select {
-	case pa.ch <- LeafApprovalDecision{Approved: approved, Comment: comment}:
+	case pa.ch <- d:
 		return nil
 	case <-h.ctx.Done():
 		return ErrRunFinished
