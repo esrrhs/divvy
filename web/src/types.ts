@@ -12,6 +12,8 @@ export type RunPhase =
 
 export type ApprovalMode = 'auto' | 'manual'
 
+export type AgentMode = 'guided' | 'direct'
+
 export interface PhaseSnapshot {
   phase: RunPhase
   pending_ask?: string
@@ -20,6 +22,12 @@ export interface PhaseSnapshot {
   session_id: string
   workdir: string
   error?: string
+  agent_loop?: AgentMode | string
+  pending_inject?: string
+  in_tool?: boolean
+  summary?: string
+  live_assistant?: string
+  live_stream_id?: string
 }
 
 export interface SessionParams {
@@ -36,6 +44,7 @@ export interface SessionParams {
   approval_mode?: ApprovalMode
   budget_tokens?: number
   max_cost?: number
+  agent_mode?: AgentMode
 }
 
 export interface SessionRow {
@@ -90,11 +99,52 @@ export interface FileChange {
   new_content?: string
 }
 
+export interface DiffHunkLine {
+  type: 'context' | 'add' | 'remove' | string
+  old_no?: number | null
+  new_no?: number | null
+  text: string
+}
+
+export interface ReviewHunk {
+  index: number
+  lines: DiffHunkLine[]
+}
+
+export interface HunkDecision {
+  index: number
+  accept: boolean
+}
+
+export interface ApplyHunkRequest {
+  path: string
+  all?: 'accept' | 'reject' | string
+  decisions?: HunkDecision[]
+}
+
+/** A persisted turn (or leaf-approval) file change, optionally with server hunks. */
+export interface TurnChange extends FileChange {
+  hunks?: ReviewHunk[]
+  hunk_count?: number
+  editable?: boolean
+  edit_block_reason?: string
+  hunk_decisions?: string[]
+  applied_content?: string
+  applied_status?: string
+}
+
+export interface TurnChangesResponse {
+  session_id: string
+  changes: TurnChange[]
+  editable?: boolean
+  reason?: string
+}
+
 export interface ApprovalPayload {
   session_id: string
   node_id: string
   title: string
-  changes: FileChange[]
+  changes: TurnChange[]
 }
 
 // ---- Task tree (mirrors pkg/models + pkg/engine.TaskTree JSON) ----
@@ -171,7 +221,7 @@ export interface TaskTree {
   model_name?: string
 }
 
-// ---- Read-only workspace file browser (GET /api/fs/*) ----
+// ---- Workspace file browser and text editor (GET/PUT /api/fs/*) ----
 
 export type FsEntryType = 'dir' | 'file' | 'symlink' | 'other'
 
@@ -195,6 +245,42 @@ export interface FsFileResponse {
   size: number
   mode: number
   content: string
+  hash?: string
+  editable?: boolean
+  redacted?: boolean
+  reason?: string
+}
+
+export interface FsWriteResponse {
+  path: string
+  size: number
+  hash: string
+  editable?: boolean
+}
+
+export interface ProjectSearchHit {
+  path: string
+  line: number
+  preview: string
+}
+
+export interface ProjectSearchResponse {
+  query: string
+  literal: boolean
+  regex: boolean
+  case_sensitive: boolean
+  glob?: string
+  hits: ProjectSearchHit[]
+  truncated: boolean
+  scanned: number
+}
+
+export interface CodeSelection {
+  path: string
+  start_line: number
+  end_line: number
+  text: string
+  draft?: boolean
 }
 
 export interface LogPage {
@@ -205,3 +291,108 @@ export interface LogPage {
   has_more: boolean
 }
 
+
+
+// ---- Project conversations (persistent thread per workdir) ----
+
+export interface ConversationSettings {
+  model?: string
+  base_url?: string
+  parallel?: number
+  isolate: boolean
+  git_commit: boolean
+  web: boolean
+  browser: boolean
+  approval_mode?: ApprovalMode
+  budget_tokens?: number
+  max_cost?: number
+  agent_mode?: AgentMode
+}
+
+export type ConvMessageKind = 'user' | 'run_started' | 'run_finished' | 'notice' | 'need_key' | 'model_reply' | 'tool_activity'
+
+export interface FileRef {
+  path: string
+  type: 'file' | 'dir' | 'selection' | string
+  bytes?: number
+  excluded?: string
+  truncated?: boolean
+  start_line?: number
+  end_line?: number
+  draft?: boolean
+}
+
+export interface QueuedTurn {
+  text: string
+  paths?: string[]
+  selections?: CodeSelection[]
+  created_at: string
+}
+
+export interface PendingSteer {
+  text: string
+  paths?: string[]
+  selections?: CodeSelection[]
+  created_at: string
+}
+
+export interface TurnChangeSummary {
+  path: string
+  status: FileChangeStatus | string
+  binary?: boolean
+  truncated?: boolean
+}
+
+export type MessageMode = 'start' | 'queue' | 'takeover' | 'steer'
+
+export interface ConvMessage {
+  id: string
+  role: 'user' | 'system' | 'assistant'
+  kind: ConvMessageKind | string
+  text: string
+  session_id?: string
+  outcome?: string
+  created_at: string
+  attachments?: FileRef[]
+  changes?: TurnChangeSummary[]
+}
+
+export interface PendingRollback {
+  session_id?: string
+  phase?: string
+  error?: string
+  files?: string[]
+  applied?: string[]
+  conflict_paths?: string[]
+  message?: string
+}
+
+export interface Conversation {
+  id: string
+  title: string
+  workdir: string
+  created_at: string
+  updated_at: string
+  settings: ConversationSettings
+  messages: ConvMessage[]
+  work_log: string[]
+  session_ids: string[]
+  current_session_id?: string
+  queue?: QueuedTurn
+  steer?: PendingSteer
+  rolled_back_turns?: string[]
+  pending_rollback?: PendingRollback
+  has_api_key: boolean
+  context_note: string
+  run_phase?: RunPhase | string
+  run_session_id?: string
+  key_required?: boolean
+  agent_loop?: AgentMode | string
+  pending_inject?: string
+  inject_state?: string
+  in_tool?: boolean
+  pending_ask?: string
+  live_assistant?: string
+  live_stream_id?: string
+  leaf_approving?: string
+}

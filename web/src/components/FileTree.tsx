@@ -25,6 +25,7 @@ function humanSize(n: number): string {
 
 export function FileTree() {
   const currentId = useStore((s) => s.currentId)
+  const currentConvId = useStore((s) => s.currentConvId)
   const openFile = useStore((s) => s.openFile)
   const viewingPath = useStore((s) => s.fileView?.path)
   const [path, setPath] = useState('.')
@@ -38,7 +39,7 @@ export function FileTree() {
       setLoading(true)
       setError(null)
       try {
-        const res = await api.fsList(p, currentId ?? undefined)
+        const res = await api.fsList(p, currentId ?? undefined, currentConvId ?? undefined)
         setEntries(res.entries)
         setTruncated(res.truncated)
         setPath(res.path || p)
@@ -48,7 +49,7 @@ export function FileTree() {
         setLoading(false)
       }
     },
-    [currentId],
+    [currentId, currentConvId],
   )
 
   useEffect(() => {
@@ -75,9 +76,9 @@ export function FileTree() {
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto px-2 py-2">
-        {!currentId && (
+        {!currentId && !currentConvId && (
           <p className="px-1.5 pb-2 text-[11px] leading-snug text-slate-600">
-            未打开会话：浏览的是服务默认工作区。打开会话后将切换到该会话的 workdir。
+            未打开会话：浏览的是服务默认工作区。打开项目后将切换到该会话的 workdir。
           </p>
         )}
         {loading && (

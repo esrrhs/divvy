@@ -1,29 +1,24 @@
 import { useEffect, useMemo, useState } from 'react'
+import { conversationRowKind, shortWorkdir } from '../lib/conversation'
 import { useStore } from '../store'
-import type { SessionRow } from '../types'
-import { FolderIcon, ListIcon, PlayIcon, PlusIcon, SpinnerIcon, TrashIcon } from './icons'
+import type { Conversation } from '../types'
+import { FolderIcon, ListIcon, PlayIcon, PlusIcon, SearchIcon, SpinnerIcon, TrashIcon } from './icons'
 import { FileTree } from './FileTree'
+import { ProjectSearch } from './ProjectSearch'
 
-type Filter = 'all' | 'active' | 'done' | 'failed' | 'resumable'
+type Filter = 'all' | 'active' | 'paused' | 'done' | 'failed' | 'idle'
 
 const filters: Array<[Filter, string]> = [
   ['all', '全部'],
   ['active', '进行中'],
-  ['resumable', '可续跑'],
+  ['paused', '已暂停'],
+  ['idle', '可继续'],
   ['done', '完成'],
   ['failed', '失败'],
 ]
 
-function rowKind(row: SessionRow): Filter {
-  if (row.live) {
-    const p = row.live.phase
-    if (p === 'done') return 'done'
-    if (p === 'failed') return 'failed'
-    return 'active'
-  }
-  if (row.root_state === 'COMPLETED') return 'done'
-  if (row.root_state === 'FAILED' || row.root_state === 'SKIPPED') return 'failed'
-  return 'resumable'
+function rowKind(row: Conversation): Filter {
+  return conversationRowKind(row.run_phase) as Filter
 }
 
 function timeAgo(iso: string): string {
@@ -38,40 +33,41 @@ function timeAgo(iso: string): string {
   return new Date(t).toLocaleDateString()
 }
 
-function SessionItem({ row }: { row: SessionRow }) {
-  const currentId = useStore((s) => s.currentId)
-  const openSession = useStore((s) => s.openSession)
-  const resumeSession = useStore((s) => s.resumeSession)
-  const deleteSession = useStore((s) => s.deleteSession)
+function ConversationItem({ row }: { row: Conversation }) {
+  const currentId = useStore((s) => s.currentConvId)
+  const openConversation = useStore((s) => s.openConversation)
+  const resumeConversation = useStore((s) => s.resumeConversation)
+  const deleteConversation = useStore((s) => s.deleteConversation)
   const active = row.id === currentId
   const kind = rowKind(row)
-  const progress = row.leaves_all > 0 ? `${row.leaves_done}/${row.leaves_all}` : null
   const [resuming, setResuming] = useState(false)
   const [deleting, setDeleting] = useState(false)
 
   const kindLabel: Record<Filter, string> = {
     all: '',
-    active: row.live ? phaseLabel(row.live.phase) : '运行中',
+    active: '进行中',
     done: '完成',
     failed: '失败',
-    resumable: '可续跑',
+    paused: '已暂停',
+    idle: '可继续',
   }
   const kindColor: Record<Filter, string> = {
     all: '',
     active: 'text-brand-400/90',
     done: 'text-emerald-400/90',
     failed: 'text-rose-400/90',
-    resumable: 'text-amber-400/90',
+    paused: 'text-amber-400/90',
+    idle: 'text-slate-400',
   }
 
   const onDelete = async () => {
-    const title = (row.goal || '(无标题)').slice(0, 60)
+    const title = (row.title || row.workdir || '(无标题)').slice(0, 60)
     const ok = window.confirm(
-      `确定删除会话「${title}」吗？\n\n任务树、事件记录与日志都会被永久删除，且无法恢复。`,
+      `确定删除对话「${title}」吗？\n\n对话记录会被删除，项目目录里的文件不会改动。`,
     )
     if (!ok) return
     setDeleting(true)
-    await deleteSession(row.id)
+    await deleteConversation(row.id)
     setDeleting(false)
   }
 
@@ -87,84 +83,67 @@ function SessionItem({ row }: { row: SessionRow }) {
         <button
           onClick={() => void onDelete()}
           disabled={deleting}
-          title="删除会话"
+          title="删除对话"
           className="absolute right-1.5 top-1.5 rounded p-0.5 text-slate-600 opacity-0 transition hover:bg-ink-700 hover:text-rose-400 focus:opacity-100 group-hover:opacity-100 disabled:opacity-60"
         >
-          {deleting ? (
-            <SpinnerIcon width={12} height={12} />
-          ) : (
-            <TrashIcon width={12} height={12} />
-          )}
+          {deleting ? <SpinnerIcon width={12} height={12} /> : <TrashIcon width={12} height={12} />}
         </button>
       )}
-      <button onClick={() => void openSession(row.id)} className="block w-full text-left">
+      <button onClick={() => void openConversation(row.id)} className="block w-full text-left">
         <div className="line-clamp-2 pr-5 text-[12.5px] leading-snug text-slate-200">
-          {row.goal || '(无标题)'}
+          {row.title || shortWorkdir(row.workdir) || '(无标题)'}
         </div>
         <div className="mt-1 flex items-center justify-between text-[11px] text-slate-500">
-          <span className="font-mono">{row.id.replace(/^sess_/, '')}</span>
-          <span className="flex items-center gap-1.5">
-            {progress && <span>{progress} 叶</span>}
+          <span className="truncate font-mono" title={row.workdir}>
+            {shortWorkdir(row.workdir)}
+          </span>
+          <span className="flex shrink-0 items-center gap-1.5">
             <span className={kindColor[kind]}>{kindLabel[kind]}</span>
             <span>{timeAgo(row.updated_at)}</span>
           </span>
         </div>
       </button>
 
-      {kind === 'resumable' && (
+      {kind === 'paused' && (
         <button
           onClick={async () => {
             setResuming(true)
-            await resumeSession(row.id)
+            if (row.id !== currentId) await openConversation(row.id)
+            await resumeConversation()
             setResuming(false)
           }}
           className="mt-1.5 flex w-full items-center justify-center gap-1 rounded border border-amber-800/60 bg-amber-950/30 py-1 text-[11px] text-amber-300 transition hover:bg-amber-900/30"
         >
           {resuming ? <SpinnerIcon width={11} height={11} /> : <PlayIcon width={11} height={11} />}
-          续跑此会话
+          续跑此对话
         </button>
       )}
     </div>
   )
 }
 
-function phaseLabel(p: string): string {
-  return (
-    {
-      planning: '规划中',
-      plan_review: '待审批',
-      running: '运行中',
-      leaf_approval: '待审',
-      ask: '问答中',
-      paused: '暂停',
-      done: '完成',
-      failed: '失败',
-    } as Record<string, string>
-  )[p] ?? p
-}
-
 export function Sidebar({ onNewSession }: { onNewSession: () => void }) {
-  const [tab, setTab] = useState<'sessions' | 'files'>('sessions')
+  const [tab, setTab] = useState<'sessions' | 'files' | 'search'>('sessions')
   const [filter, setFilter] = useState<Filter>('all')
-  const sessions = useStore((s) => s.sessions)
-  const loading = useStore((s) => s.sessionsLoading)
-  const refresh = useStore((s) => s.refreshSessions)
+  const conversations = useStore((s) => s.conversations)
+  const loading = useStore((s) => s.conversationsLoading)
+  const refresh = useStore((s) => s.refreshConversations)
 
   useEffect(() => {
     void refresh()
   }, [refresh])
 
   const filtered = useMemo(
-    () => (filter === 'all' ? sessions : sessions.filter((r) => rowKind(r) === filter)),
-    [sessions, filter],
+    () => (filter === 'all' ? conversations : conversations.filter((r) => rowKind(r) === filter)),
+    [conversations, filter],
   )
 
   return (
     <aside className="flex h-full w-[264px] shrink-0 flex-col border-r border-line bg-ink-850">
       <div className="flex items-center gap-2 px-3 pb-2 pt-3">
-        <button onClick={onNewSession} className="btn-primary flex-1 py-1.5 text-[12.5px]" title="新建会话">
+        <button onClick={onNewSession} className="btn-primary flex-1 py-1.5 text-[12.5px]" title="打开项目">
           <PlusIcon width={14} height={14} />
-          新建会话
+          打开项目
         </button>
         <button onClick={() => void refresh()} className="btn-ghost px-2 py-1.5" title="刷新列表">
           {loading ? <SpinnerIcon width={14} height={14} /> : <ListIcon width={14} height={14} />}
@@ -174,8 +153,9 @@ export function Sidebar({ onNewSession }: { onNewSession: () => void }) {
       <div className="flex gap-1 px-3 pb-2">
         {(
           [
-            ['sessions', ListIcon, '会话'],
+            ['sessions', ListIcon, '对话'],
             ['files', FolderIcon, '文件'],
+            ['search', SearchIcon, '搜索'],
           ] as const
         ).map(([key, Icon, label]) => (
           <button
@@ -211,23 +191,25 @@ export function Sidebar({ onNewSession }: { onNewSession: () => void }) {
             ))}
           </div>
           <div className="flex-1 space-y-1 overflow-y-auto px-2 pb-3">
-            {sessions.length === 0 && !loading && (
+            {conversations.length === 0 && !loading && (
               <p className="px-2 py-6 text-center text-[12px] leading-relaxed text-slate-600">
-                还没有会话。
+                还没有对话。
                 <br />
-                点击「新建会话」开始。
+                点击「打开项目」选择一个已有目录。
               </p>
             )}
-            {sessions.length > 0 && filtered.length === 0 && (
-              <p className="px-2 py-6 text-center text-[12px] text-slate-600">该筛选下没有会话。</p>
+            {conversations.length > 0 && filtered.length === 0 && (
+              <p className="px-2 py-6 text-center text-[12px] text-slate-600">该筛选下没有对话。</p>
             )}
             {filtered.map((row) => (
-              <SessionItem key={row.id} row={row} />
+              <ConversationItem key={row.id} row={row} />
             ))}
           </div>
         </>
-      ) : (
+      ) : tab === 'files' ? (
         <FileTree />
+      ) : (
+        <ProjectSearch />
       )}
     </aside>
   )

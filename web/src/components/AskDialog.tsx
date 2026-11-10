@@ -7,6 +7,7 @@ import { SpinnerIcon } from './icons'
 // terminal guider).
 export function AskDialog() {
   const question = useStore((s) => s.live?.pending_ask ?? '')
+  const inConversation = useStore((s) => !!s.currentConvId)
   const answer = useStore((s) => s.answer)
   const pause = useStore((s) => s.pause)
   const actionError = useStore((s) => s.actionError)
@@ -17,7 +18,8 @@ export function AskDialog() {
     setText('')
   }, [question])
 
-  if (!question) return null
+  // Conversation view renders an inline ask card; don't stack a modal on top.
+  if (!question || inConversation) return null
 
   async function submit() {
     if (!text.trim()) return

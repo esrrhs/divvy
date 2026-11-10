@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { api, ApiError } from '../api/client'
 import { useStore } from '../store'
-import type { ApprovalPayload } from '../types'
+import type { ApplyHunkRequest, ApprovalPayload } from '../types'
 import { FileDiffList } from './FileDiffView'
 import { CheckIcon, SpinnerIcon, XIcon } from './icons'
 
@@ -21,12 +21,14 @@ export function LeafApprovalCard() {
   const [comment, setComment] = useState('')
   const [showReject, setShowReject] = useState(false)
   const [busy, setBusy] = useState(false)
+  const [hunks, setHunks] = useState<Record<string, ApplyHunkRequest>>({})
 
   useEffect(() => {
     setPayload(null)
     setLoadError(null)
     setComment('')
     setShowReject(false)
+    setHunks({})
     if (!sessionId || !leafId || phase !== 'leaf_approval') return
     let cancelled = false
     // The leaf hook registers its payload just before the phase flips;
@@ -58,7 +60,7 @@ export function LeafApprovalCard() {
   async function decide(decision: 'approve' | 'reject') {
     if (!leafId) return
     setBusy(true)
-    const ok = await decideLeaf(leafId, decision, comment)
+    const ok = await decideLeaf(leafId, decision, comment, decision === 'approve' ? hunks : undefined)
     setBusy(false)
     if (ok) {
       setComment('')
@@ -75,7 +77,7 @@ export function LeafApprovalCard() {
       <div className="flex items-center gap-3 px-5 pt-3">
         <span className="flex h-2 w-2 shrink-0 animate-pulse rounded-full bg-fuchsia-400" />
         <p className="text-[13px] font-medium text-fuchsia-200">
-          叶子改动审查{payload ? `：${payload.title}` : ''}
+          {leafId === 'direct' ? '本轮改动审查' : '叶子改动审查'}{payload ? `：${payload.title}` : ''}
           <span className="ml-2 font-mono text-[11px] text-fuchsia-400/70">{leafId}</span>
         </p>
         <span className="ml-auto rounded border border-fuchsia-800/60 px-1.5 py-px text-[10.5px] text-fuchsia-300">
@@ -92,7 +94,7 @@ export function LeafApprovalCard() {
             正在生成变更清单…
           </p>
         ) : (
-          <FileDiffList changes={payload.changes} />
+          <FileDiffList changes={payload.changes} mode="select" editable onDraftChange={setHunks} />
         )}
       </div>
 
@@ -100,7 +102,7 @@ export function LeafApprovalCard() {
         {showReject && (
           <textarea
             className="input mb-2 min-h-[56px] resize-y text-[12.5px]"
-            placeholder="拒绝原因（必填）：会作为 prevError 反馈给叶子，要求它按意见重做"
+            placeholder={leafId === 'direct' ? '拒绝原因（必填）：改动不会写入工作区，本轮结束，不会自动重试绕过' : '拒绝原因（必填）：会作为 prevError 反馈给叶子，要求它按意见重做'}
             value={comment}
             onChange={(e) => {
               setComment(e.target.value)
@@ -152,7 +154,7 @@ export function LeafApprovalCard() {
                 onClick={() => void decide('approve')}
               >
                 {busy ? <SpinnerIcon width={13} height={13} /> : <CheckIcon width={13} height={13} />}
-                批准合并
+                {Object.keys(hunks).length > 0 ? '按已选块批准合并' : '批准合并'}
               </button>
             </>
           )}
