@@ -241,12 +241,12 @@ func saveConversation(dataDir string, c *Conversation, secrets []string) error {
 	}
 	tmpPath := tmp.Name()
 	if _, err := tmp.Write(payload); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		os.Remove(tmpPath)
 		return fmt.Errorf("write conversation: %w", err)
 	}
 	if err := tmp.Sync(); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		os.Remove(tmpPath)
 		return err
 	}

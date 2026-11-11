@@ -21,7 +21,14 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install bubblewrap
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+        run: |
+          sudo apt-get update && sudo apt-get install -y bubblewrap
+          # Ubuntu 24.04 AppArmor lets bwrap create a user namespace but
+          # withholds CAP_NET_ADMIN inside it, so --unshare-all dies on
+          # "bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted".
+          # This restores the kernel default on the disposable runner; it
+          # does not loosen sandbox flags or skip tests.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
       - name: Set up Go ${{ matrix.go }}
         uses: actions/setup-go@v5
@@ -68,7 +75,14 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install bubblewrap
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+        run: |
+          sudo apt-get update && sudo apt-get install -y bubblewrap
+          # Ubuntu 24.04 AppArmor lets bwrap create a user namespace but
+          # withholds CAP_NET_ADMIN inside it, so --unshare-all dies on
+          # "bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted".
+          # This restores the kernel default on the disposable runner; it
+          # does not loosen sandbox flags or skip tests.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -111,7 +125,14 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install bubblewrap
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+        run: |
+          sudo apt-get update && sudo apt-get install -y bubblewrap
+          # Ubuntu 24.04 AppArmor lets bwrap create a user namespace but
+          # withholds CAP_NET_ADMIN inside it, so --unshare-all dies on
+          # "bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted".
+          # This restores the kernel default on the disposable runner; it
+          # does not loosen sandbox flags or skip tests.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -245,7 +266,14 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install bubblewrap
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+        run: |
+          sudo apt-get update && sudo apt-get install -y bubblewrap
+          # Ubuntu 24.04 AppArmor lets bwrap create a user namespace but
+          # withholds CAP_NET_ADMIN inside it, so --unshare-all dies on
+          # "bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted".
+          # This restores the kernel default on the disposable runner; it
+          # does not loosen sandbox flags or skip tests.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
       - name: Set up Node
         uses: actions/setup-node@v4

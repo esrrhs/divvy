@@ -223,12 +223,12 @@ func saveRollbackJournal(dataDir string, j *rollbackJournal) error {
 	}
 	tmpPath := tmp.Name()
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		os.Remove(tmpPath)
 		return err
 	}
 	if err := tmp.Sync(); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		os.Remove(tmpPath)
 		return err
 	}
@@ -414,12 +414,12 @@ func copyWorkdirBackup(workdir, rel, dest string) error {
 	}
 	tmpPath := tmp.Name()
 	if _, err := io.Copy(tmp, src); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		os.Remove(tmpPath)
 		return err
 	}
 	if err := tmp.Sync(); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		os.Remove(tmpPath)
 		return err
 	}
@@ -465,12 +465,12 @@ func atomicWriteWorkdirFileMode(workdir, rel, content string, perm os.FileMode) 
 	}
 	tmpPath := tmp.Name()
 	if _, err := tmp.Write([]byte(content)); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		os.Remove(tmpPath)
 		return err
 	}
 	if err := tmp.Sync(); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		os.Remove(tmpPath)
 		return err
 	}
