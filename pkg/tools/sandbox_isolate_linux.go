@@ -121,7 +121,21 @@ func appendDependencyCaches(args []string) []string {
 	if dir := hostGoModCache(); dir != "" {
 		args = append(args, "--ro-bind", dir, "/tmp/divvy-gomodcache")
 	}
+	// /tmp is a fresh tmpfs per bwrap invocation. Bind a persistent host
+	// build cache over GOCACHE so consecutive run_bash compiles in the
+	// same conversation are not cold every time.
+	if dir := hostGoBuildCache(); dir != "" {
+		args = append(args, "--bind", dir, "/tmp/divvy-gocache")
+	}
 	return args
+}
+
+func hostGoBuildCache() string {
+	dir := filepath.Join(os.TempDir(), "divvy-gocache")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return ""
+	}
+	return dir
 }
 
 func hostGoModCache() string {

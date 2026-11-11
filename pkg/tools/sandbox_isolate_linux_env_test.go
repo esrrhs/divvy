@@ -101,3 +101,48 @@ func main() {
 		t.Fatalf("unexpected isolated go run output: %s", got)
 	}
 }
+
+func TestIsolatedGoCachePersistsAcrossCommands(t *testing.T) {
+	root := t.TempDir()
+	ok, reason := ProbeShellIsolation(root)
+	if !ok {
+		t.Skip(reason)
+	}
+	writeFile(t, filepath.Join(root, "go.mod"), "module addtest\n\ngo 1.22\n")
+	writeFile(t, filepath.Join(root, "add.go"), "package addtest\n\nfunc Add(a, b int) int { return a + b }\n")
+	writeFile(t, filepath.Join(root, "add_test.go"), `package addtest
+
+import "testing"
+
+func TestAdd(t *testing.T) {
+	if got := Add(2, 3); got != 5 {
+		t.Fatalf("Add(2,3)=%d", got)
+	}
+}
+`)
+	first, err := isolateShellCommand(context.Background(), root, "go test .", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := first.CombinedOutput(); err != nil {
+		t.Fatalf("first isolated go test: %v\n%s", err, out)
+	}
+	cache := hostGoBuildCache()
+	if cache == "" {
+		t.Fatal("host GOCACHE dir should be created so it can be bound")
+	}
+	entries, err := os.ReadDir(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) == 0 {
+		t.Fatalf("host GOCACHE %s was not populated by the isolated compile", cache)
+	}
+	second, err := isolateShellCommand(context.Background(), root, "go test .", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := second.CombinedOutput(); err != nil {
+		t.Fatalf("second isolated go test: %v\n%s", err, out)
+	}
+}
