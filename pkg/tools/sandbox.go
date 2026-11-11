@@ -138,6 +138,13 @@ func NewSandbox(root string) (*Sandbox, error) {
 	if err := os.MkdirAll(abs, 0755); err != nil {
 		return nil, err
 	}
+	// Canonicalize the root: Resolve returns fully-evaluated paths, so on
+	// platforms where the workspace sits under a symlink (e.g. macOS
+	// /var -> /private/var) a lexical Root would make every Resolve result
+	// look like it escapes the workspace and filepath.Rel would produce
+	// "../../.." for paths inside it. Keeping Root real makes Rel and the
+	// containment checks agree with Resolve.
+	abs = mustRealRoot(abs)
 	return &Sandbox{
 		Root:      abs,
 		Timeout:   60 * time.Second,

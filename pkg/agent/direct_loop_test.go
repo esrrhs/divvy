@@ -440,3 +440,139 @@ func TestDirect_HTTPProtocolRepairAndBudget(t *testing.T) {
 		t.Fatal("budget stop must not mark the root completed")
 	}
 }
+
+// TestDirect_InvalidJSONStopsBeforeBudget covers the weak-model JSON loop:
+// three unparseable replies must end the turn with ErrInvalidJSON instead of
+// burning every remaining step on "please reply with JSON".
+func TestDirect_InvalidJSONStopsBeforeBudget(t *testing.T) {
+	work, data := t.TempDir(), t.TempDir()
+	cfg := directCfg(t, work, data, "make a change")
+	cfg.DirectSteps = 20
+	calls := 0
+	client := &llm.ScriptedClient{Handle: func(ctx context.Context, req llm.Request) (*llm.Response, error) {
+		calls++
+		return &llm.Response{Content: "this is not a tool call"}, nil
+	}}
+	o, err := NewFromGoal(cfg, client, SilentLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(o.Close)
+	err = NewDirect(o, &testDirectCtl{}).Run(context.Background())
+	if !errors.Is(err, ErrInvalidJSON) {
+		t.Fatalf("err = %v, want ErrInvalidJSON", err)
+	}
+	if calls != maxInvalidJSONRounds {
+		t.Fatalf("model calls = %d, want %d (must not burn DirectSteps)", calls, maxInvalidJSONRounds)
+	}
+	st, loadErr := loadDirectState(filepath.Join(data, o.SessionID()+".direct.json"), cfg.APIKey)
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if st != nil && st.Done {
+		t.Fatal("invalid-JSON abort must not mark the transcript done")
+	}
+	if root := o.tree.GetRoot(); root != nil && root.State == models.TaskStateCompleted {
+		t.Fatal("invalid-JSON abort must not mark the root completed")
+	}
+}
+
+// TestDirect_FinishGateRejectsConflictMarker covers the missing deterministic
+// pre-finish review in direct mode: finish must be refused while an unresolved
+// conflict marker is present, the model must see the report, and a later clean
+// finish must succeed.
+func TestDirect_FinishGateRejectsConflictMarker(t *testing.T) {
+	work, data := t.TempDir(), t.TempDir()
+	initGitRepo(t, work)
+	cfg := directCfg(t, work, data, "write a clean file")
+	calls := 0
+	wroteClean := false
+	client := &llm.ScriptedClient{Handle: func(ctx context.Context, req llm.Request) (*llm.Response, error) {
+		calls++
+		body := joinReq(req)
+		switch {
+		case calls == 1:
+			return jsonAct(tools.ToolWriteFile, map[string]any{
+				"path":    "broken.go",
+				"content": "package demo\n\n<<<<<<< HEAD\nfunc A() {}\n=======\nfunc A() int { return 1 }\n>>>>>>> other\n",
+			}), nil
+		case calls == 2:
+			return jsonAct(tools.ToolFinish, map[string]any{"summary": "should be blocked"}), nil
+		case !wroteClean && strings.Contains(body, "REJECTED by review_diff"):
+			wroteClean = true
+			return jsonAct(tools.ToolWriteFile, map[string]any{
+				"path":    "broken.go",
+				"content": "package demo\n\nfunc A() int { return 1 }\n",
+			}), nil
+		default:
+			return jsonAct(tools.ToolFinish, map[string]any{"summary": "clean finish"}), nil
+		}
+	}}
+	o, err := NewFromGoal(cfg, client, SilentLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(o.Close)
+	ctl := &testDirectCtl{}
+	if err := NewDirect(o, ctl).Run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if ctl.summary != "clean finish" {
+		t.Fatalf("summary = %q, want the post-repair finish (gate did not block or was not retried)", ctl.summary)
+	}
+	raw, err := os.ReadFile(filepath.Join(data, o.SessionID()+".direct.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "REJECTED by review_diff") {
+		t.Fatal("transcript should show the rejected finish and its review report")
+	}
+}
+
+// TestDirect_RepeatedIdenticalCallGetsIntervention covers the other weak-model
+// loop shape: the same successful read repeated until the budget runs out. The
+// model must be told the repetition cannot help, and the turn must still be
+// able to finish.
+func TestDirect_RepeatedIdenticalCallGetsIntervention(t *testing.T) {
+	work, data := t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(work, "note.txt"), []byte("hello\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := directCfg(t, work, data, "read note.txt, then finish")
+	cfg.DirectSteps = 10
+	calls := 0
+	sawIntervention := false
+	client := &llm.ScriptedClient{Handle: func(ctx context.Context, req llm.Request) (*llm.Response, error) {
+		calls++
+		body := joinReq(req)
+		if calls <= directRepeatLimit {
+			return jsonAct(tools.ToolReadFile, map[string]any{"path": "note.txt"}), nil
+		}
+		if strings.Contains(body, "identical arguments") {
+			sawIntervention = true
+		}
+		return jsonAct(tools.ToolFinish, map[string]any{"summary": "stopped repeating"}), nil
+	}}
+	o, err := NewFromGoal(cfg, client, SilentLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(o.Close)
+	ctl := &testDirectCtl{}
+	if err := NewDirect(o, ctl).Run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !sawIntervention {
+		t.Fatal("model never saw the repeated-call intervention")
+	}
+	if ctl.summary != "stopped repeating" {
+		t.Fatalf("summary = %q", ctl.summary)
+	}
+	raw, err := os.ReadFile(filepath.Join(data, o.SessionID()+".direct.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "identical arguments") {
+		t.Fatal("transcript should keep the intervention")
+	}
+}

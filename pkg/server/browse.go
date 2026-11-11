@@ -34,7 +34,28 @@ func resolveExistingDir(path string) (string, error) {
 	if !info.IsDir() {
 		return "", fmt.Errorf("path is not a directory: %s", abs)
 	}
-	return abs, nil
+	// Store the canonical directory so conversation workdirs and sandbox
+	// roots compare equal even when reached through a symlink (macOS
+	// /var -> /private/var, or a symlinked project directory).
+	return canonicalPath(abs), nil
+}
+
+// canonicalPath resolves a path to its absolute, symlink-free form when it
+// exists, and otherwise to its absolute lexical form. Use it whenever paths
+// from different surfaces (UI, CLI, sandbox roots, saved sessions) are
+// compared or used as map keys.
+func canonicalPath(path string) string {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return path
+	}
+	if real, err := filepath.EvalSymlinks(abs); err == nil {
+		if realAbs, err := filepath.Abs(real); err == nil {
+			return realAbs
+		}
+		return real
+	}
+	return abs
 }
 
 func (s *Server) handleBrowse(w http.ResponseWriter, r *http.Request) {
