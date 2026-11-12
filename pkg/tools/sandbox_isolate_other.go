@@ -9,7 +9,7 @@ import (
 )
 
 func isolateShellCommand(ctx context.Context, root, command string, env []string) (*exec.Cmd, error) {
-	return nil, fmt.Errorf("run_bash requires filesystem isolation (bubblewrap/landlock) and is not available on this platform; the command was not executed")
+	return nil, fmt.Errorf("%w: run_bash requires filesystem isolation (bubblewrap/landlock) and is not available on this platform; the command was not executed", ErrExecutionUnavailable)
 }
 
 // ProbeShellIsolation always reports run_bash unavailable off Linux.

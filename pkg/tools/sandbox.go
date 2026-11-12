@@ -5,6 +5,7 @@ import (
 
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -22,6 +23,13 @@ const (
 	defaultMaxList       = 120
 	defaultMaxOutput     = 24 * 1024
 )
+
+// ErrExecutionUnavailable marks a failure caused by the host lacking the
+// isolation primitives run_bash needs (bubblewrap/landlock) rather than by
+// the command itself. Callers must treat it as fatal for the run: retrying
+// or re-splitting cannot make bwrap appear, so it must not be counted as a
+// verification failure or fed back to the model as something to repair.
+var ErrExecutionUnavailable = errors.New("command execution unavailable in this environment")
 
 var skipDirNames = map[string]bool{
 	".git":         true,

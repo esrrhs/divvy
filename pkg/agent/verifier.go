@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -16,6 +17,20 @@ type VerifyResult struct {
 	Command  string
 	Output   string
 	ExitCode int
+	// Unavailable is set when the host cannot execute commands at all
+	// (missing bubblewrap/landlock). This is an environment failure, not a
+	// verdict on the work: retrying or re-splitting cannot fix it, so runs
+	// abort instead of treating it as a normal verification failure.
+	Unavailable bool
+}
+
+// UnavailableErr returns a fatal environment error when the command could not
+// be executed at all, or nil when the result reflects an executed command.
+func (vr VerifyResult) UnavailableErr() error {
+	if !vr.Unavailable {
+		return nil
+	}
+	return fmt.Errorf("%w: %s", tools.ErrExecutionUnavailable, vr.Output)
 }
 
 func (o *Orchestrator) verify(ctx context.Context, sb *tools.Sandbox, node *models.TaskNode) VerifyResult {
@@ -40,11 +55,13 @@ func (o *Orchestrator) verify(ctx context.Context, sb *tools.Sandbox, node *mode
 		if err != nil {
 			msg := fmt.Sprintf("command %q failed to start: %v", cmd, err)
 			o.log.Errorf("%s", msg)
+			unavailable := errors.Is(err, tools.ErrExecutionUnavailable)
 			o.events.Record("verify", node.ID, map[string]any{
 				"command": cmd, "ok": false, "exit_code": -1,
 				"duration_ms": duration, "error": clip(err.Error(), evReasonChars),
+				"unavailable": unavailable,
 			})
-			return VerifyResult{OK: false, Command: cmd, Output: msg, ExitCode: -1}
+			return VerifyResult{OK: false, Command: cmd, Output: msg, ExitCode: -1, Unavailable: unavailable}
 		}
 		// One retry with a longer budget when the default-ish timeout fires:
 		// weak-model DoD often leaves TimeoutSec at 60 while go test needs more
@@ -141,6 +158,31 @@ func (o *Orchestrator) verify(ctx context.Context, sb *tools.Sandbox, node *mode
 		}
 	}
 	return VerifyResult{OK: true, Output: combined.String()}
+}
+
+// abortExecutionUnavailable turns a host-capability failure (run_bash cannot
+// start at all) into a fatal run error. Retrying, re-splitting or asking the
+// model to repair cannot install bubblewrap, so the node and the root are
+// marked FAILED and the tree is checkpointed; the user sees the real reason
+// instead of a model that keeps "fixing" code that was never executed.
+func (o *Orchestrator) abortExecutionUnavailable(nodeID string, vr VerifyResult) error {
+	msg := strings.TrimSpace(vr.Output)
+	if msg == "" {
+		msg = tools.ErrExecutionUnavailable.Error()
+	}
+	o.log.Errorf("command execution is unavailable in this environment (node %s): %s", nodeID, truncate(msg, 240))
+	o.events.Record("execution_unavailable", nodeID, map[string]any{
+		"command": vr.Command,
+		"reason":  clip(msg, evReasonChars),
+	})
+	if nodeID != "" && nodeID != o.tree.RootID {
+		if _, ok := o.tree.CloneNode(nodeID); ok {
+			_ = o.sched.UpdateNodeState(nodeID, models.TaskStateFailed, msg)
+		}
+	}
+	_ = o.sched.UpdateNodeState(o.tree.RootID, models.TaskStateFailed, msg)
+	_ = o.checkpoint()
+	return fmt.Errorf("%w: %s", tools.ErrExecutionUnavailable, msg)
 }
 
 // retargetCommands rewrites absolute workspace paths baked into DoD commands

@@ -35,6 +35,9 @@ func (o *Orchestrator) verifyRootAcceptance(ctx context.Context) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
+	if uerr := vr.UnavailableErr(); uerr != nil {
+		return o.abortExecutionUnavailable(o.tree.RootID, vr)
+	}
 	if vr.OK {
 		o.log.Okf("goal acceptance passed")
 		return o.markAcceptancePassed()

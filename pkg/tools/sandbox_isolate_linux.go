@@ -19,7 +19,7 @@ import (
 func isolateShellCommand(ctx context.Context, root, command string, env []string) (*exec.Cmd, error) {
 	bwrap, err := exec.LookPath("bwrap")
 	if err != nil {
-		return nil, fmt.Errorf("run_bash requires filesystem isolation (bubblewrap); bwrap is not available and the command was not executed")
+		return nil, fmt.Errorf("%w: run_bash requires filesystem isolation (bubblewrap); bwrap is not available and the command was not executed", ErrExecutionUnavailable)
 	}
 	abs, err := filepath.Abs(root)
 	if err != nil {

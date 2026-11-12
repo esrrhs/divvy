@@ -163,6 +163,9 @@ func (o *Orchestrator) RunSolo(ctx context.Context) (runErr error) {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		if uerr := vr.UnavailableErr(); uerr != nil {
+			return o.abortExecutionUnavailable(root.ID, vr)
+		}
 		if vr.OK {
 			if s.auditDue() {
 				// Acceptance commands are a floor. A measured run passed all of
