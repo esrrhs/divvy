@@ -1009,10 +1009,7 @@ func (s *Server) rollbackPendingForWorkdir(workdir string) (string, bool) {
 	if s == nil || strings.TrimSpace(workdir) == "" {
 		return "", false
 	}
-	abs, err := filepath.Abs(workdir)
-	if err != nil {
-		abs = workdir
-	}
+	abs := canonicalPath(workdir)
 	list, unreadables, err := inspectRollbackJournals(s.dataDir)
 	if err != nil {
 		return journalUnreadableMessage(err.Error()), true
@@ -1024,11 +1021,7 @@ func (s *Server) rollbackPendingForWorkdir(workdir string) (string, bool) {
 		if j == nil || !journalIsPending(j) && j.Phase != rollbackPhaseDone {
 			continue
 		}
-		jw, jerr := filepath.Abs(j.WorkDir)
-		if jerr != nil {
-			jw = j.WorkDir
-		}
-		if filepath.Clean(jw) != filepath.Clean(abs) {
+		if canonicalPath(j.WorkDir) != abs {
 			continue
 		}
 		if j.Phase == rollbackPhaseDone {

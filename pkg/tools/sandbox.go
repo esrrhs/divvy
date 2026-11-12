@@ -5,6 +5,7 @@ import (
 
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -22,6 +23,13 @@ const (
 	defaultMaxList       = 120
 	defaultMaxOutput     = 24 * 1024
 )
+
+// ErrExecutionUnavailable marks a failure caused by the host lacking the
+// isolation primitives run_bash needs (bubblewrap/landlock) rather than by
+// the command itself. Callers must treat it as fatal for the run: retrying
+// or re-splitting cannot make bwrap appear, so it must not be counted as a
+// verification failure or fed back to the model as something to repair.
+var ErrExecutionUnavailable = errors.New("command execution unavailable in this environment")
 
 var skipDirNames = map[string]bool{
 	".git":         true,
@@ -138,6 +146,13 @@ func NewSandbox(root string) (*Sandbox, error) {
 	if err := os.MkdirAll(abs, 0755); err != nil {
 		return nil, err
 	}
+	// Canonicalize the root: Resolve returns fully-evaluated paths, so on
+	// platforms where the workspace sits under a symlink (e.g. macOS
+	// /var -> /private/var) a lexical Root would make every Resolve result
+	// look like it escapes the workspace and filepath.Rel would produce
+	// "../../.." for paths inside it. Keeping Root real makes Rel and the
+	// containment checks agree with Resolve.
+	abs = mustRealRoot(abs)
 	return &Sandbox{
 		Root:      abs,
 		Timeout:   60 * time.Second,

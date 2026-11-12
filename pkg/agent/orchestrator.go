@@ -393,7 +393,9 @@ func (o *Orchestrator) Run(ctx context.Context) (runErr error) {
 	// Where does the workspace stand before any leaf runs? Knowing this keeps a
 	// project that was already broken from being blamed on the first wave.
 	if o.waveEnabled() {
-		o.baselineAggregate(ctx)
+		if err := o.baselineAggregate(ctx); err != nil {
+			return err
+		}
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -982,6 +984,9 @@ func (o *Orchestrator) executeLeaf(ctx context.Context, leaf *models.TaskNode) e
 		if ctx.Err() != nil {
 			o.parkInterrupted(leaf.ID)
 			return ctx.Err()
+		}
+		if uerr := vr.UnavailableErr(); uerr != nil {
+			return o.abortExecutionUnavailable(leaf.ID, vr)
 		}
 		if vr.OK {
 			// Layout fail-fast: soft DoD greps can pass against a drifted path

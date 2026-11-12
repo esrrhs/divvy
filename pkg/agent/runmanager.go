@@ -119,6 +119,9 @@ func (m *RunManager) HandleForWorkdir(abs string) *RunHandle {
 	if m == nil || abs == "" {
 		return nil
 	}
+	if resolved, err := canonicalWorkdir(abs); err == nil {
+		abs = resolved
+	}
 	m.mu.Lock()
 	var cands []*RunHandle
 	if sid, ok := m.busy[abs]; ok {
@@ -174,6 +177,24 @@ func (m *RunManager) Forget(sessionID string) error {
 // the orchestrator knowing its minted session id. It is never a valid id.
 const startingReservation = ":starting:"
 
+// canonicalWorkdir makes a workdir comparable across code paths. Sandbox roots
+// are canonical (symlinks fully evaluated), so a configured path that reaches
+// the same directory through a symlink (macOS /var -> /private/var, or a user's
+// symlinked project) must not look like a different workspace.
+func canonicalWorkdir(p string) (string, error) {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", err
+	}
+	if real, err := filepath.EvalSymlinks(abs); err == nil {
+		if realAbs, err := filepath.Abs(real); err == nil {
+			return realAbs, nil
+		}
+		return real, nil
+	}
+	return abs, nil
+}
+
 // Start creates a goal-driven guided run and launches it. The workdir lock is
 // reserved before the orchestrator is built so two concurrent starts can
 // never both win the same workspace.
@@ -181,7 +202,7 @@ func (m *RunManager) Start(cfg Config, client llm.Client, log *Logger) (*RunHand
 	if strings.TrimSpace(cfg.Goal) == "" {
 		return nil, fmt.Errorf("goal is required")
 	}
-	abs, err := filepath.Abs(cfg.WorkDir)
+	abs, err := canonicalWorkdir(cfg.WorkDir)
 	if err != nil {
 		return nil, fmt.Errorf("resolve workdir: %w", err)
 	}
@@ -223,13 +244,13 @@ func (m *RunManager) Resume(cfg Config, client llm.Client, log *Logger) (*RunHan
 		return nil, err
 	}
 	scrubToolSecrets(o)
-	abs, err := filepath.Abs(o.sandbox.Root)
+	abs, err := canonicalWorkdir(o.sandbox.Root)
 	if err != nil {
 		o.Close() // P2-1: Load already opened the event file
 		return nil, fmt.Errorf("resolve workdir: %w", err)
 	}
 	if wd := strings.TrimSpace(cfg.WorkDir); wd != "" && wd != "." {
-		if configured, ferr := filepath.Abs(wd); ferr == nil && configured != abs {
+		if configured, ferr := canonicalWorkdir(wd); ferr == nil && configured != abs {
 			o.Close()
 			return nil, fmt.Errorf("configured workdir %s does not match saved session workdir %s", configured, abs)
 		}
@@ -315,7 +336,7 @@ func (m *RunManager) beginWorkdirWrite(abs, owner string, exclusive bool) (func(
 	if abs == "" {
 		return nil, fmt.Errorf("workdir write lease requires a path")
 	}
-	abs, err := filepath.Abs(abs)
+	abs, err := canonicalWorkdir(abs)
 	if err != nil {
 		return nil, err
 	}
@@ -369,7 +390,7 @@ func (m *RunManager) WorkdirBusy(abs string) (string, bool) {
 	if m == nil || abs == "" {
 		return "", false
 	}
-	if resolved, err := filepath.Abs(abs); err == nil {
+	if resolved, err := canonicalWorkdir(abs); err == nil {
 		abs = resolved
 	}
 	m.mu.Lock()

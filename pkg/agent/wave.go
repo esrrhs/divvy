@@ -221,12 +221,13 @@ func (o *Orchestrator) hasSources(proj tools.ProjectType) bool {
 
 // baselineAggregate records where the workspace stood before any leaf ran, so a
 // project that was already broken is not blamed on the first wave. It is a
-// no-op when there is nothing to check yet.
-func (o *Orchestrator) baselineAggregate(ctx context.Context) {
+// no-op when there is nothing to check yet. A host that cannot execute
+// commands at all is fatal rather than a "pre-existing failure".
+func (o *Orchestrator) baselineAggregate(ctx context.Context) error {
 	cmds := o.aggregateCommands()
 	if len(cmds) == 0 {
 		o.log.Debugf("wave aggregate: nothing to check yet")
-		return
+		return nil
 	}
 	// A baseline is only meaningful for a project that already exists. In a
 	// greenfield workspace the aggregate fails by definition — there is nothing
@@ -236,18 +237,21 @@ func (o *Orchestrator) baselineAggregate(ctx context.Context) {
 	// -aggregate gets no baseline until the workspace has code of its own.
 	if !o.hasSources(o.projectType()) {
 		o.log.Debugf("wave aggregate baseline: no sources yet, so the run owns the result")
-		return
+		return nil
 	}
 	node := &models.TaskNode{ID: waveAggregateNodeID, DoD: models.DoD{
 		Commands: cmds, TimeoutSec: waveAggregateTimeout,
 	}}
 	vr := o.verify(ctx, o.sandbox, node)
 	if ctx.Err() != nil {
-		return
+		return ctx.Err()
+	}
+	if uerr := vr.UnavailableErr(); uerr != nil {
+		return o.abortExecutionUnavailable("", vr)
 	}
 	if vr.OK {
 		o.log.Infof("wave aggregate baseline: the untouched workspace already builds and tests clean")
-		return
+		return nil
 	}
 	// Remember how it was broken. A wave that reproduces the same failure did
 	// not cause it, and queueing a repair leaf for pre-existing breakage would
@@ -258,6 +262,7 @@ func (o *Orchestrator) baselineAggregate(ctx context.Context) {
 	o.events.Record("wave_baseline", "", map[string]any{
 		"ok": false, "command": vr.Command, "output": clip(vr.Output, evReasonChars),
 	})
+	return nil
 }
 
 // runWaveAggregate checks that the workspace still builds and tests after the
@@ -289,6 +294,9 @@ func (o *Orchestrator) runWaveAggregate(ctx context.Context) error {
 	vr := o.verify(ctx, o.sandbox, node)
 	if ctx.Err() != nil {
 		return ctx.Err()
+	}
+	if uerr := vr.UnavailableErr(); uerr != nil {
+		return o.abortExecutionUnavailable("", vr)
 	}
 	if vr.OK {
 		o.wave.fails = 0

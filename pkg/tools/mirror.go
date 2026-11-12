@@ -70,6 +70,10 @@ func NewMirror(src string) (*Mirror, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create mirror dir: %w", err)
 	}
+	// Sandbox roots are canonical, so keep the mirror path canonical too;
+	// otherwise a temp dir under a symlink (macOS /var) makes the sandbox
+	// root and Mirror.Dir compare unequal and Rel disagree with Resolve.
+	dir = mustRealRoot(dir)
 	if repoReadyForWorktree(src) {
 		m, werr := newWorktreeMirror(src, dir)
 		if werr != nil {
@@ -116,6 +120,7 @@ func NewMirrorAt(src, dir string) (*Mirror, error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("create mirror dir: %w", err)
 	}
+	dir = mustRealRoot(dir)
 	if repoReadyForWorktree(src) {
 		m, werr := newWorktreeMirror(src, dir)
 		if werr != nil {

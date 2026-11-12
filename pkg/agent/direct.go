@@ -26,6 +26,13 @@ const (
 	directDefaultContextChars = 100_000
 	directMapMaxEntries       = 80
 	directMapMaxDepth         = 3
+	// directRepeatLimit is how many identical tool calls in a row count as a
+	// loop. Two would fire on a legitimate read-then-verify pair; four wastes
+	// a step on something already unmistakable.
+	directRepeatLimit = 3
+	// directRepeatNags caps how many times one turn interrupts a repeated-call
+	// loop. The step budget still bounds the turn after that.
+	directRepeatNags = 2
 )
 
 // directMarker is the leading sentence of the direct-mode system prompt so
@@ -52,6 +59,18 @@ type DirectAgent struct {
 	st  *directState
 	sb  *tools.Sandbox
 	mir *tools.Mirror
+
+	// invalidRounds counts consecutive empty/unparseable model replies so a
+	// weak model cannot burn the whole per-turn step budget on
+	// "please reply with JSON" retries. Reset as soon as an action parses.
+	invalidRounds int
+	// repeatKey / repeatCount / repeatNags catch the other loop shape: the
+	// exact same tool call repeated with identical arguments (observed as ten
+	// identical read_file calls), which never fails and so never trips a
+	// failure-based guard.
+	repeatKey   string
+	repeatCount int
+	repeatNags  int
 }
 
 func NewDirect(o *Orchestrator, ctl DirectControl) *DirectAgent {
@@ -545,13 +564,19 @@ func (d *DirectAgent) loop(ctx context.Context) error {
 			continue
 		}
 		if len(actions) == 0 {
+			d.invalidRounds++
 			d.st.Messages = append(d.st.Messages,
 				llm.Message{Role: llm.RoleAssistant, Content: resp.Content},
-				llm.Message{Role: llm.RoleUser, Content: invalidJSONRetryPrompt(1)},
+				llm.Message{Role: llm.RoleUser, Content: invalidJSONRetryPrompt(d.invalidRounds)},
 			)
+			if d.invalidRounds >= maxInvalidJSONRounds {
+				return d.stop(fmt.Errorf("%w: %d consecutive empty/invalid JSON replies (refusing to burn the remaining step budget)",
+					ErrInvalidJSON, d.invalidRounds))
+			}
 			_ = d.persist()
 			continue
 		}
+		d.invalidRounds = 0
 
 		d.st.Messages = append(d.st.Messages, llm.Message{
 			Role: llm.RoleAssistant, Content: resp.Content, ToolCalls: resp.ToolCalls,
@@ -585,6 +610,16 @@ func (d *DirectAgent) applyActions(ctx context.Context, nodeID string, actions [
 	for i, act := range actions {
 		d.o.log.Actionf("direct %s %s", act.Name, previewArgs(act))
 		if act.Name == tools.ToolFinish {
+			// Deterministic pre-finish review, the same gate worker/solo
+			// apply: unresolved conflict markers and hard-coded secrets must
+			// not be accepted as a successful turn. Warnings (debug prints,
+			// large diffs) are logged but do not block.
+			if blocked, ok := d.finishGate(ctx); !ok {
+				d.appendToolOutcome(act, blocked)
+				d.skipRemaining(actions[i+1:], "Not executed: the run did not finish; finish was rejected by the review gate.")
+				_ = d.persist()
+				return false, "", nil
+			}
 			summary, _ = stringFromArgs(act.Args, "summary")
 			if summary == "" {
 				summary = strings.TrimSpace(act.Thought)
@@ -682,8 +717,84 @@ func (d *DirectAgent) applyActions(ctx context.Context, nodeID string, actions [
 			_ = d.persist()
 			return false, "", nil
 		}
+		if msg, looped := d.trackRepeatCall(act); looped {
+			d.st.Messages = append(d.st.Messages, llm.Message{Role: llm.RoleUser, Content: msg})
+			_ = d.persist()
+		}
 	}
 	return false, "", nil
+}
+
+// trackRepeatCall interrupts a loop of identical tool calls. The call is still
+// executed (it may be a read whose result was already useful), but the model is
+// told that repeating it cannot change anything and must change its next action.
+// Nags are capped so the intervention itself does not become the loop.
+func (d *DirectAgent) trackRepeatCall(act taggedAction) (string, bool) {
+	if d.repeatNags >= directRepeatNags {
+		return "", false
+	}
+	// json.Marshal sorts map keys, so two equal argument maps produce the same
+	// string; fmt's %v on a map would too, but not by contract.
+	args, err := json.Marshal(act.Args)
+	if err != nil {
+		return "", false
+	}
+	key := act.Name + "\x00" + string(args)
+	if key == d.repeatKey {
+		d.repeatCount++
+	} else {
+		d.repeatKey, d.repeatCount = key, 1
+	}
+	if d.repeatCount < directRepeatLimit {
+		return "", false
+	}
+	d.repeatKey, d.repeatCount = "", 0
+	d.repeatNags++
+	d.o.log.Warnf("direct: %s called %d times with identical arguments; interrupting", act.Name, directRepeatLimit)
+	d.o.events.Record("direct_repeat_call", d.o.tree.RootID, map[string]any{
+		"tool":  act.Name,
+		"count": directRepeatLimit,
+	})
+	return directRepeatCallIntervention(act.Name, string(args), directRepeatLimit), true
+}
+
+func directRepeatCallIntervention(name, args string, n int) string {
+	return fmt.Sprintf(`You have now called %s with identical arguments %d times in a row: %s
+
+Repeating the call cannot produce a different result. Pick one:
+- You already have what you asked for — use it. Make the edit with replace_lines or write_file, or decide the file needs no change and move on.
+- The result did not tell you what you needed — change the call: another path, a narrower range, or a search for the specific symbol instead of reading the whole file.
+- You are checking whether something exists — search for it; do not re-read the file to find out.
+
+Your next action must change the workspace or advance the goal.`, name, n, clip(args, 400))
+}
+
+// finishGate is the deterministic pre-finish review over the current workspace
+// (or the isolated mirror in manual-approval mode). It returns the message the
+// model must see before trying again when the gate blocks. Review plumbing
+// errors fail open: a broken checker must not trap a finished turn.
+func (d *DirectAgent) finishGate(ctx context.Context) (string, bool) {
+	gate, err := d.toolSandbox().PreFinishGate(ctx)
+	if err != nil {
+		d.o.log.Debugf("pre-finish review unavailable: %v", err)
+		return "", true
+	}
+	if gate == nil {
+		return "", true
+	}
+	d.o.events.Record("finish_gate", d.o.tree.RootID, map[string]any{
+		"blocking": gate.Blocking,
+		"report":   clip(gate.Report, evReasonChars),
+	})
+	if !gate.Blocking {
+		d.o.log.Warnf("direct pre-finish warnings:\n%s", gate.Report)
+		return "", true
+	}
+	d.o.log.Warnf("direct finish rejected by review gate")
+	return "finish REJECTED by review_diff. Fix these blocking issue(s) before finishing " +
+		"(unresolved conflict markers and hard-coded secrets are never accepted):\n" +
+		gate.Report +
+		"\nFix the code, then call finish again. Debug-print and large-diff items are warnings only, but conflict/secret items must be removed.", false
 }
 
 func (d *DirectAgent) drainInject(ctx context.Context) error {
