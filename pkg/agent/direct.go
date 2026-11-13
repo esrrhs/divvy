@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/esrrhs/divvy/pkg/llm"
+	"github.com/esrrhs/divvy/pkg/mcp"
 	"github.com/esrrhs/divvy/pkg/models"
 	"github.com/esrrhs/divvy/pkg/tools"
 )
@@ -92,6 +93,8 @@ type DirectAgent struct {
 	// systemGuide is the per-turn base system prompt; the live plan is
 	// appended before each request so it survives context trimming.
 	systemGuide string
+	// mcp holds this turn's stdio MCP servers and their tool index.
+	mcp *mcp.Runtime
 }
 
 func NewDirect(o *Orchestrator, ctl DirectControl) *DirectAgent {
@@ -369,6 +372,11 @@ func (d *DirectAgent) Run(ctx context.Context) (runErr error) {
 		d.closeMirror()
 	}()
 
+	// Start MCP after isolation so external tools run against the mirror in
+	// manual approval mode, and close them however the turn exits.
+	d.setupMCP(ctx)
+	defer d.closeMCP()
+
 	return d.loop(ctx)
 }
 
@@ -467,9 +475,10 @@ func (d *DirectAgent) loop(ctx context.Context) error {
 	if d.o.cfg.NativeTools {
 		native = nativeToolDefs(d.toolSandbox())
 		native = append(native, directPlanNativeTool())
+		native = append(native, d.mcpToolDefs()...)
 	}
 	// Cache the base prompt once per turn; the plan block changes every step.
-	d.systemGuide = directSystemGuide(d.toolSandbox(), d.o.cfg.DataDir)
+	d.systemGuide = directSystemGuide(d.toolSandbox(), d.o.cfg.DataDir) + d.mcpGuide()
 
 	if d.st.PendingApproval {
 		if err := d.reviewAndMaybeMerge(ctx, d.st.Summary); err != nil {
@@ -699,6 +708,58 @@ func (d *DirectAgent) applyActions(ctx context.Context, nodeID string, actions [
 			}
 			d.appendToolOutcome(act, out)
 			_ = d.persist()
+			continue
+		}
+
+		// MCP tools live in external processes, not the filesystem sandbox.
+		// Run them through the same bookkeeping as built-in tools so pause,
+		// events, repeat detection and failure skipping stay consistent.
+		if d.mcp != nil && d.mcp.HasTool(act.Name) {
+			d.st.InFlight = &directInFlight{ID: act.ID, Name: act.Name, Args: act.Args, StartedUnix: time.Now().Unix()}
+			if err := d.persist(); err != nil {
+				return false, "", err
+			}
+			d.o.events.Record("tool_start", nodeID, map[string]any{
+				"tool": act.Name,
+				"args": clip(previewArgs(act), evReasonChars),
+			})
+			if d.ctl != nil {
+				d.ctl.SetInTool(true)
+			}
+			callStart := time.Now()
+			out, callErr := d.mcp.Call(ctx, act.Name, act.Args)
+			if d.ctl != nil {
+				d.ctl.SetInTool(false)
+			}
+			d.o.events.ToolCall(nodeID, act.Name, act.Args, out, callErr, callStart)
+			if callErr != nil {
+				out = "ERROR: " + callErr.Error()
+				d.o.log.Warnf("%s", out)
+			}
+			d.st.InFlight = nil
+			d.appendToolOutcome(act, out)
+			if err := d.persist(); err != nil {
+				return false, "", err
+			}
+			if d.pauseRequested() {
+				d.st.PendingActions = append([]taggedAction(nil), actions[i+1:]...)
+				_ = d.persist()
+				return false, "", ErrPaused
+			}
+			if err := ctx.Err(); err != nil {
+				d.skipRemaining(actions[i+1:], "Not executed: the run was canceled before this tool started. Do not assume it ran.")
+				_ = d.persist()
+				return false, "", err
+			}
+			if toolOutcomeFailed(act.Name, out, callErr) {
+				d.skipRemaining(actions[i+1:], "Not executed: an earlier MCP tool in the same model reply failed. Inspect that result before continuing; do not assume this tool ran.")
+				_ = d.persist()
+				return false, "", nil
+			}
+			if msg, looped := d.trackRepeatCall(act); looped {
+				d.st.Messages = append(d.st.Messages, llm.Message{Role: llm.RoleUser, Content: msg})
+				_ = d.persist()
+			}
 			continue
 		}
 

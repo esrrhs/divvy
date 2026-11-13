@@ -318,6 +318,27 @@ direct / worker / solo 的开场提示里，除了目录清单，还会附一段
 - 目录清单说明「有哪些文件」，声明索引说明「哪些定义在项目里被依赖」，让模型先读对文件，少走几步搜索
 - 这是静态索引，不是语义检索：具体内容仍要靠 `read_file` / `search_files` / `find_symbol`
 
+### MCP 工具（stdio）
+
+直接模式可以接入 [MCP](https://modelcontextprotocol.io) 服务器：在数据目录放 `mcp.json`，或在项目里放 `.divvy/mcp.json`（同名服务器以项目配置为准）。配置格式与常见 agent 的 `mcpServers` 块一致：
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]},
+    "internal": {"command": "./tools/mcp-server", "env": {"TOKEN": "..."}}
+  }
+}
+```
+
+- 服务器通过 stdio 启动，工具以 `mcp__<server>__<tool>` 暴露；native tool calling 与 JSON 动作模式都可用
+- 参数 schema 直接来自服务器的 `tools/list`，字符串/对象等类型原样传给模型
+- 多个服务器分区失败互不影响：某个服务器启动或初始化失败只记警告，其余工具照常可用；配置语法错误同样不会阻塞本轮
+- 工具输出按文本展开（图片/资源以占位说明），单次最多 64KiB；初始化 20s、单次调用 3min 超时
+- 服务器工作目录是当前工作区；手动审批模式下是隔离副本，批准前不会碰真实项目
+- 需要显式配置才会启动，不配置就没有额外进程；`"disabled": true` 可临时停用单个服务器
+- 这是直接模式的能力；任务树的叶子仍只使用内置工具
+
 ### 桌面应用（Tauri，macOS / Linux / Windows）
 
 `desktop/` 是 Tauri v2 外壳：启动时按平台定位并拉起内置的 `divvy -serve` sidecar（externalBin），解析其启动日志里的随机端口与一次性 token，再把 WebView 指向 sidecar（发布模式）或 Vite（开发模式，`/api` 代理到 sidecar）。数据与默认工作区放在平台应用数据目录（macOS：`~/Library/Application Support/com.divvy.desktop/`；Linux：`~/.local/share/com.divvy.desktop/`；Windows：`%APPDATA%\com.divvy.desktop`）。
