@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -74,7 +75,11 @@ func TestLoadConfigMissingAndMalformed(t *testing.T) {
 
 func buildHelper(t *testing.T) string {
 	t.Helper()
-	out := filepath.Join(t.TempDir(), "mcphelper")
+	name := "mcphelper"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	out := filepath.Join(t.TempDir(), name)
 	cmd := exec.Command("go", "build", "-o", out, "./testdata/mcphelper")
 	cmd.Dir = "."
 	if data, err := cmd.CombinedOutput(); err != nil {
