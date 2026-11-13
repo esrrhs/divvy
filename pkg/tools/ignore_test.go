@@ -45,9 +45,9 @@ func TestSearchRespectsGitignore(t *testing.T) {
 	root := t.TempDir()
 	runGitTest(t, root, "init", "-q")
 	writeTestFile(t, root, ".gitignore", "secret/\n*.log\n!keep.log\n")
-	writeTestFile(t, root, "app.go", "package app // needle\n")
+	writeTestFile(t, root, "app.go", "package app // needle\n\nfunc NeedleFunc() {}\n")
 	writeTestFile(t, root, "notes.txt", "needle here\n")
-	writeTestFile(t, root, "secret/hidden.go", "package secret // needle\n")
+	writeTestFile(t, root, "secret/hidden.go", "package secret // needle\n\nfunc NeedleFunc() {}\n")
 	writeTestFile(t, root, "debug.log", "needle in a log\n")
 	writeTestFile(t, root, "keep.log", "needle in a kept log\n")
 
@@ -76,6 +76,26 @@ func TestSearchRespectsGitignore(t *testing.T) {
 	}
 	if !strings.Contains(found, "app.go") || strings.Contains(found, "secret/hidden.go") {
 		t.Fatalf("find_files must apply the same ignore rules:\n%s", found)
+	}
+
+	sym, err := sb.FindSymbol(t.Context(), "NeedleFunc", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(sym, "app.go") || strings.Contains(sym, "secret/hidden.go") {
+		t.Fatalf("find_symbol must apply the same ignore rules:\n%s", sym)
+	}
+
+	snap := sb.Snapshot()
+	if !strings.Contains(snap, "app.go") || strings.Contains(snap, "secret/") || strings.Contains(snap, "debug.log") {
+		t.Fatalf("prompt snapshot must hide ignored paths:\n%s", snap)
+	}
+	listed, err := sb.ListDir(".", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(listed, "secret/hidden.go") {
+		t.Fatalf("explicit list_dir should still show ignored files:\n%s", listed)
 	}
 
 	// Explicit reads still work: ignore rules are for retrieval, not access.

@@ -116,7 +116,7 @@ export OPENAI_MODEL=qwen2.5-coder:14b
 叶子执行**不携带**其它叶子的对话历史，只注入：当前任务、契约、父节点/依赖摘要、少量相关文件、验收命令。
 `search_files` 用正则搜索文件内容并返回紧凑的 `相对路径:行号:匹配行`：修改现有代码时，弱模型用它一次定位符号，不必逐个读整个文件，省步骤也省上下文（自动跳过 `.git` 等目录，可用 `glob` 过滤，默认忽略大小写）。`find_files` 则按文件名 glob 查找（`*_test.go` 裸模式按 basename 递归匹配任意深度，`pkg/*.go` 按相对路径匹配），返回路径列表。
 
-两者和直接模式的项目地图都尊重仓库的 git ignore 规则（根/嵌套 `.gitignore`、negation、`.git/info/exclude`）：构建产物、日志和本地私有目录不会淹没检索结果。`read_file` / `list_dir` 不过滤，仍可显式查看被忽略的文件。
+两者和直接模式的项目地图都尊重仓库的 git ignore 规则（根/嵌套 `.gitignore`、negation、`.git/info/exclude`）：构建产物、日志和本地私有目录不会淹没检索结果；`find_symbol` 的定义扫描、注入提示的 workspace 清单也同样过滤。`read_file` / `list_dir` 不过滤，仍可显式查看被忽略的文件。
 `read_file` 支持可选的 `start_line`/`end_line`（1-indexed、含端点，返回带行号的片段）：配合 `search_files` 的行号只读目标区段，大文件也能直接跳到 64KB 整读截断点之后，无需在 shell 里拼 `sed`。也支持 `{"paths":["a.go","b.go"]}` **一次批量读最多 8 个文件**（各自独立套 64KB 上限，带 `### path` 分隔头）——弱模型每轮只能调一个工具，批量读把"看 N 个相关文件"从 N 次 LLM 往返压成 1 次；任一路径不存在则整批失败，不会返回半截结果。`run_bash` 支持 `timeout_sec`（默认 60s），跑 `npm install`、`cargo build` 这类慢命令时显式放大超时。
 `replace_lines` 除行号区间和单点 `old_string`/`new_string` 外，还接受 `edits: [{old_string,new_string}…]` **批量原子编辑**：所有锚点先在内存里逐条校验（缺失或不唯一即整体失败、文件一字节都不改），全部通过后才一次写回——同一文件改多处不必串行多轮，也不会留下半改状态，用文本锚点还能避开行号漂移。`delete_path`（删目录必须显式 `recursive:true`，工作区根目录受保护）和 `move_path`（工作区内重命名/移动，禁止移入自身子树）让删除和重命名走沙箱校验，不用再借 `run_bash` 拼 `rm`/`mv`。
 验收失败时，Verifier 会按已探测的技术栈从输出里抽取去重、单行截断的根因诊断（最多 25 行）作为**诊断块前置**到错误全文之前；重试叶子只截取错误前缀注入上下文（4000 字符），根因因此一定在最显眼的位置，原始日志完整附在块后。目前覆盖：Go（`x.go:4:2: undefined:`、`--- FAIL`、`panic`）、Python（traceback 的 `File "x", line N`、`XError:`、pytest 的 `E` 行与 `FAILED`）、Rust（`error[E0xxx]:`、`--> file:line:col`、`panicked at`）、Node/TypeScript（tsc 的 `x.ts(10,5): error TS…`、Node 的源码位置行与 `ReferenceError:` 等异常头；刻意不收冗长的 `at …` 栈帧）。
