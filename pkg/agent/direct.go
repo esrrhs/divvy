@@ -984,6 +984,10 @@ func (d *DirectAgent) openingPrompt() string {
 		b.WriteString("\n\nShallow project map (a bounded file listing, not a semantic index — use read_file, search_files, or find_files for real contents):\n")
 		b.WriteString(m)
 	}
+	if st := directWorkspaceStatus(d.o.sandbox.Root); st != "" {
+		b.WriteString("\n\n")
+		b.WriteString(st)
+	}
 	b.WriteString("\n\nRead and search the project as needed, make the change, run real verification, and repair from the tool output. Call finish with a concise summary of what you actually did; that summary is shown to the user as your reply.")
 	return b.String()
 }
@@ -996,6 +1000,10 @@ func (d *DirectAgent) followUpPrompt() string {
 	if m := directProjectMap(d.o.sandbox, directMapMaxEntries, directMapMaxDepth); m != "" {
 		b.WriteString("\n\nCurrent shallow project map (bounded listing, not a semantic index):\n")
 		b.WriteString(m)
+	}
+	if st := directWorkspaceStatus(d.o.sandbox.Root); st != "" {
+		b.WriteString("\n\n")
+		b.WriteString(st)
 	}
 	return b.String()
 }
