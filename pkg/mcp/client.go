@@ -2,12 +2,14 @@ package mcp
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"sort"
@@ -46,13 +48,19 @@ type toolRef struct {
 
 type server struct {
 	name string
-	cmd  *exec.Cmd
-	in   io.WriteCloser
-	out  *bufio.Reader
-	err  *limitedBuffer
+	// cmd/in/out are set for stdio servers; url/http/headers for remote ones.
+	cmd        *exec.Cmd
+	in         io.WriteCloser
+	out        *bufio.Reader
+	err        *limitedBuffer
+	url        string
+	httpClient *http.Client
+	headers    map[string]string
+	sessionID  string
 
 	wmu     sync.Mutex
 	mu      sync.Mutex
+	sessMu  sync.Mutex
 	nextID  int64
 	pending map[int64]chan rpcMessage
 	done    chan struct{}
@@ -148,6 +156,9 @@ func Start(ctx context.Context, cfg map[string]ServerConfig, workdir string, log
 }
 
 func startServer(ctx context.Context, name string, cfg ServerConfig, workdir string) (*server, error) {
+	if strings.TrimSpace(cfg.URL) != "" {
+		return startRemote(name, cfg), nil
+	}
 	cmd := exec.CommandContext(ctx, cfg.Command, cfg.Args...)
 	if workdir != "" {
 		cmd.Dir = workdir
@@ -182,6 +193,21 @@ func startServer(ctx context.Context, name string, cfg ServerConfig, workdir str
 	return s, nil
 }
 
+func startRemote(name string, cfg ServerConfig) *server {
+	headers := make(map[string]string, len(cfg.Headers))
+	for k, v := range cfg.Headers {
+		headers[k] = v
+	}
+	return &server{
+		name:       name,
+		url:        strings.TrimSpace(cfg.URL),
+		httpClient: &http.Client{Timeout: callTimeout},
+		headers:    headers,
+		pending:    map[int64]chan rpcMessage{},
+		done:       make(chan struct{}),
+	}
+}
+
 func (s *server) initialize(ctx context.Context) error {
 	initCtx, cancel := context.WithTimeout(ctx, initTimeout)
 	defer cancel()
@@ -200,6 +226,9 @@ func (s *server) initialize(ctx context.Context) error {
 }
 
 func (s *server) request(ctx context.Context, method string, params any) (json.RawMessage, error) {
+	if s.url != "" {
+		return s.httpRequest(ctx, method, params)
+	}
 	id := s.nextRequestID()
 	ch := make(chan rpcMessage, 1)
 	s.mu.Lock()
@@ -229,6 +258,14 @@ func (s *server) request(ctx context.Context, method string, params any) (json.R
 }
 
 func (s *server) notify(method string, params any) error {
+	if s.url != "" {
+		// Notifications are fire-and-forget; still bound them so a dead
+		// endpoint cannot hold the turn open.
+		ctx, cancel := context.WithTimeout(context.Background(), initTimeout)
+		defer cancel()
+		_, err := s.httpPost(ctx, map[string]any{"jsonrpc": "2.0", "method": method, "params": params}, 0)
+		return err
+	}
 	return s.write(map[string]any{"jsonrpc": "2.0", "method": method, "params": params})
 }
 
@@ -333,6 +370,9 @@ func (s *server) stderrTail() string {
 // Close speaks the stdio shutdown convention (close stdin) and then kills a
 // server that did not exit promptly. MCP has no required shutdown request.
 func (s *server) Close() {
+	if s.url != "" {
+		return
+	}
 	s.once.Do(func() {
 		_ = s.in.Close()
 		waited := make(chan struct{})
@@ -349,6 +389,129 @@ func (s *server) Close() {
 			<-waited
 		}
 	})
+}
+
+// httpRequest performs one JSON-RPC request over Streamable HTTP. It accepts
+// either a single JSON response or an SSE stream; unrelated notifications are
+// skipped until the matching response id arrives.
+func (s *server) httpRequest(ctx context.Context, method string, params any) (json.RawMessage, error) {
+	id := s.nextRequestID()
+	raw, err := s.httpPost(ctx, map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "params": params}, id)
+	if err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
+func (s *server) httpPost(ctx context.Context, msg map[string]any, wantID int64) (json.RawMessage, error) {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.url, bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("MCP-Protocol-Version", "2024-11-05")
+	for k, v := range s.headers {
+		req.Header.Set(k, v)
+	}
+	s.sessMu.Lock()
+	session := s.sessionID
+	s.sessMu.Unlock()
+	if session != "" {
+		req.Header.Set("Mcp-Session-Id", session)
+	}
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("mcp http %s: %w", s.name, err)
+	}
+	defer resp.Body.Close()
+	if sid := strings.TrimSpace(resp.Header.Get("Mcp-Session-Id")); sid != "" {
+		s.sessMu.Lock()
+		s.sessionID = sid
+		s.sessMu.Unlock()
+	}
+	if resp.StatusCode == http.StatusAccepted {
+		return nil, nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return nil, fmt.Errorf("mcp http %s: status %d: %s", s.name, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	if wantID == 0 {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxReadBytes))
+		return nil, nil
+	}
+	if strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
+		return readSSE(resp.Body, wantID)
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxReadBytes))
+	if err != nil {
+		return nil, err
+	}
+	var rpc rpcMessage
+	if err := json.Unmarshal(raw, &rpc); err != nil {
+		return nil, fmt.Errorf("decode MCP response: %w", err)
+	}
+	if rpc.Error != nil {
+		return nil, fmt.Errorf("MCP error: %s", rpc.Error.Message)
+	}
+	if len(rpc.Result) == 0 {
+		return nil, fmt.Errorf("MCP response has no result")
+	}
+	return rpc.Result, nil
+}
+
+func readSSE(r io.Reader, wantID int64) (json.RawMessage, error) {
+	reader := bufio.NewReaderSize(r, 64<<10)
+	var data strings.Builder
+	flush := func() (json.RawMessage, bool) {
+		payload := strings.TrimSpace(data.String())
+		data.Reset()
+		if payload == "" {
+			return nil, false
+		}
+		var msg rpcMessage
+		if err := json.Unmarshal([]byte(payload), &msg); err != nil {
+			return nil, false
+		}
+		if len(msg.ID) == 0 {
+			return nil, false
+		}
+		id, err := strconv.ParseInt(strings.Trim(string(msg.ID), `"`), 10, 64)
+		if err != nil || id != wantID {
+			return nil, false
+		}
+		if msg.Error != nil {
+			return json.RawMessage(`{"error":"` + msg.Error.Message + `"}`), true
+		}
+		return msg.Result, true
+	}
+	for {
+		line, err := reader.ReadString('\n')
+		trimmed := strings.TrimRight(line, "\r\n")
+		switch {
+		case trimmed == "":
+			if result, ok := flush(); ok {
+				return result, nil
+			}
+		case strings.HasPrefix(trimmed, "data:"):
+			data.WriteString(strings.TrimSpace(strings.TrimPrefix(trimmed, "data:")))
+			data.WriteByte('\n')
+		}
+		if err != nil {
+			if result, ok := flush(); ok {
+				return result, nil
+			}
+			if errors.Is(err, io.EOF) {
+				return nil, fmt.Errorf("MCP SSE stream ended before the response")
+			}
+			return nil, err
+		}
+	}
 }
 
 func (rt *Runtime) indexServer(ctx context.Context, s *server) error {

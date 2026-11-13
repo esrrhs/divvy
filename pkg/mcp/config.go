@@ -13,9 +13,13 @@ import (
 // the `mcpServers` block other coding agents use, so an existing configuration
 // can be copied into `mcp.json` without rewriting.
 type ServerConfig struct {
-	Command  string            `json:"command"`
+	// Command/Args start a local stdio server; URL talks to a remote
+	// Streamable-HTTP MCP endpoint. Exactly one transport is required.
+	Command  string            `json:"command,omitempty"`
 	Args     []string          `json:"args,omitempty"`
 	Env      map[string]string `json:"env,omitempty"`
+	URL      string            `json:"url,omitempty"`
+	Headers  map[string]string `json:"headers,omitempty"`
 	Disabled bool              `json:"disabled,omitempty"`
 }
 
@@ -66,8 +70,10 @@ func LoadConfig(dataDir, workspace string) (map[string]ServerConfig, error) {
 			delete(out, name)
 			continue
 		}
-		if strings.TrimSpace(cfg.Command) == "" {
-			return out, fmt.Errorf("mcp server %q has no command", name)
+		hasCommand := strings.TrimSpace(cfg.Command) != ""
+		hasURL := strings.TrimSpace(cfg.URL) != ""
+		if hasCommand == hasURL {
+			return out, fmt.Errorf("mcp server %q must set exactly one of command or url", name)
 		}
 	}
 	return out, nil

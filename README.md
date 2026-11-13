@@ -326,17 +326,20 @@ direct / worker / solo 的开场提示里，除了目录清单，还会附一段
 {
   "mcpServers": {
     "filesystem": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]},
-    "internal": {"command": "./tools/mcp-server", "env": {"TOKEN": "..."}}
+    "internal": {"command": "./tools/mcp-server", "env": {"TOKEN": "..."}},
+    "remote": {"url": "https://mcp.example.com/mcp", "headers": {"Authorization": "Bearer ..."}}
   }
 }
 ```
 
-- 服务器通过 stdio 启动，工具以 `mcp__<server>__<tool>` 暴露；native tool calling 与 JSON 动作模式都可用
+- 支持本地 stdio（`command` + `args` + `env`）和远程 Streamable HTTP（`url` + `headers`），每个服务器必须二选一
+- 工具以 `mcp__<server>__<tool>` 暴露；native tool calling 与 JSON 动作模式都可用
 - 参数 schema 直接来自服务器的 `tools/list`，字符串/对象等类型原样传给模型
 - 多个服务器分区失败互不影响：某个服务器启动或初始化失败只记警告，其余工具照常可用；配置语法错误同样不会阻塞本轮
 - 工具输出按文本展开（图片/资源以占位说明），单次最多 64KiB；初始化 20s、单次调用 3min 超时
 - 服务器工作目录是当前工作区；手动审批模式下是隔离副本，批准前不会碰真实项目
 - 需要显式配置才会启动，不配置就没有额外进程；`"disabled": true` 可临时停用单个服务器
+- **安全边界**：MCP 服务器是用户显式接入的外部程序/服务，按当前用户权限运行，能访问网络和绝对路径；手动审批只保证内置文件工具和服务器的工作目录指向隔离副本，不能沙箱化一个恶意服务器。只添加可信配置；服务器返回的文本会进入模型上下文
 - 这是直接模式的能力；任务树的叶子仍只使用内置工具
 
 ### 桌面应用（Tauri，macOS / Linux / Windows）
