@@ -309,7 +309,7 @@ func (d *DirectAgent) Run(ctx context.Context) (runErr error) {
 		return err
 	}
 	d.applySandboxPolicy()
-	system := llm.Message{Role: llm.RoleSystem, Content: directSystemGuide(d.o.sandbox)}
+	system := llm.Message{Role: llm.RoleSystem, Content: directSystemGuide(d.o.sandbox, d.o.cfg.DataDir)}
 	switch {
 	case st == nil || len(st.Messages) < 2:
 		st = &directState{Version: 1, Messages: []llm.Message{system, {Role: llm.RoleUser, Content: d.openingPrompt()}}}
@@ -1020,7 +1020,7 @@ func (d *DirectAgent) applyPolicyToSandbox(sb *tools.Sandbox) {
 	}
 }
 
-func directSystemGuide(sb *tools.Sandbox) string {
+func directSystemGuide(sb *tools.Sandbox, dataDir string) string {
 	dyn := ""
 	if sb != nil {
 		dyn = sb.DynamicToolDescriptions()
@@ -1032,7 +1032,7 @@ func directSystemGuide(sb *tools.Sandbox) string {
 	b.WriteString("search_files and find_files are literal regex/glob matching, not a semantic index.\n")
 	b.WriteString("If a user follow-up arrives mid-loop, honor it from the next step; do not restart the whole task from scratch.\n")
 	b.WriteString("When the work for this turn is done, call finish with a concise, factual summary written for the user — that text is your reply. Do not call finish just to narrate a failed check; repair first.\n")
-	b.WriteString(projectRulesBlock(sb))
+	b.WriteString(projectRulesBlock(sb, dataDir))
 	b.WriteString("\n")
 	if sb != nil {
 		b.WriteString(sb.ToolGuide())

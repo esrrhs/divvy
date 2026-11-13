@@ -171,6 +171,10 @@ func (o *Orchestrator) decomposeUserPrompt(node *models.TaskNode) string {
 	}
 	b.WriteString("\nWorkspace snapshot:\n")
 	b.WriteString(o.sandbox.Snapshot())
+	if rules := projectRulesBlock(o.sandbox, o.cfg.DataDir); rules != "" {
+		b.WriteString(rules)
+		b.WriteString("\n")
+	}
 	return b.String()
 }
 
