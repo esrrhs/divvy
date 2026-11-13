@@ -89,6 +89,9 @@ type DirectAgent struct {
 	failKey   string
 	failCount int
 	failNags  int
+	// systemGuide is the per-turn base system prompt; the live plan is
+	// appended before each request so it survives context trimming.
+	systemGuide string
 }
 
 func NewDirect(o *Orchestrator, ctl DirectControl) *DirectAgent {
@@ -321,6 +324,7 @@ func (d *DirectAgent) Run(ctx context.Context) (runErr error) {
 		st.Messages[0] = system
 		st.Done = false
 		st.Summary = ""
+		st.Plan = nil
 		st.InFlight = nil
 		st.Step = 0
 		st.PendingAsk = ""
@@ -462,7 +466,10 @@ func (d *DirectAgent) loop(ctx context.Context) error {
 	var native []llm.Tool
 	if d.o.cfg.NativeTools {
 		native = nativeToolDefs(d.toolSandbox())
+		native = append(native, directPlanNativeTool())
 	}
+	// Cache the base prompt once per turn; the plan block changes every step.
+	d.systemGuide = directSystemGuide(d.toolSandbox(), d.o.cfg.DataDir)
 
 	if d.st.PendingApproval {
 		if err := d.reviewAndMaybeMerge(ctx, d.st.Summary); err != nil {
@@ -504,6 +511,12 @@ func (d *DirectAgent) loop(ctx context.Context) error {
 		d.o.log.Actionf("direct step %d/%d", step, maxSteps)
 		d.o.events.Record("direct_step", nodeID, map[string]any{"step": step, "max": maxSteps})
 
+		// Rebuild the system prompt with the current plan. Rules may have
+		// changed since the last turn, and the plan must stay visible even
+		// after transcript trimming.
+		if len(d.st.Messages) > 0 && d.st.Messages[0].Role == llm.RoleSystem {
+			d.st.Messages[0].Content = d.systemGuide + directPlanBlock(d.st.Plan)
+		}
 		window, dropped := directRequestWindow(d.st.Messages, d.contextBudget())
 		if dropped > 0 {
 			d.o.log.Infof("direct context trimmed %d earlier messages (budget %d chars); system prompt and the original request were kept, and the full transcript is on disk", dropped, d.contextBudget())
@@ -632,6 +645,12 @@ func (d *DirectAgent) applyActions(ctx context.Context, nodeID string, actions [
 			// apply: unresolved conflict markers and hard-coded secrets must
 			// not be accepted as a successful turn. Warnings (debug prints,
 			// large diffs) are logged but do not block.
+			if blocked, ok := d.unfinishedPlanBlock(); !ok {
+				d.appendToolOutcome(act, blocked)
+				d.skipRemaining(actions[i+1:], "Not executed: finish was rejected because the plan still has unfinished steps. Update the plan or finish the work first.")
+				_ = d.persist()
+				return false, "", nil
+			}
 			if blocked, ok := d.finishGate(ctx); !ok {
 				d.appendToolOutcome(act, blocked)
 				d.skipRemaining(actions[i+1:], "Not executed: the run did not finish; finish was rejected by the review gate.")
@@ -671,6 +690,16 @@ func (d *DirectAgent) applyActions(ctx context.Context, nodeID string, actions [
 			d.skipRemaining(actions[i+1:], "Not executed: an earlier ask in the same model reply must be answered first. Re-issue this tool if it is still appropriate after the user's answer.")
 			_ = d.persist()
 			return false, "", nil
+		}
+
+		if act.Name == tools.ToolUpdatePlan {
+			out, perr := d.updatePlan(act.Args)
+			if perr != nil {
+				out = "ERROR: " + perr.Error()
+			}
+			d.appendToolOutcome(act, out)
+			_ = d.persist()
+			continue
 		}
 
 		if err := ctx.Err(); err != nil {
@@ -1052,6 +1081,7 @@ func directSystemGuide(sb *tools.Sandbox, dataDir string) string {
 	b.WriteString("search_files and find_files are literal regex/glob matching, not a semantic index.\n")
 	b.WriteString("If a user follow-up arrives mid-loop, honor it from the next step; do not restart the whole task from scratch.\n")
 	b.WriteString("When the work for this turn is done, call finish with a concise, factual summary written for the user — that text is your reply. Do not call finish just to narrate a failed check; repair first.\n")
+	b.WriteString(directPlanGuide())
 	b.WriteString(projectRulesBlock(sb, dataDir))
 	b.WriteString("\n")
 	if sb != nil {
@@ -1074,7 +1104,9 @@ func directSystemFor(web bool, dynamicTools string) string {
 	b.WriteString("You work in one growing tool transcript for this project. Use tools to actually read, search, edit, and verify. Do not claim success without checking real tool results. Do not invent file contents.\n")
 	b.WriteString("search_files and find_files are literal regex/glob matching, not a semantic index.\n")
 	b.WriteString("If a user follow-up arrives mid-loop, honor it from the next step; do not restart the whole task from scratch.\n")
-	b.WriteString("When the work for this turn is done, call finish with a concise, factual summary written for the user — that text is your reply. Do not call finish just to narrate a failed check; repair first.\n\n")
+	b.WriteString("When the work for this turn is done, call finish with a concise, factual summary written for the user — that text is your reply. Do not call finish just to narrate a failed check; repair first.\n")
+	b.WriteString(directPlanGuide())
+	b.WriteString("\n")
 	b.WriteString(tools.Descriptions())
 	if web {
 		b.WriteString("\n")
@@ -1323,6 +1355,9 @@ type directState struct {
 	PendingActions  []taggedAction     `json:"pending_actions,omitempty"`
 	Mirror          *tools.MirrorState `json:"mirror,omitempty"`
 	InFlight        *directInFlight    `json:"in_flight,omitempty"`
+	// Plan is the model-maintained task list for this turn. It survives
+	// resume, resets when a new follow-up starts, and gates finish.
+	Plan []directPlanItem `json:"plan,omitempty"`
 }
 
 type directInFlight struct {
