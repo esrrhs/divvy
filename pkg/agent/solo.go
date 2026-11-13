@@ -90,7 +90,7 @@ func (o *Orchestrator) RunSolo(ctx context.Context) (runErr error) {
 		autoAcceptance: autoAcceptance,
 		histPath:       o.storage.GetSoloHistoryPath(o.tree.ID),
 	}
-	system := llm.Message{Role: llm.RoleSystem, Content: soloSystemFor(o.cfg.WebEnabled, o.sandbox.DynamicToolDescriptions())}
+	system := llm.Message{Role: llm.RoleSystem, Content: soloSystemFor(o.cfg.WebEnabled, o.sandbox.DynamicToolDescriptions()) + projectRulesBlock(o.sandbox)}
 	if prev, err := loadSoloHistory(s.histPath); err != nil || len(prev) < 2 {
 		if err != nil {
 			o.log.Warnf("earlier transcript unreadable, starting a new one: %v", err)

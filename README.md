@@ -290,6 +290,15 @@ go build -o divvy ./cmd/divvy
 
 打开项目时目录必须已存在。默认仍建议开启隔离执行；人工审批 diff 时会自动打开隔离，避免拒绝后无法丢弃改动。
 
+### 项目规则（AGENTS.md / .divvy/rules）
+
+每次进入模型前，direct、worker、solo 三种循环都会读取工作区根部的 `AGENTS.md`、`DIVVY.md`、`.divvy/rules.md`，以及 `.divvy/rules/*.md`（按文件名排序），合并成一段 `PROJECT RULES` 注入 system prompt。规则里可以写项目的技术栈约束、目录约定、必跑的验证命令和禁止事项；模型把它们当作本轮的绑定约束，不必再花工具调用重读这些文件。
+
+- 同一路径只读一次，重复内容只保留一份；总量上限 16KiB，超出会截断并标注
+- 用户本轮的明确要求优先于项目规则（规则不是不可覆盖的系统指令）
+- 规则会在每轮/每个叶子开始时重新读取，改完下一轮即生效
+- 文件缺失/不可读时安静跳过，不会让运行失败
+
 ### 桌面应用（Tauri，macOS / Linux / Windows）
 
 `desktop/` 是 Tauri v2 外壳：启动时按平台定位并拉起内置的 `divvy -serve` sidecar（externalBin），解析其启动日志里的随机端口与一次性 token，再把 WebView 指向 sidecar（发布模式）或 Vite（开发模式，`/api` 代理到 sidecar）。数据与默认工作区放在平台应用数据目录（macOS：`~/Library/Application Support/com.divvy.desktop/`；Linux：`~/.local/share/com.divvy.desktop/`；Windows：`%APPDATA%\com.divvy.desktop`）。

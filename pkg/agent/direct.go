@@ -1031,7 +1031,9 @@ func directSystemGuide(sb *tools.Sandbox) string {
 	b.WriteString("You work in one growing tool transcript for this project. Use tools to actually read, search, edit, and verify. Do not claim success without checking real tool results. Do not invent file contents.\n")
 	b.WriteString("search_files and find_files are literal regex/glob matching, not a semantic index.\n")
 	b.WriteString("If a user follow-up arrives mid-loop, honor it from the next step; do not restart the whole task from scratch.\n")
-	b.WriteString("When the work for this turn is done, call finish with a concise, factual summary written for the user — that text is your reply. Do not call finish just to narrate a failed check; repair first.\n\n")
+	b.WriteString("When the work for this turn is done, call finish with a concise, factual summary written for the user — that text is your reply. Do not call finish just to narrate a failed check; repair first.\n")
+	b.WriteString(projectRulesBlock(sb))
+	b.WriteString("\n")
 	if sb != nil {
 		b.WriteString(sb.ToolGuide())
 	} else {

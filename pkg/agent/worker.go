@@ -19,7 +19,7 @@ func (o *Orchestrator) runWorker(ctx context.Context, sb *tools.Sandbox, node *m
 	defer sb.ReleaseBrowser()
 
 	messages := []llm.Message{
-		{Role: llm.RoleSystem, Content: workerSystemFor(o.cfg.WebEnabled, sb.DynamicToolDescriptions())},
+		{Role: llm.RoleSystem, Content: workerSystemFor(o.cfg.WebEnabled, sb.DynamicToolDescriptions()) + projectRulesBlock(sb)},
 		{Role: llm.RoleUser, Content: o.projectContext(sb, node, prevError)},
 	}
 
