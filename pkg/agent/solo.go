@@ -861,6 +861,10 @@ func (o *Orchestrator) soloTaskPrompt(sb *tools.Sandbox, root *models.TaskNode) 
 	b.WriteString("\n\nWorkspace files right now:\n")
 	snap := sb.Snapshot()
 	b.WriteString(snap)
+	if m := sb.RepoMap(4000); m != "" {
+		b.WriteString("\n\n")
+		b.WriteString(m)
+	}
 	if workspaceHasFiles(snap) {
 		// Measured failure mode: handed a goal whose workspace already held a
 		// passing implementation, a solo run rewrote every file from scratch —
@@ -895,6 +899,10 @@ func (o *Orchestrator) soloResumePrompt(root *models.TaskNode) string {
 	b.WriteString(formatDoD(root.DoD))
 	b.WriteString("\n\nWorkspace files right now:\n")
 	b.WriteString(o.sandbox.Snapshot())
+	if m := o.sandbox.RepoMap(4000); m != "" {
+		b.WriteString("\n\n")
+		b.WriteString(m)
+	}
 	b.WriteString(`
 Do not restart from scratch. Run the acceptance commands first to see where you actually are, then continue from that point. What already passes does not need to be rewritten.`)
 	return b.String()

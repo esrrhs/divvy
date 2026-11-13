@@ -26,6 +26,10 @@ const (
 	directDefaultContextChars = 100_000
 	directMapMaxEntries       = 80
 	directMapMaxDepth         = 3
+	// directRepoMapChars bounds the ranked symbol map. It is orientation, not
+	// a substitute for reading the code, and the same budget is reused on
+	// follow-up turns where the transcript already holds earlier context.
+	directRepoMapChars = 4000
 	// directRepeatLimit is how many identical tool calls in a row count as a
 	// loop. Two would fire on a legitimate read-then-verify pair; four wastes
 	// a step on something already unmistakable.
@@ -984,6 +988,10 @@ func (d *DirectAgent) openingPrompt() string {
 		b.WriteString("\n\nShallow project map (a bounded file listing, not a semantic index — use read_file, search_files, or find_files for real contents):\n")
 		b.WriteString(m)
 	}
+	if m := d.o.sandbox.RepoMap(directRepoMapChars); m != "" {
+		b.WriteString("\n\n")
+		b.WriteString(m)
+	}
 	if st := directWorkspaceStatus(d.o.sandbox.Root); st != "" {
 		b.WriteString("\n\n")
 		b.WriteString(st)
@@ -999,6 +1007,10 @@ func (d *DirectAgent) followUpPrompt() string {
 	b.WriteString("\n\nContinue from the current workspace (do not redo completed work unless the new request requires it). Use tools to inspect and verify. Call finish with a concise summary of this follow-up.")
 	if m := directProjectMap(d.o.sandbox, directMapMaxEntries, directMapMaxDepth); m != "" {
 		b.WriteString("\n\nCurrent shallow project map (bounded listing, not a semantic index):\n")
+		b.WriteString(m)
+	}
+	if m := d.o.sandbox.RepoMap(directRepoMapChars); m != "" {
+		b.WriteString("\n\n")
 		b.WriteString(m)
 	}
 	if st := directWorkspaceStatus(d.o.sandbox.Root); st != "" {
