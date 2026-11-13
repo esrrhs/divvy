@@ -33,6 +33,14 @@ const (
 	// directRepeatNags caps how many times one turn interrupts a repeated-call
 	// loop. The step budget still bounds the turn after that.
 	directRepeatNags = 2
+	// directFailureLimit is how many times the same verification command may
+	// fail with the same output before the loop demands a strategy change.
+	// Solo escalates on the second identical failure; direct is conversational,
+	// so it gets the same one-observation-round budget.
+	directFailureLimit = 2
+	// directFailureNags caps how many strategy-change prompts one turn gets,
+	// so the intervention itself cannot become the loop.
+	directFailureNags = 2
 )
 
 // directMarker is the leading sentence of the direct-mode system prompt so
@@ -71,6 +79,12 @@ type DirectAgent struct {
 	repeatKey   string
 	repeatCount int
 	repeatNags  int
+	// failKey / failCount / failNags catch the third loop shape: different
+	// calls (edits interleaved with the same verification command) that keep
+	// producing the same failure. The workspace changes, the outcome does not.
+	failKey   string
+	failCount int
+	failNags  int
 }
 
 func NewDirect(o *Orchestrator, ctl DirectControl) *DirectAgent {
@@ -713,7 +727,16 @@ func (d *DirectAgent) applyActions(ctx context.Context, nodeID string, actions [
 		// A failed check in this same reply must not be followed by finish
 		// (or later tools planned before the model saw the failure).
 		if toolOutcomeFailed(act.Name, out, callErr) {
+			// The repeated-call guard does not catch "edit, run the same
+			// failing check, edit again": the calls differ, but the outcome
+			// never does. Name that loop and demand an observation. The
+			// prompt is appended after the skipped tool results so a native
+			// tool_calls message is not interleaved with a user message.
+			msg, nag := d.trackRepeatedFailure(act, out, callErr)
 			d.skipRemaining(actions[i+1:], "Not executed: an earlier tool in the same model reply failed or returned a non-zero exit. Inspect that result, repair if needed, and re-issue only what is still appropriate. Do not assume this tool ran.")
+			if nag {
+				d.st.Messages = append(d.st.Messages, llm.Message{Role: llm.RoleUser, Content: msg})
+			}
 			_ = d.persist()
 			return false, "", nil
 		}
@@ -756,6 +779,67 @@ func (d *DirectAgent) trackRepeatCall(act taggedAction) (string, bool) {
 		"count": directRepeatLimit,
 	})
 	return directRepeatCallIntervention(act.Name, string(args), directRepeatLimit), true
+}
+
+// trackRepeatedFailure catches the loop shape the repeated-call guard misses:
+// the model edits, runs the same verification command, edits again, and the
+// command keeps failing the same way. The calls differ, so nothing looks
+// repeated, but the outcome never changes. After directFailureLimit identical
+// failures the model is told to observe before editing again — the same
+// escalation that measurably beat plain "fix it again" in solo mode.
+func (d *DirectAgent) trackRepeatedFailure(act taggedAction, out string, callErr error) (string, bool) {
+	if act.Name != tools.ToolRunBash {
+		return "", false
+	}
+	if !toolOutcomeFailed(act.Name, out, callErr) {
+		// A passing verification means the previous failure was addressed;
+		// the next failure is a new problem. A successful non-verify call
+		// (read/edit) does not reset the run: edits are exactly what the
+		// model does between identical failures.
+		d.failKey, d.failCount = "", 0
+		return "", false
+	}
+	if d.failNags >= directFailureNags {
+		return "", false
+	}
+	cmd, _ := stringFromArgs(act.Args, "command")
+	key := stallFingerprint(d.o.projectType(), act.Name+"\n"+cmd+"\n"+out)
+	if key == "" {
+		return "", false
+	}
+	if key == d.failKey {
+		d.failCount++
+	} else {
+		d.failKey, d.failCount = key, 1
+	}
+	if d.failCount < directFailureLimit {
+		return "", false
+	}
+	d.failCount = 0
+	d.failNags++
+	d.o.log.Warnf("direct: %q failed the same way %d times; demanding an observation before another edit", cmd, directFailureLimit)
+	d.o.events.Record("direct_repeated_failure", d.o.tree.RootID, map[string]any{
+		"command": clip(cmd, evReasonChars),
+		"count":   directFailureLimit,
+	})
+	return directFailureEscalation(cmd, out, directFailureLimit), true
+}
+
+func directFailureEscalation(command, output string, n int) string {
+	return fmt.Sprintf(`The same command has now failed the same way %d times in a row: %s
+
+%s
+
+Your last change did not alter the outcome. Do NOT edit the same lines again on another hunch, and do NOT weaken or delete the assertion to make it pass — that is how a previous attempt made things worse.
+
+Change strategy:
+1. State in one sentence what you believe the cause is, and what observation would confirm or refute it.
+2. Observe it: print the intermediate values around the failure, add temporary debug output, or run the failing scenario in a small scratch program kept inside the workspace so the project's own packages resolve.
+3. If the observation contradicts your theory, discard the theory and form a new one. Do not tune numbers until something passes.
+4. Only after the observation explains the failure, change the code where the observation points.
+5. Re-run the command yourself before calling finish.
+
+Keep everything that already works; this is a diagnosis step, not a rewrite.`, n, command, clip(output, 4000))
 }
 
 func directRepeatCallIntervention(name, args string, n int) string {
