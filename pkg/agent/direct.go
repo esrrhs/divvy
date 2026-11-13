@@ -980,7 +980,7 @@ func (d *DirectAgent) openingPrompt() string {
 	b.WriteString(strings.TrimSpace(d.o.cfg.Goal))
 	b.WriteString("\n\nWorking directory: ")
 	b.WriteString(d.o.sandbox.Root)
-	if m := directProjectMap(d.o.sandbox.Root, directMapMaxEntries, directMapMaxDepth); m != "" {
+	if m := directProjectMap(d.o.sandbox, directMapMaxEntries, directMapMaxDepth); m != "" {
 		b.WriteString("\n\nShallow project map (a bounded file listing, not a semantic index — use read_file, search_files, or find_files for real contents):\n")
 		b.WriteString(m)
 	}
@@ -993,7 +993,7 @@ func (d *DirectAgent) followUpPrompt() string {
 	b.WriteString("The earlier tool transcript is still in this conversation. New user request:\n")
 	b.WriteString(strings.TrimSpace(d.o.cfg.Goal))
 	b.WriteString("\n\nContinue from the current workspace (do not redo completed work unless the new request requires it). Use tools to inspect and verify. Call finish with a concise summary of this follow-up.")
-	if m := directProjectMap(d.o.sandbox.Root, directMapMaxEntries, directMapMaxDepth); m != "" {
+	if m := directProjectMap(d.o.sandbox, directMapMaxEntries, directMapMaxDepth); m != "" {
 		b.WriteString("\n\nCurrent shallow project map (bounded listing, not a semantic index):\n")
 		b.WriteString(m)
 	}
@@ -1225,23 +1225,24 @@ func inFlightRecoveryMessage(in *directInFlight, native bool) llm.Message {
 	return llm.Message{Role: llm.RoleUser, Content: content}
 }
 
-func directProjectMap(root string, maxEntries, maxDepth int) string {
-	if root == "" || maxEntries <= 0 {
+func directProjectMap(sb *tools.Sandbox, maxEntries, maxDepth int) string {
+	if sb == nil || strings.TrimSpace(sb.Root) == "" || maxEntries <= 0 {
 		return ""
 	}
-	var lines []string
+	type mapEntry struct{ text, rel string }
+	var entries []mapEntry
 	var walk func(dir, rel string, depth int)
 	walk = func(dir, rel string, depth int) {
-		if len(lines) >= maxEntries || depth > maxDepth {
+		if len(entries) >= maxEntries || depth > maxDepth {
 			return
 		}
-		entries, err := os.ReadDir(dir)
+		des, err := os.ReadDir(dir)
 		if err != nil {
 			return
 		}
-		for _, e := range entries {
-			if len(lines) >= maxEntries {
-				lines = append(lines, "…(truncated)")
+		for _, e := range des {
+			if len(entries) >= maxEntries {
+				entries = append(entries, mapEntry{text: "…(truncated)"})
 				return
 			}
 			name := e.Name()
@@ -1253,7 +1254,7 @@ func directProjectMap(root string, maxEntries, maxDepth int) string {
 				child = filepath.ToSlash(filepath.Join(rel, name))
 			}
 			if e.IsDir() {
-				lines = append(lines, child+"/")
+				entries = append(entries, mapEntry{text: child + "/", rel: child})
 				if depth < maxDepth {
 					walk(filepath.Join(dir, name), child, depth+1)
 				}
@@ -1263,10 +1264,29 @@ func directProjectMap(root string, maxEntries, maxDepth int) string {
 			if e.Type()&fs.ModeSymlink != 0 {
 				continue
 			}
-			lines = append(lines, child)
+			entries = append(entries, mapEntry{text: child, rel: child})
 		}
 	}
-	walk(root, "", 0)
+	walk(sb.Root, "", 0)
+	if len(entries) == 0 {
+		return ""
+	}
+	// The map is the onboarding view of the repo, so it should show the same
+	// files the project's own ignore rules consider part of the project.
+	rels := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.rel != "" {
+			rels = append(rels, e.rel)
+		}
+	}
+	ignored := sb.IgnoredPaths(rels)
+	lines := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.rel != "" && ignored[e.rel] {
+			continue
+		}
+		lines = append(lines, e.text)
+	}
 	return strings.Join(lines, "\n")
 }
 

@@ -101,6 +101,8 @@ func (s *Sandbox) SearchFilesHits(pattern, rootDir, glob string, caseSensitive b
 	}
 
 	out := &SearchFilesResult{Hits: []SearchHit{}}
+	type candidate struct{ abs, rel string }
+	var candidates []candidate
 	walkErr := filepath.WalkDir(absRoot, func(p string, d fs.DirEntry, werr error) error {
 		if werr != nil {
 			return nil // skip unreadable entries
@@ -134,13 +136,30 @@ func (s *Sandbox) SearchFilesHits(pattern, rootDir, glob string, caseSensitive b
 		if matcher != nil && !matcher(relSlash) {
 			return nil
 		}
+		candidates = append(candidates, candidate{abs: p, rel: relSlash})
+		return nil
+	})
+	if walkErr != nil {
+		return nil, walkErr
+	}
+	// Filter ignored files after the walk so one `git check-ignore` call
+	// covers the whole candidate set instead of spawning git per entry.
+	rels := make([]string, 0, len(candidates))
+	for _, c := range candidates {
+		rels = append(rels, c.rel)
+	}
+	ignored := s.IgnoredPaths(rels)
+	for _, c := range candidates {
+		if ignored[c.rel] {
+			continue
+		}
 		out.Scanned++
-		data, err := os.ReadFile(p)
+		data, err := os.ReadFile(c.abs)
 		if err != nil {
-			return nil
+			continue
 		}
 		if IsBinarySniff(data) || !utf8.Valid(data) {
-			return nil
+			continue
 		}
 		for lineNo, line := range strings.Split(string(data), "\n") {
 			if !re.MatchString(line) {
@@ -148,18 +167,14 @@ func (s *Sandbox) SearchFilesHits(pattern, rootDir, glob string, caseSensitive b
 			}
 			if len(out.Hits) >= limit {
 				out.Truncated = true
-				return fs.SkipAll
+				return out, nil
 			}
 			out.Hits = append(out.Hits, SearchHit{
-				Path:    relSlash,
+				Path:    c.rel,
 				Line:    lineNo + 1,
 				Preview: keepSearchLine(line),
 			})
 		}
-		return nil
-	})
-	if walkErr != nil {
-		return nil, walkErr
 	}
 	return out, nil
 }
@@ -213,9 +228,7 @@ func (s *Sandbox) FindFiles(pattern, rootDir string) (string, error) {
 		return "", err
 	}
 
-	var b strings.Builder
-	found := 0
-	truncated := false
+	var matched []string
 	walkErr := filepath.WalkDir(absRoot, func(p string, d fs.DirEntry, werr error) error {
 		if werr != nil {
 			return nil
@@ -241,16 +254,26 @@ func (s *Sandbox) FindFiles(pattern, rootDir string) (string, error) {
 		if !ok {
 			return nil
 		}
-		found++
-		if found > defaultMaxFoundFiles {
-			truncated = true
-			return nil
-		}
-		fmt.Fprintf(&b, "%s\n", relSlash)
+		matched = append(matched, relSlash)
 		return nil
 	})
 	if walkErr != nil {
 		return "", walkErr
+	}
+	ignored := s.IgnoredPaths(matched)
+	var b strings.Builder
+	found := 0
+	truncated := false
+	for _, relSlash := range matched {
+		if ignored[relSlash] {
+			continue
+		}
+		found++
+		if found > defaultMaxFoundFiles {
+			truncated = true
+			break
+		}
+		fmt.Fprintf(&b, "%s\n", relSlash)
 	}
 	if found == 0 {
 		return fmt.Sprintf("(no files matching %q)", pattern), nil
