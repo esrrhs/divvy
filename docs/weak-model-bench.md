@@ -219,16 +219,17 @@ go run ./cmd/bench -loop tree   -goals fix-average -extra '{"reasoning_effort":"
 go test ./... && go build -o /tmp/config_cli . && /tmp/config_cli test.json
 ```
 
-两处都不成立，而引擎没有拦住任何一处：
+三件事都发生过，而引擎当时一件也没拦住：
 
 1. **macOS 沙箱没有可写的 `/tmp`**（只有被重定向的 `TMPDIR`），`go build -o /tmp/config_cli` 直接 `mkdir /tmp/: operation not permitted`。bwrap 后端能给私有 tmpfs，seatbelt 不能，只能拒绝——这是安全策略差异，不是 bug，但模型生成的 DoD 里 `/tmp` 是最常见的临时路径。
 2. **`test.json` 谁都不负责产出**：仓库里没有，计划里也没有叶子声明它。引擎到目前为止只检查"DoD 引用的路径有没有人产出"（`planBlockers` 的 outputs 侧），不检查**输入**。
+3. **重试路径原本等于空转。** 验收失败被路由到集成叶子 `impl_main`，但它的重跑是**盲的**：`handleAcceptanceFailure` 把错误写进 `node.ErrorMsg`，而 `executeLeaf` 的 `prevErr` 永远从空字符串开始，两边各说各话。于是叶子满足自己那个更窄的 DoD、合并、根验收以完全相同的方式失败，2 次重试用尽判 FAILED——14 分钟里没有任何一次重试是有信息的。
 
-而且重试路径也没救回来：验收失败被路由到集成叶子 `impl_main`，但那个叶子执行的是它自己的 DoD（`go build ./...`），不是那条失败的验收命令，于是"修好"了别的东西，根验收原样再失败一次，2 次重试用尽判 FAILED。
+第 3 条已在本轮修掉（`938aae7`）：重新排队时给 `ErrorMsg` 打 `[goal-acceptance]` 前缀并带上失败命令与输出，`executeLeaf` 把它取作 `prevErr` 初值、取完即清；文案明写"你自己的 DoD 过了不算数"。回归测试 `TestExecuteLeaf_SeedsRetryPromptFromAcceptanceFailure` 把叶子 DoD 设成 `true` 来隔离变量——它自己必然通过，那么 prompt 里出现的任何失败只可能来自根验收。
 
-这两条都还是**未决**（见下），所以 `config-cli` 目前在 tree 侧是 known-failing：它测出了引擎的真实缺口，而不是把缺口藏起来。
+**上表的数字全部产生于这次修复之前**，所以第 4 行的那次失败不能用来判断修复后的表现；`config-cli` 的 tree 侧目前仍是 known-failing，等空闲时重跑再登记（本机 load 10+ 时 27B 模型的吞吐会掉到几分之一，单次 decompose 就能挂住十几分钟，那种数据没有意义）。
 
-**接下来要决定的两件事**（都不是"改个参数"就能解决的）：
+前两条都还是**未决**，而且都不是"改个参数"能解决的：
 
 - **沙箱要不要给一个可写的 `/tmp`。** 不给，模型生成的 `-o /tmp/xxx`、`mktemp` 之外的显式 `/tmp` 路径都会失败，而且错误信息看起来像代码问题；给，就等于承认 macOS 上没有私有临时目录（允许写会让沙箱进程能读别的进程放进 `/tmp` 的文件）。这是安全边界，得单独拍板。
-- **集成叶子应当继承失败的验收命令。** 现在它跑自己的 DoD，等于"你告诉我门没锁，我去擦了窗户"。让它以失败的那条命令为 DoD，重试才有意义；但要先处理第一条，否则它会一直撞 `/tmp`。
+- **集成叶子的 DoD 要不要并入根验收命令。** 现在只做到"把失败命令告诉它"（种子），叶子自己的验收门仍然比根的门窄，等于"你告诉我门没锁，我去擦了窗户"的一半。改成继承才是结构性的，但要先处理 `/tmp` —— 否则继承过来的命令会一直撞墙，叶子再用功也过不了。
