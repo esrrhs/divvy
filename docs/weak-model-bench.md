@@ -208,6 +208,7 @@ go run ./cmd/bench -loop tree   -goals fix-average -extra '{"reasoning_effort":"
 | 2 | direct | 40 | ✅ | 2m06s | 9 | 21,384 | — | 修掉 VCS stamping 之后 |
 | 3 | tree | 15 | ✅ | 3m10s | 7 | 16,808 | 1/1 | 拆解仍判 atomic，没拆 |
 | 4 | tree | 6 | ❌ | 14m36s | 23 | 58,670 | 4/4 | 拆成 4 叶全完成，败在根验收 |
+| 5 | tree | 6 | ✅ | 20m51s | 18 | 51,257 | 1/1 | 计划结构修复后重跑；根验收通过（墙钟被机器负载抬高，见下） |
 
 第 1 次的 19 次调用 / 60k token **不是模型能力问题**：`go build` 会给 main 包做 VCS stamping，而沙箱里 git 跑不起来（macOS 上 `xcode-select` 被拒），于是每一条 `[auto-verify] go build .` 都报 `error obtaining VCS status`。模型把它当代码错误，先后去查 git、再想 `xcode-select`、再试 `sudo`（被沙箱挡住），十步之后开始输出截断的 JSON。修法是把 `GOFLAGS=-buildvcs=false` 强制进沙箱环境（`pkg/tools/sandbox_isolate_env.go`，两个平台共用）——沙箱里本来就没有有意义的 VCS 状态可打。回归测试 `TestDarwinBackend_BuildsMainPackageInGitRepo` 把这条钉住：去掉修复，它立刻复现同一条 `error obtaining VCS status`。修完后同一目标 9 次调用、2 分 06 秒通过。
 
@@ -228,6 +229,33 @@ go test ./... && go build -o /tmp/config_cli . && /tmp/config_cli test.json
 第 3 条已在本轮修掉（`938aae7`）：重新排队时给 `ErrorMsg` 打 `[goal-acceptance]` 前缀并带上失败命令与输出，`executeLeaf` 把它取作 `prevErr` 初值、取完即清；文案明写"你自己的 DoD 过了不算数"。回归测试 `TestExecuteLeaf_SeedsRetryPromptFromAcceptanceFailure` 把叶子 DoD 设成 `true` 来隔离变量——它自己必然通过，那么 prompt 里出现的任何失败只可能来自根验收。
 
 **上表的数字全部产生于这次修复之前**，所以第 4 行的那次失败不能用来判断修复后的表现；`config-cli` 的 tree 侧目前仍是 known-failing，等空闲时重跑再登记（本机 load 10+ 时 27B 模型的吞吐会掉到几分之一，单次 decompose 就能挂住十几分钟，那种数据没有意义）。
+
+### `config-cli` tree：修复后第一次重跑，第 5 行 ✅（2026-11-14 晚）
+
+计划结构修复（`pkg/agent/acceptcmd.go`，PR #22）之后重跑 tree 侧：**通过**。
+
+```
+config-cli  tree  1  yes  20m51.185s  18  51257  1/1  -  3  1  0  0
+                                       ↑根验收过  ↑墙钟  ↑调用 ↑token ↑VFAIL ↑重试 ↑停滞
+```
+
+模型这次给的根验收命令是一条**链**：
+
+```
+go build ./... && go test ./... && go build -o /tmp/configcli . && echo '{"name":"svc","retries":3}' > /tmp/cfg.json && /tmp/configcli /tmp/cfg.json
+```
+
+这条命令同时踩中了第 4 次失败的三个坑，又恰好全躲过去了：
+
+- `/tmp` 的写入这次用的是 `> /tmp/cfg.json` **重定向**，走的是沙箱允许的路径；`-o /tmp/configcli` 的产物路径不再被当成"某个叶子必须交付的文件"（工作区外的路径没有人能拥有它）；
+- 夹具由命令自己 `echo` 出来，**不再需要某个叶子去产出 `test.json`**——上一轮"谁都不负责产出输入"的坑这次模型自己绕开了；
+- `VFAIL=3` + `RETRY=1` 说明叶子真的撞了三次失败的验证并自修回来，不是第一次就绿。
+
+`resplits=0` 是这次修复的可见痕迹：按旧的解析，这条命令里的 `&&` 会被当成一个必须交付的路径，`/tmp/configcli` 也会被当成交付物 → 两个**谁也修不掉的假 blocker** → 白烧 `-max-redecompose` 预算并逼规划器去修不存在的问题。现在这两个都不再成立。
+
+**但这一行的墙钟和 token 不能跟前四行比。** 本轮机器负载 9+（用户自己的编译在跑），第一次 decompose 单步就花了 12 分钟；`20m51s` 里绝大部分是排队等模型，不是引擎慢。`load` 回落到 2 以下时必须再跑一次才能拿到可比的数字。
+
+**这次也没有真正压到拆解路径**：模型又判了 atomic（1/1 叶），所以 `planBlockers` 在这次运行里没有被调用。假 blocker 的证据在单元测试里（把 `splitCommandChain` 改回"整条命令一袋词"，8 个用例立刻报红，报红形态与线上 bug 一致），不在这次基准里。
 
 前两条都还是**未决**，而且都不是"改个参数"能解决的：
 
