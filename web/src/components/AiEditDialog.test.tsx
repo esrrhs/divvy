@@ -5,7 +5,7 @@ import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { api } from '../api/client'
 import { useStore } from '../store'
-import type { AiEditResponse } from '../types'
+import type { AiEditRequest, AiEditResponse } from '../types'
 import { AiEditDialog } from './AiEditDialog'
 
 const RESULT: AiEditResponse = {
@@ -55,6 +55,7 @@ describe('AiEditDialog', () => {
       aiEditStreaming: '',
       aiEditBusy: false,
       aiEditApplied: null,
+      aiEditHistory: [],
     })
   })
 
@@ -204,5 +205,89 @@ describe('AiEditDialog', () => {
     })
     expect(host.textContent).toContain('boom')
     expect(useStore.getState().aiEditOpen).toBe(true)
+  })
+
+  // Cursor's inline chat: a follow-up must carry the earlier turn, otherwise
+  // the model answers "再补一个零值短路" from the original code and throws
+  // away the work the first turn did.
+  it('carries the earlier turn into a follow-up', async () => {
+    const bodies: AiEditRequest[] = []
+    vi.spyOn(api, 'aiEditStream').mockImplementation(async (_id, body) => {
+      bodies.push(body)
+      return bodies.length === 1 ? RESULT : RESULT
+    })
+
+    await render()
+    const ta = host.querySelector('textarea') as HTMLTextAreaElement
+    await act(async () => {
+      typeInto(ta, '把返回值改成 2')
+      await Promise.resolve()
+    })
+    await act(async () => {
+      ;(Array.from(host.querySelectorAll('button')).find((b) => b.textContent?.includes('生成候选')) as HTMLButtonElement).click()
+      await Promise.resolve()
+    })
+
+    expect(bodies).toHaveLength(1)
+    expect(bodies[0].history ?? []).toHaveLength(0)
+
+    // The box is cleared after a turn, so the next instruction is clearly new.
+    await act(async () => {
+      typeInto(ta, '再补一个零值短路')
+      await Promise.resolve()
+    })
+    const followUp = Array.from(host.querySelectorAll('button')).find((b) => b.textContent?.includes('继续改'))
+    expect(followUp).toBeTruthy()
+    await act(async () => {
+      ;(followUp as HTMLButtonElement).click()
+      await Promise.resolve()
+    })
+
+    expect(bodies).toHaveLength(2)
+    const history = bodies[1].history ?? []
+    expect(history).toHaveLength(1)
+    expect(history[0].instruction).toBe('把返回值改成 2')
+    expect(history[0].code).toBe(RESULT.new_text)
+    // The dialog says which round this is, and offers a way back to the start.
+    expect(host.textContent).toContain('第 2 轮')
+    expect(Array.from(host.querySelectorAll('button')).some((b) => b.textContent?.includes('从头再来'))).toBe(true)
+  })
+
+  it('drops the earlier turns when the user starts over', async () => {
+    const bodies: AiEditRequest[] = []
+    vi.spyOn(api, 'aiEditStream').mockImplementation(async (_id, body) => {
+      bodies.push(body)
+      return RESULT
+    })
+
+    await render()
+    const ta = host.querySelector('textarea') as HTMLTextAreaElement
+    await act(async () => {
+      typeInto(ta, '第一轮')
+      await Promise.resolve()
+    })
+    await act(async () => {
+      ;(Array.from(host.querySelectorAll('button')).find((b) => b.textContent?.includes('生成候选')) as HTMLButtonElement).click()
+      await Promise.resolve()
+    })
+
+    const reset = Array.from(host.querySelectorAll('button')).find((b) => b.textContent?.includes('从头再来'))
+    expect(reset).toBeTruthy()
+    await act(async () => {
+      ;(reset as HTMLButtonElement).click()
+      await Promise.resolve()
+    })
+    expect(useStore.getState().aiEditHistory).toHaveLength(0)
+
+    await act(async () => {
+      typeInto(ta, '重新来一遍')
+      await Promise.resolve()
+    })
+    await act(async () => {
+      ;(Array.from(host.querySelectorAll('button')).find((b) => b.textContent?.includes('生成候选')) as HTMLButtonElement).click()
+      await Promise.resolve()
+    })
+    expect(bodies).toHaveLength(2)
+    expect(bodies[1].history ?? []).toHaveLength(0)
   })
 })

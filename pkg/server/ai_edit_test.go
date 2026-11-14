@@ -196,6 +196,134 @@ func TestAiEdit_StreamsDeltasAndFinalEvent(t *testing.T) {
 	}
 }
 
+// TestAiEdit_FollowUpTurnRevisesTheProposal is the inline-chat behaviour:
+// a second instruction must be answered in the context of the first turn's
+// proposal, and the diff the user reviews must still be relative to the file
+// on disk — so the apply path (base hash + old text) does not change.
+func TestAiEdit_FollowUpTurnRevisesTheProposal(t *testing.T) {
+	work := t.TempDir()
+	if err := os.WriteFile(filepath.Join(work, "calc.go"), []byte(aiEditSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	firstCode := "// Add returns the sum of a and b.\nfunc Add(a, b int) int {\n\treturn a + b\n}\n"
+	secondCode := "// Add returns the sum of a and b.\nfunc Add(a, b int) int {\n\tif a == 0 && b == 0 {\n\t\treturn 0\n\t}\n\treturn a + b\n}\n"
+
+	var seen []llm.Request
+	client := &llm.ScriptedClient{
+		Handle: func(ctx context.Context, req llm.Request) (*llm.Response, error) {
+			seen = append(seen, req)
+			if len(seen) == 1 {
+				return &llm.Response{Content: firstCode}, nil
+			}
+			return &llm.Response{Content: secondCode}, nil
+		},
+	}
+	ts := apiServerWithClient(t, work, t.TempDir(), func(agent.Config) llm.Client { return client })
+	id := newAiEditConv(t, ts, work)
+
+	// Turn 1.
+	status, got := apiDo(t, http.MethodPost, apiBase(ts)+"/conversations/"+id+"/ai-edit?token=test-token", map[string]any{
+		"path":        "calc.go",
+		"instruction": "修正 Add 的实现",
+		"selection":   map[string]any{"start_line": 3, "end_line": 6},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("turn 1 status=%d resp=%v", status, got)
+	}
+	original := "// Add returns the sum of a and b.\nfunc Add(a, b int) int {\n\treturn a - b\n}\n"
+
+	// Turn 2: same selection, a follow-up instruction, and the previous turn
+	// replayed as history.
+	status, got = apiDo(t, http.MethodPost, apiBase(ts)+"/conversations/"+id+"/ai-edit?token=test-token", map[string]any{
+		"path":        "calc.go",
+		"instruction": "再补一个零值短路",
+		"selection":   map[string]any{"start_line": 3, "end_line": 6},
+		"history": []map[string]any{
+			{"instruction": "修正 Add 的实现", "code": firstCode},
+		},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("turn 2 status=%d resp=%v", status, got)
+	}
+
+	// The model must have been told what happened before.
+	prompt := ""
+	for _, m := range seen[1].Messages {
+		prompt += m.Content
+	}
+	if !strings.Contains(prompt, "修正 Add 的实现") {
+		t.Fatal("the follow-up prompt lost the previous instruction")
+	}
+	if !strings.Contains(prompt, "return a + b") {
+		t.Fatal("the follow-up prompt lost the previous proposal")
+	}
+	// And it must have been shown the proposal as the current selection, not
+	// the original code: the marked lines (>>) carry the proposal.
+	marked := false
+	for _, line := range strings.Split(prompt, "\n") {
+		if strings.Contains(line, ">>") && strings.Contains(line, "return a + b") {
+			marked = true
+		}
+	}
+	if !marked {
+		t.Fatalf("the follow-up prompt does not carry the previous proposal as the selection:\n%s", prompt)
+	}
+
+	// The diff stays relative to the file on disk: old_text is still the
+	// original region, so apply can verify it against the real file.
+	if anyString(got["old_text"]) != original {
+		t.Fatalf("old_text must stay the on-disk region, got %q", anyString(got["old_text"]))
+	}
+	if anyString(got["new_text"]) != secondCode {
+		t.Fatalf("new_text=%q", anyString(got["new_text"]))
+	}
+	if anyString(got["base_hash"]) != fileSHA256([]byte(aiEditSrc)) {
+		t.Fatal("base_hash must still be the hash of the file on disk")
+	}
+
+	// Applying the second turn writes the second proposal over the original.
+	status, applied := apiDo(t, http.MethodPost, apiBase(ts)+"/conversations/"+id+"/ai-edit/apply?token=test-token", map[string]any{
+		"path":       "calc.go",
+		"base_hash":  anyString(got["base_hash"]),
+		"start_line": 3,
+		"end_line":   6,
+		"old_text":   anyString(got["old_text"]),
+		"new_text":   anyString(got["new_text"]),
+	})
+	if status != http.StatusOK {
+		t.Fatalf("apply status=%d resp=%v", status, applied)
+	}
+	onDisk, _ := os.ReadFile(filepath.Join(work, "calc.go"))
+	if !strings.Contains(string(onDisk), "if a == 0 && b == 0") {
+		t.Fatalf("disk content did not get the second proposal:\n%s", onDisk)
+	}
+	if strings.Contains(string(onDisk), "return a - b") {
+		t.Fatalf("the original line survived the apply:\n%s", onDisk)
+	}
+}
+
+// A follow-up with no proposal to revise is a client bug, not something to
+// guess about.
+func TestAiEdit_FollowUpWithoutCodeIsRejected(t *testing.T) {
+	work := t.TempDir()
+	if err := os.WriteFile(filepath.Join(work, "calc.go"), []byte(aiEditSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ts, _ := aiEditHarness(t, work, "unused")
+	id := newAiEditConv(t, ts, work)
+
+	status, got := apiDo(t, http.MethodPost, apiBase(ts)+"/conversations/"+id+"/ai-edit?token=test-token", map[string]any{
+		"path":        "calc.go",
+		"instruction": "再改一次",
+		"selection":   map[string]any{"start_line": 3, "end_line": 6},
+		"history":     []map[string]any{{"instruction": "上一轮", "code": "   "}},
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("status=%d resp=%v, want 400", status, got)
+	}
+}
+
 // TestAiEdit_ApplyHonoursDecisions is the Cursor "accept some hunks" flow:
 // rejected hunks must leave the original lines untouched.
 func TestAiEdit_ApplyHonoursDecisions(t *testing.T) {

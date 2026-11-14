@@ -5,6 +5,7 @@ import { EventSourceClient, type SseStatus } from './api/sse'
 import type {
   AiEditResponse,
   AiEditSelection,
+  AiEditTurn,
   PhaseSnapshot,
   RunPhase,
   ApplyHunkRequest,
@@ -145,11 +146,17 @@ interface AppState {
   aiEditBusy: boolean
   // Set after a write so the dialog can offer a one-step undo.
   aiEditApplied: { applied: number; rejected: number } | null
+  // Earlier rounds of the same inline edit. A follow-up is answered against
+  // the last proposal, not against the original selection.
+  aiEditHistory: AiEditTurn[]
   // Bumped after an inline edit is written so the open file reloads from disk.
   fileReloadNonce: number
   openAiEditDialog: (path: string, selection: AiEditSelection) => void
   closeAiEditDialog: () => void
   runAiEdit: (instruction: string) => Promise<boolean>
+  // Drops the earlier rounds so the next generation starts from the original
+  // selection again.
+  resetAiEdit: () => void
   applyAiEdit: (decisions: boolean[]) => Promise<boolean>
   undoAiEdit: () => Promise<boolean>
   removeSelection: (index: number) => void
@@ -212,6 +219,7 @@ export const useStore = create<AppState>((set, get) => ({
   aiEditStreaming: '',
   aiEditBusy: false,
   aiEditApplied: null,
+  aiEditHistory: [],
   fileReloadNonce: 0,
 
   clearError: () => set({ apiError: null }),
@@ -768,6 +776,7 @@ export const useStore = create<AppState>((set, get) => ({
       aiEditStreaming: '',
       aiEditBusy: false,
       aiEditApplied: null,
+      aiEditHistory: [],
       actionError: null,
     })
   },
@@ -784,7 +793,11 @@ export const useStore = create<AppState>((set, get) => ({
       aiEditStreaming: '',
       aiEditBusy: false,
       aiEditApplied: null,
+      aiEditHistory: [],
     })
+  },
+  resetAiEdit: () => {
+    set({ aiEditResult: null, aiEditStreaming: '', aiEditHistory: [], actionError: null })
   },
   runAiEdit: async (instruction) => {
     const id = get().currentConvId
@@ -803,14 +816,21 @@ export const useStore = create<AppState>((set, get) => ({
     aiEditAbort = ctrl
     set({ actionError: null, aiEditBusy: true, aiEditResult: null, aiEditStreaming: '' })
     try {
+      // A follow-up carries the earlier rounds so the model revises its last
+      // proposal instead of starting over from the original selection.
+      const history = get().aiEditHistory
       const res = await api.aiEditStream(
         id,
-        { path, selection: sel, instruction },
+        { path, selection: sel, instruction, history: history.length ? history : undefined },
         (text) => set((s) => ({ aiEditStreaming: s.aiEditStreaming + text })),
         ctrl.signal,
       )
       if (ctrl.signal.aborted) return false
-      set({ aiEditResult: res, aiEditBusy: false })
+      set((s) => ({
+        aiEditResult: res,
+        aiEditBusy: false,
+        aiEditHistory: [...s.aiEditHistory, { instruction, code: res.new_text }],
+      }))
       return true
     } catch (e) {
       if (ctrl.signal.aborted) return false

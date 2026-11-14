@@ -406,11 +406,19 @@ export interface AiEditSelection {
   insert_line?: number
 }
 
+/** One earlier round of an inline edit: the instruction and what came back. */
+export interface AiEditTurn {
+  instruction: string
+  code: string
+}
+
 export interface AiEditRequest {
   path: string
   selection: AiEditSelection
   instruction: string
   stream?: boolean
+  /** Earlier turns, so a follow-up revises the previous proposal. */
+  history?: AiEditTurn[]
 }
 
 /** The server diffs the model's code reply against the region it sent. */
