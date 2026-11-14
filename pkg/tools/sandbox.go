@@ -345,6 +345,19 @@ func (s *Sandbox) WriteFile(path, content string) error {
 	if err != nil {
 		return err
 	}
+	// A whole-file write is not an "anchor landed in the wrong place" hazard,
+	// but it IS a "the file changed under me" hazard: the user's edit would be
+	// silently overwritten. The patch paths have been gated on this all along;
+	// the write path was not, so the one tool that can destroy the most work
+	// was the one tool without a guard.
+	//
+	// A file nobody read is still allowed (the leaf/resume cases), and so is a
+	// file that has not changed since the model last looked at it.
+	if cur, rerr := os.ReadFile(abs); rerr == nil {
+		if err := s.checkStaleEdit(s.Rel(abs), digestBytes(cur)); err != nil {
+			return err
+		}
+	}
 	max := s.MaxWrite
 	if max <= 0 {
 		max = defaultMaxWriteBytes

@@ -259,3 +259,67 @@ func TestObservedFiles_RoundTripIsACopy(t *testing.T) {
 		t.Fatalf("restore must not overwrite a live observation, got %q", got)
 	}
 }
+
+// A whole-file write can destroy the most work at once: the user's edit is
+// gone and nothing said so. The patch paths have been gated on this since the
+// beginning; the write path was not.
+func TestWriteFile_RefusesWhenTheFileChangedSinceTheRead(t *testing.T) {
+	sb, err := NewSandbox(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(sb.Root, "a.go")
+	if err := os.WriteFile(path, []byte("package p\n\nfunc A() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The model reads the file.
+	if _, err := sb.ReadFile("a.go"); err != nil {
+		t.Fatal(err)
+	}
+	// Somebody else edits it.
+	if err := os.WriteFile(path, []byte("package p\n\nfunc A() { /* theirs */ }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err = sb.WriteFile("a.go", "package p\n\nfunc A() { /* mine */ }\n")
+	if err == nil {
+		t.Fatal("the write must be refused: the file changed after the model read it")
+	}
+	var stale *StaleReadError
+	if !errors.As(err, &stale) {
+		t.Fatalf("err = %v, want a stale-read refusal", err)
+	}
+	// The user's edit must survive.
+	onDisk, _ := os.ReadFile(path)
+	if !strings.Contains(string(onDisk), "theirs") {
+		t.Fatalf("the user's edit was destroyed:\n%s", onDisk)
+	}
+}
+
+// The model may rewrite a file it just wrote: that is not a stale read.
+func TestWriteFile_AllowsRewritingAFileItJustWrote(t *testing.T) {
+	sb, err := NewSandbox(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sb.WriteFile("a.go", "package p\n\nfunc A() {}\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := sb.WriteFile("a.go", "package p\n\nfunc A() { return }\n"); err != nil {
+		t.Fatalf("the model's own second write must be allowed: %v", err)
+	}
+}
+
+// A file nobody read is still allowed to be written (leaf and resume cases).
+func TestWriteFile_AllowsAFileNobodyRead(t *testing.T) {
+	sb, err := NewSandbox(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sb.Root, "b.go"), []byte("package p\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := sb.WriteFile("b.go", "package p\n\nfunc B() {}\n"); err != nil {
+		t.Fatalf("writing a file nobody read must be allowed: %v", err)
+	}
+}
