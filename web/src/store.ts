@@ -144,8 +144,11 @@ interface AppState {
   // Raw code as it streams in, before the diff is known.
   aiEditStreaming: string
   aiEditBusy: boolean
-  // Set after a write so the dialog can offer a one-step undo.
+  // Set after a write so the dialog can offer an undo.
   aiEditApplied: { applied: number; rejected: number } | null
+  // How many inline writes can still be undone. The dialog stays open while
+  // there is more than one, so a second Cmd-Z reaches further back.
+  aiEditUndoDepth: number
   // Earlier rounds of the same inline edit. A follow-up is answered against
   // the last proposal, not against the original selection.
   aiEditHistory: AiEditTurn[]
@@ -220,6 +223,7 @@ export const useStore = create<AppState>((set, get) => ({
   aiEditBusy: false,
   aiEditApplied: null,
   aiEditHistory: [],
+  aiEditUndoDepth: 0,
   fileReloadNonce: 0,
 
   clearError: () => set({ apiError: null }),
@@ -777,6 +781,7 @@ export const useStore = create<AppState>((set, get) => ({
       aiEditBusy: false,
       aiEditApplied: null,
       aiEditHistory: [],
+      aiEditUndoDepth: 0,
       actionError: null,
     })
   },
@@ -794,6 +799,7 @@ export const useStore = create<AppState>((set, get) => ({
       aiEditBusy: false,
       aiEditApplied: null,
       aiEditHistory: [],
+      aiEditUndoDepth: 0,
     })
   },
   resetAiEdit: () => {
@@ -874,6 +880,8 @@ export const useStore = create<AppState>((set, get) => ({
         aiEditApplied: { applied: out.applied, rejected: out.rejected },
         aiEditResult: null,
         aiEditStreaming: '',
+        // The write just made is undoable, on top of whatever was before it.
+        aiEditUndoDepth: s.aiEditUndoDepth + 1,
         fileReloadNonce: s.fileReloadNonce + 1,
       }))
       return true
@@ -890,13 +898,17 @@ export const useStore = create<AppState>((set, get) => ({
     }
     set({ actionError: null, aiEditBusy: true })
     try {
-      await api.aiEditUndo(id)
+      const res = await api.aiEditUndo(id)
+      const remaining = res.remaining ?? 0
       set((s) => ({
         aiEditBusy: false,
         aiEditApplied: null,
-        aiEditOpen: false,
-        aiEditPath: null,
-        aiEditSelection: null,
+        aiEditUndoDepth: remaining,
+        // The dialog stays open while there is more to undo: a second Cmd-Z
+        // should not require opening it again.
+        aiEditOpen: remaining > 0,
+        aiEditPath: remaining > 0 ? s.aiEditPath : null,
+        aiEditSelection: remaining > 0 ? s.aiEditSelection : null,
         fileReloadNonce: s.fileReloadNonce + 1,
       }))
       return true

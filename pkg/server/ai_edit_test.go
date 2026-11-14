@@ -428,6 +428,77 @@ func TestAiEdit_ApplyHonoursDecisions(t *testing.T) {
 	}
 }
 
+// TestAiEdit_UndoReachesBackThroughTheStack: two inline edits in a row must
+// leave BOTH undoable. One slot meant the first edit was unreachable — the
+// only way back was to hand-edit the file.
+func TestAiEdit_UndoReachesBackThroughTheStack(t *testing.T) {
+	work := t.TempDir()
+	src := "package p\n\nfunc A() int {\n\treturn 1\n}\n"
+	if err := os.WriteFile(filepath.Join(work, "p.go"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ts, _ := aiEditHarness(t, work, "unused")
+	id := newAiEditConv(t, ts, work)
+
+	region := "func A() int {\n\treturn 1\n}\n"
+	first := "func A() int {\n\treturn 10\n}\n"
+	second := "func A() int {\n\treturn 100\n}\n"
+
+	apply := func(baseHash, oldText, newText string) {
+		t.Helper()
+		status, got := apiDo(t, http.MethodPost, apiBase(ts)+"/conversations/"+id+"/ai-edit/apply?token=test-token", map[string]any{
+			"path":       "p.go",
+			"base_hash":  baseHash,
+			"start_line": 3,
+			"end_line":   5,
+			"old_text":   oldText,
+			"new_text":   newText,
+		})
+		if status != http.StatusOK {
+			t.Fatalf("apply status=%d resp=%v", status, got)
+		}
+	}
+
+	apply(fileSHA256([]byte(src)), region, first)
+	afterFirst := "package p\n\n" + first
+	apply(fileSHA256([]byte(afterFirst)), first, second)
+
+	undo := func() map[string]any {
+		t.Helper()
+		status, got := apiDo(t, http.MethodPost, apiBase(ts)+"/conversations/"+id+"/ai-edit/undo?token=test-token", map[string]any{})
+		if status != http.StatusOK {
+			t.Fatalf("undo status=%d resp=%v", status, got)
+		}
+		return got
+	}
+
+	// First undo: back to the state after the first edit, one undo left.
+	got := undo()
+	if got["remaining"].(float64) != 1 {
+		t.Fatalf("remaining = %v, want 1", got["remaining"])
+	}
+	onDisk, _ := os.ReadFile(filepath.Join(work, "p.go"))
+	if string(onDisk) != afterFirst {
+		t.Fatalf("after the first undo: %q want %q", onDisk, afterFirst)
+	}
+
+	// Second undo: back to the original, nothing left.
+	got = undo()
+	if got["remaining"].(float64) != 0 {
+		t.Fatalf("remaining = %v, want 0", got["remaining"])
+	}
+	onDisk, _ = os.ReadFile(filepath.Join(work, "p.go"))
+	if string(onDisk) != src {
+		t.Fatalf("after the second undo: %q want %q", onDisk, src)
+	}
+
+	// A third undo has nothing to undo.
+	status, _ := apiDo(t, http.MethodPost, apiBase(ts)+"/conversations/"+id+"/ai-edit/undo?token=test-token", map[string]any{})
+	if status != http.StatusNotFound {
+		t.Fatalf("a third undo should be 404, got %d", status)
+	}
+}
+
 // TestAiEdit_ApplyRejectsStaleBaseHash: a file edited between generation and
 // apply must not be silently overwritten.
 func TestAiEdit_ApplyRejectsStaleBaseHash(t *testing.T) {

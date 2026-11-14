@@ -459,4 +459,6 @@ export interface AiEditUndoResponse {
   path: string
   restored: boolean
   new_content: string
+  /** Writes that can still be undone after this one. */
+  remaining?: number
 }

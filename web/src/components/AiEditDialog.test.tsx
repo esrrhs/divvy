@@ -56,6 +56,7 @@ describe('AiEditDialog', () => {
       aiEditBusy: false,
       aiEditApplied: null,
       aiEditHistory: [],
+      aiEditUndoDepth: 0,
     })
   })
 
@@ -251,6 +252,59 @@ describe('AiEditDialog', () => {
     // The dialog says which round this is, and offers a way back to the start.
     expect(host.textContent).toContain('第 2 轮')
     expect(Array.from(host.querySelectorAll('button')).some((b) => b.textContent?.includes('从头再来'))).toBe(true)
+  })
+
+  it('undoes repeatedly, and Cmd-Z reaches the stack', async () => {
+    vi.spyOn(api, 'aiEditStream').mockResolvedValue(RESULT)
+    vi.spyOn(api, 'aiEditApply').mockResolvedValue({
+      path: 'pkg/a.go',
+      applied: 1,
+      rejected: 0,
+      new_content: 'package p\n\nfunc A() int {\n\treturn 2\n}\n',
+      conflict: false,
+    })
+    // The server says one more write can still be undone.
+    const undo = vi.spyOn(api, 'aiEditUndo').mockResolvedValue({
+      path: 'pkg/a.go',
+      restored: true,
+      new_content: 'package p\n\nfunc A() int {\n\treturn 1\n}\n',
+      remaining: 2,
+    })
+
+    await render()
+    await act(async () => {
+      typeInto(host.querySelector('textarea') as HTMLTextAreaElement, '改一下')
+      await Promise.resolve()
+    })
+    await act(async () => {
+      ;(Array.from(host.querySelectorAll('button')).find((b) => b.textContent?.includes('生成候选')) as HTMLButtonElement).click()
+      await Promise.resolve()
+    })
+    await act(async () => {
+      ;(Array.from(host.querySelectorAll('button')).find((b) => b.textContent?.includes('应用 1 块')) as HTMLButtonElement).click()
+      await Promise.resolve()
+    })
+
+    // The dialog offers the undo.
+    const undoBtn = Array.from(host.querySelectorAll('button')).find((b) => b.textContent?.includes('撤销'))
+    expect(undoBtn).toBeTruthy()
+
+    await act(async () => {
+      ;(undoBtn as HTMLButtonElement).click()
+      await Promise.resolve()
+    })
+    expect(undo).toHaveBeenCalledTimes(1)
+    // Writes are still undoable, so the dialog stays open and says how many.
+    expect(useStore.getState().aiEditOpen).toBe(true)
+    expect(useStore.getState().aiEditUndoDepth).toBe(2)
+    expect(host.textContent).toContain('还有')
+
+    // Cmd-Z is the editor's shortcut for the same thing.
+    await act(async () => {
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'z', metaKey: true, bubbles: true }))
+      await Promise.resolve()
+    })
+    expect(undo).toHaveBeenCalledTimes(2)
   })
 
   it('drops the earlier turns when the user starts over', async () => {

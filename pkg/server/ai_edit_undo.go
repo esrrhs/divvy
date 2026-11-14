@@ -11,14 +11,14 @@ import (
 	"github.com/esrrhs/divvy/pkg/tools"
 )
 
-// aiEditUndoRecord is the snapshot needed to reverse the most recent inline
-// edit in a conversation.
+// aiEditUndoRecord is the snapshot needed to reverse one inline edit in a
+// conversation.
 //
 // It is deliberately NOT stored in the turn rollback journal: that journal is
 // consumed by turn rollback, which is keyed on a session id. An inline edit has
 // no turn, so a journal entry there would be silently "recovered" by the next
-// unrelated rollback. A separate one-slot record keeps undo honest and scoped
-// to the exact write it belongs to.
+// unrelated rollback. A separate stack keeps undo honest and scoped to the
+// exact writes it belongs to.
 type aiEditUndoRecord struct {
 	Version    int       `json:"version"`
 	ConvID     string    `json:"conv_id"`
@@ -30,18 +30,52 @@ type aiEditUndoRecord struct {
 	At         time.Time `json:"at"`
 }
 
-const aiEditUndoVersion = 1
+const (
+	aiEditUndoVersion = 2
+	// aiEditUndoMaxDepth bounds the stack. An inline edit is cheap to repeat,
+	// so a deep stack is not the concern; the concern is a file that grows
+	// without bound in the data dir.
+	aiEditUndoMaxDepth = 10
+)
+
+// aiEditUndoStack is the on-disk shape: the records of the inline edits of one
+// conversation, oldest first.
+//
+// The stack exists because one slot was too little: two inline edits in a row
+// left the first one unundoable, and the only way back was to hand-edit the
+// file. An editor's Cmd-Z reaches further than that.
+type aiEditUndoStack struct {
+	Version int                `json:"version"`
+	Records []*aiEditUndoRecord `json:"records"`
+}
 
 func aiEditUndoPath(dataDir, convID string) string {
 	return filepath.Join(dataDir, "conversations", convID+".ai-edit-undo.json")
 }
 
+// saveAiEditUndo appends a record to the conversation's undo stack.
 func saveAiEditUndo(dataDir string, rec *aiEditUndoRecord) error {
-	data, err := json.MarshalIndent(rec, "", "  ")
+	stack, err := loadAiEditUndoStack(dataDir, rec.ConvID)
 	if err != nil {
 		return err
 	}
-	path := aiEditUndoPath(dataDir, rec.ConvID)
+	if stack == nil {
+		stack = &aiEditUndoStack{Version: aiEditUndoVersion}
+	}
+	stack.Version = aiEditUndoVersion
+	stack.Records = append(stack.Records, rec)
+	if len(stack.Records) > aiEditUndoMaxDepth {
+		stack.Records = stack.Records[len(stack.Records)-aiEditUndoMaxDepth:]
+	}
+	return writeAiEditUndoStack(dataDir, rec.ConvID, stack)
+}
+
+func writeAiEditUndoStack(dataDir, convID string, stack *aiEditUndoStack) error {
+	data, err := json.MarshalIndent(stack, "", "  ")
+	if err != nil {
+		return err
+	}
+	path := aiEditUndoPath(dataDir, convID)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
@@ -52,7 +86,11 @@ func saveAiEditUndo(dataDir string, rec *aiEditUndoRecord) error {
 	return os.Rename(tmp, path)
 }
 
-func loadAiEditUndo(dataDir, convID string) (*aiEditUndoRecord, error) {
+// loadAiEditUndoStack reads the undo stack of a conversation.
+//
+// A stack written by the previous version (a single record) is migrated on
+// read: the user should not lose their undo because the binary was updated.
+func loadAiEditUndoStack(dataDir, convID string) (*aiEditUndoStack, error) {
 	raw, err := os.ReadFile(aiEditUndoPath(dataDir, convID))
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -60,24 +98,37 @@ func loadAiEditUndo(dataDir, convID string) (*aiEditUndoRecord, error) {
 		}
 		return nil, err
 	}
-	var rec aiEditUndoRecord
-	if err := json.Unmarshal(raw, &rec); err != nil {
+	var old aiEditUndoRecord
+	if err := json.Unmarshal(raw, &old); err == nil && old.Version == 1 && old.Path != "" {
+		return &aiEditUndoStack{Version: aiEditUndoVersion, Records: []*aiEditUndoRecord{&old}}, nil
+	}
+	var stack aiEditUndoStack
+	if err := json.Unmarshal(raw, &stack); err != nil {
 		return nil, fmt.Errorf("撤销记录损坏：%w", err)
 	}
-	if rec.Version != aiEditUndoVersion || rec.Path == "" {
+	if stack.Version != aiEditUndoVersion {
 		return nil, fmt.Errorf("撤销记录格式不支持")
 	}
-	return &rec, nil
+	return &stack, nil
 }
 
-func removeAiEditUndo(dataDir, convID string) {
-	_ = os.Remove(aiEditUndoPath(dataDir, convID))
+// popAiEditUndo removes the newest record from the stack and returns it.
+func popAiEditUndo(dataDir, convID string) (*aiEditUndoRecord, *aiEditUndoStack, error) {
+	stack, err := loadAiEditUndoStack(dataDir, convID)
+	if err != nil || stack == nil || len(stack.Records) == 0 {
+		return nil, stack, err
+	}
+	rec := stack.Records[len(stack.Records)-1]
+	stack.Records = stack.Records[:len(stack.Records)-1]
+	return rec, stack, nil
 }
 
 type aiEditUndoResponse struct {
 	Path       string `json:"path"`
 	Restored   bool   `json:"restored"`
 	NewContent string `json:"new_content"`
+	// Remaining counts the writes that can still be undone after this one.
+	Remaining int `json:"remaining"`
 }
 
 // handleAiEditUndo reverses the last inline edit, but only if the file still
@@ -90,7 +141,7 @@ func (s *Server) handleAiEditUndo(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, statusForConvErr(err), map[string]string{"error": err.Error()})
 		return
 	}
-	rec, err := loadAiEditUndo(s.dataDir, c.ID)
+	rec, stack, err := popAiEditUndo(s.dataDir, c.ID)
 	if err != nil {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
@@ -128,7 +179,12 @@ func (s *Server) handleAiEditUndo(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	removeAiEditUndo(s.dataDir, c.ID)
+	// The record is dropped only after the restore actually happened: a failed
+	// undo must stay undoable.
+	if err := writeAiEditUndoStack(s.dataDir, c.ID, stack); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "文件已恢复，但撤销记录保存失败: " + err.Error()})
+		return
+	}
 
 	secrets := s.secretsFor(c.ID)
 	s.mu.Lock()
@@ -145,5 +201,6 @@ func (s *Server) handleAiEditUndo(w http.ResponseWriter, r *http.Request) {
 		Path:       rec.Path,
 		Restored:   true,
 		NewContent: rec.Restore,
+		Remaining:  len(stack.Records),
 	})
 }

@@ -36,6 +36,7 @@ export function AiEditDialog() {
   const streaming = useStore((s) => s.aiEditStreaming)
   const busy = useStore((s) => s.aiEditBusy)
   const applied = useStore((s) => s.aiEditApplied)
+  const undoDepth = useStore((s) => s.aiEditUndoDepth)
   const history = useStore((s) => s.aiEditHistory)
   const runAiEdit = useStore((s) => s.runAiEdit)
   const resetAiEdit = useStore((s) => s.resetAiEdit)
@@ -95,6 +96,15 @@ export function AiEditDialog() {
       } else if (e.key.toLowerCase() === 's' && result && accepted > 0 && !busy) {
         e.preventDefault()
         void applyAiEdit(decisionsFor(hunks, rejected))
+      } else if (e.key.toLowerCase() === 'z' && (applied || undoDepth > 0) && !busy) {
+        // Cmd-Z undoes the write, the way an editor's does. Inside the
+        // instruction box the browser's own text undo wins: hijacking it
+        // would eat the user's typing.
+        const el = e.target as HTMLElement | null
+        const typing = !!el && (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT')
+        if (typing) return
+        e.preventDefault()
+        void undoAiEdit()
       }
     }
     window.addEventListener('keydown', onKey)
@@ -133,14 +143,16 @@ export function AiEditDialog() {
         </div>
 
         <div className="max-h-[62vh] overflow-auto px-4 py-3">
-          {applied ? (
+          {applied || undoDepth > 0 ? (
             <div className="py-3">
               <p className="text-[13px] text-emerald-300">
-                已写回 {applied.applied} 块
-                {applied.rejected > 0 ? `，拒绝 ${applied.rejected} 块` : ''}。
+                {applied
+                  ? `已写回 ${applied.applied} 块${applied.rejected > 0 ? `，拒绝 ${applied.rejected} 块` : ''}。`
+                  : '已撤销上一次改写。'}
               </p>
               <p className="mt-1.5 text-[12px] text-slate-400">
                 文件已从磁盘重新载入。撤销只在这个文件此后没有被其他改动碰过时才生效，否则会拒绝覆盖。
+                {undoDepth > 1 && ` ⌘/Ctrl+Z 可连续撤销，还有 ${undoDepth - 1} 次。`}
               </p>
             </div>
           ) : (
@@ -302,7 +314,7 @@ export function AiEditDialog() {
         </div>
 
         <div className="flex items-center justify-end gap-2 border-t border-line bg-ink-900/50 px-4 py-2.5">
-          {applied ? (
+          {applied || undoDepth > 0 ? (
             <>
               <button
                 type="button"
@@ -312,7 +324,7 @@ export function AiEditDialog() {
                 title="把文件恢复到这次改写之前。文件此后被其他改动碰过时会拒绝。"
               >
                 {busy && <SpinnerIcon width={13} height={13} />}
-                撤销这次改写
+                {undoDepth > 1 ? `再撤销上一次（还有 ${undoDepth - 1} 次）` : '撤销这次改写'}
               </button>
               <button type="button" className="btn-primary px-3 py-1.5 text-[12px]" onClick={() => closeAiEditDialog()}>
                 完成
