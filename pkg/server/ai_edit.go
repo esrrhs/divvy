@@ -103,6 +103,11 @@ type aiEditApplyResponse struct {
 // this the model gets a window around the selection instead of the whole file.
 const aiEditContextChars = 24000
 
+// aiEditMaxHistoryTurns bounds how many earlier rounds of an inline edit are
+// replayed into the prompt. Each turn carries a whole code block, so an
+// unbounded history would grow the prompt until the request becomes useless.
+const aiEditMaxHistoryTurns = 6
+
 // aiEditWindowLines is the context radius used when the file is too large.
 const aiEditWindowLines = 80
 
@@ -160,10 +165,17 @@ func (s *Server) handleAiEdit(w http.ResponseWriter, r *http.Request) {
 	// the code it produced last time. The file in memory is rewritten with
 	// that proposal so the model sees one consistent picture — the file as it
 	// would look with its own last change in it.
+	history := req.History
+	if len(history) > aiEditMaxHistoryTurns {
+		// The prompt carries every earlier turn, so an endless conversation
+		// would grow it without bound. The recent turns are the ones that
+		// matter; the oldest ones are dropped.
+		history = history[len(history)-aiEditMaxHistoryTurns:]
+	}
 	promptContent := content
 	promptRegion := region
-	if len(req.History) > 0 {
-		virtual, vregion, verr := aiEditVirtualRegion(content, region, req.History[len(req.History)-1].Code)
+	if len(history) > 0 {
+		virtual, vregion, verr := aiEditVirtualRegion(content, region, history[len(history)-1].Code)
 		if verr != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": verr.Error()})
 			return
@@ -180,7 +192,7 @@ func (s *Server) handleAiEdit(w http.ResponseWriter, r *http.Request) {
 	client := s.newClient(cfg)
 	secrets := s.secretsFor(c.ID)
 
-	prompt := buildAiEditPrompt(rel, promptContent, promptRegion, req.Instruction, req.History)
+	prompt := buildAiEditPrompt(rel, promptContent, promptRegion, req.Instruction, history)
 
 	// SSE only if the client asked for it and the ResponseWriter can flush.
 	flusher, canFlush := w.(http.Flusher)

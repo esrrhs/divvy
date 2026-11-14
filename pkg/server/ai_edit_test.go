@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -321,6 +322,53 @@ func TestAiEdit_FollowUpWithoutCodeIsRejected(t *testing.T) {
 	})
 	if status != http.StatusBadRequest {
 		t.Fatalf("status=%d resp=%v, want 400", status, got)
+	}
+}
+
+// The prompt carries every earlier turn, so an endless conversation would
+// grow it without bound. The oldest turns are dropped.
+func TestAiEdit_HistoryIsCapped(t *testing.T) {
+	work := t.TempDir()
+	if err := os.WriteFile(filepath.Join(work, "calc.go"), []byte(aiEditSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var seen []llm.Request
+	client := &llm.ScriptedClient{
+		Handle: func(ctx context.Context, req llm.Request) (*llm.Response, error) {
+			seen = append(seen, req)
+			return &llm.Response{Content: "func Add(a, b int) int {\n\treturn a + b\n}\n"}, nil
+		},
+	}
+	ts := apiServerWithClient(t, work, t.TempDir(), func(agent.Config) llm.Client { return client })
+	id := newAiEditConv(t, ts, work)
+
+	var history []map[string]any
+	for i := 1; i <= 10; i++ {
+		history = append(history, map[string]any{
+			"instruction": fmt.Sprintf("第%d轮", i),
+			"code":        "func Add(a, b int) int {\n\treturn a + b\n}\n",
+		})
+	}
+	status, got := apiDo(t, http.MethodPost, apiBase(ts)+"/conversations/"+id+"/ai-edit?token=test-token", map[string]any{
+		"path":        "calc.go",
+		"instruction": "再来一轮",
+		"selection":   map[string]any{"start_line": 3, "end_line": 6},
+		"history":     history,
+	})
+	if status != http.StatusOK {
+		t.Fatalf("status=%d resp=%v", status, got)
+	}
+
+	prompt := ""
+	for _, m := range seen[0].Messages {
+		prompt += m.Content
+	}
+	if strings.Contains(prompt, "第1轮") {
+		t.Fatal("the oldest turn should have been dropped")
+	}
+	if !strings.Contains(prompt, "第10轮") {
+		t.Fatal("the newest turn must be replayed")
 	}
 }
 
