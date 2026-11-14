@@ -189,6 +189,11 @@ func directCfg(t *testing.T, work, data, goal string) Config {
 	cfg.APIKey = "sk-direct-test-key-do-not-persist"
 	cfg.Stream = false
 	cfg.RequestTimeout = 15 * time.Second
+	// Unit tests are hermetic: the real post-edit check shells out to the
+	// toolchain, which is unavailable on some hosts and slow on all of them.
+	// Tests that exercise the check inject d.editCheck/d.recheckEdits and turn
+	// this back on explicitly.
+	cfg.DisableAutoVerify = true
 	return cfg
 }
 

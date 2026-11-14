@@ -71,10 +71,54 @@ type DirectAgent struct {
 	repeatKey   string
 	repeatCount int
 	repeatNags  int
+
+	// editCheck runs the cheap post-edit verification for the files a tool
+	// just wrote. recheckEdits re-runs previously failing commands at finish.
+	// Both are fields so tests can exercise the gate without a real sandbox
+	// (shell execution is unavailable on some hosts).
+	editCheck    func(ctx context.Context, paths []string) tools.EditCheck
+	recheckEdits func(ctx context.Context, cmds []string) tools.EditCheck
+	// recheckCmds holds commands whose last post-edit check failed. Finish is
+	// refused while one of them still fails, so "it compiles" is not something
+	// the model can assert without the workspace agreeing.
+	recheckCmds []string
+	// verifyRejects counts consecutive finish refusals caused by the check, so
+	// an unfixable toolchain problem cannot trap the run forever.
+	verifyRejects int
+	// skipNoted dedups "auto-verify skipped because ..." log lines per turn.
+	skipNoted map[string]bool
 }
 
 func NewDirect(o *Orchestrator, ctl DirectControl) *DirectAgent {
-	return &DirectAgent{o: o, ctl: ctl}
+	d := &DirectAgent{o: o, ctl: ctl, skipNoted: map[string]bool{}}
+	d.editCheck = d.defaultEditCheck
+	d.recheckEdits = d.defaultRecheck
+	return d
+}
+
+// directEditCheckTimeout bounds one post-edit check. It is short on purpose:
+// this runs after every write, so a slow check would tax the whole turn.
+const directEditCheckTimeout = 20 * time.Second
+
+// directVerifyMaxRejects is how many times finish may be refused for a failing
+// post-edit check before the gate yields and lets the turn end with the failure
+// disclosed.
+const directVerifyMaxRejects = 2
+
+func (d *DirectAgent) editCheckTimeout() time.Duration {
+	if d.o != nil && d.o.cfg.AutoVerifyTimeout > 0 {
+		return d.o.cfg.AutoVerifyTimeout
+	}
+	return directEditCheckTimeout
+}
+
+func (d *DirectAgent) defaultEditCheck(ctx context.Context, paths []string) tools.EditCheck {
+	return d.toolSandbox().VerifyEditedFiles(ctx, paths, d.editCheckTimeout())
+}
+
+func (d *DirectAgent) defaultRecheck(ctx context.Context, cmds []string) tools.EditCheck {
+	project := tools.DetectProject(d.toolSandbox().Root)
+	return d.toolSandbox().RunEditCheckCommands(ctx, project, cmds, d.editCheckTimeout())
 }
 
 const directReviewNodeID = "direct"
@@ -620,6 +664,15 @@ func (d *DirectAgent) applyActions(ctx context.Context, nodeID string, actions [
 				_ = d.persist()
 				return false, "", nil
 			}
+			// The review gate is static (conflict markers, secrets). This is
+			// the dynamic half: the package that was broken a moment ago must
+			// build before the turn can be declared done.
+			if blocked, ok := d.verifyBeforeFinish(ctx); !ok {
+				d.appendToolOutcome(act, blocked)
+				d.skipRemaining(actions[i+1:], "Not executed: the run did not finish; finish was rejected because the automatic check for the edited files still fails.")
+				_ = d.persist()
+				return false, "", nil
+			}
 			summary, _ = stringFromArgs(act.Args, "summary")
 			if summary == "" {
 				summary = strings.TrimSpace(act.Thought)
@@ -685,6 +738,20 @@ func (d *DirectAgent) applyActions(ctx context.Context, nodeID string, actions [
 			d.o.log.Debugf("tool out: %s", truncate(out, 240))
 		}
 
+		// Observe: a write is only half the step. Run the cheapest
+		// compile/type check for the edited files and hand the result back in
+		// the same tool output, so the model cannot "finish" over a workspace
+		// it never saw fail.
+		editCheckFailed := false
+		if callErr == nil {
+			if check, ran := d.checkAfterEdit(ctx, act, nodeID); ran {
+				if block := check.Block(); block != "" {
+					out += "\n\n" + block
+				}
+				editCheckFailed = check.Failed || check.TimedOut
+			}
+		}
+
 		if d.o.cfg.NativeTools && act.ID != "" {
 			d.st.Messages = append(d.st.Messages, llm.Message{
 				Role: llm.RoleTool, ToolCallID: act.ID, Name: act.Name, Content: out,
@@ -712,6 +779,11 @@ func (d *DirectAgent) applyActions(ctx context.Context, nodeID string, actions [
 		}
 		// A failed check in this same reply must not be followed by finish
 		// (or later tools planned before the model saw the failure).
+		if editCheckFailed {
+			d.skipRemaining(actions[i+1:], "Not executed: an earlier edit failed its automatic post-edit compile/type check. Read that tool result, fix the reported errors, and re-issue only what is still needed. Do not assume this tool ran.")
+			_ = d.persist()
+			return false, "", nil
+		}
 		if toolOutcomeFailed(act.Name, out, callErr) {
 			d.skipRemaining(actions[i+1:], "Not executed: an earlier tool in the same model reply failed or returned a non-zero exit. Inspect that result, repair if needed, and re-issue only what is still appropriate. Do not assume this tool ran.")
 			_ = d.persist()
@@ -773,6 +845,136 @@ Your next action must change the workspace or advance the goal.`, name, n, clip(
 // (or the isolated mirror in manual-approval mode). It returns the message the
 // model must see before trying again when the gate blocks. Review plumbing
 // errors fail open: a broken checker must not trap a finished turn.
+// editedPaths returns the workspace paths a mutating tool touched. Read-only
+// tools return nil: there is nothing to verify.
+func editedPaths(name string, args map[string]any) []string {
+	one := func(key string) []string {
+		if v, ok := stringFromArgs(args, key); ok && strings.TrimSpace(v) != "" {
+			return []string{strings.TrimSpace(v)}
+		}
+		return nil
+	}
+	switch name {
+	case tools.ToolWriteFile, tools.ToolReplaceLines, tools.ToolDeletePath:
+		return one("path")
+	case tools.ToolMovePath:
+		out := one("from")
+		return append(out, one("to")...)
+	default:
+		return nil
+	}
+}
+
+// checkAfterEdit runs the cheap compile/type check for an edit and records
+// failures for the finish gate. It returns ok=false when nothing ran (not a
+// source file, unsupported project, or no shell), in which case the tool result
+// is left untouched rather than padded with "skipped" noise on every edit.
+func (d *DirectAgent) checkAfterEdit(ctx context.Context, act taggedAction, nodeID string) (tools.EditCheck, bool) {
+	if d.o.cfg.DisableAutoVerify {
+		return tools.EditCheck{}, false
+	}
+	paths := editedPaths(act.Name, act.Args)
+	if len(paths) == 0 {
+		return tools.EditCheck{}, false
+	}
+	run := d.editCheck
+	if run == nil {
+		run = d.defaultEditCheck
+	}
+	check := run(ctx, paths)
+	if !check.Ran() {
+		if check.Skipped != "" && !d.skipNoted[check.Skipped] {
+			d.skipNoted[check.Skipped] = true
+			d.o.log.Infof("auto-verify skipped: %s", check.Skipped)
+		}
+		return check, false
+	}
+	d.o.events.Record("edit_check", nodeID, map[string]any{
+		"commands": check.Commands,
+		"failed":   check.Failed,
+		"ms":       check.Duration.Milliseconds(),
+	})
+	if check.Failed || check.TimedOut {
+		for _, cmd := range check.Commands {
+			d.noteRecheck(cmd)
+		}
+		d.o.log.Warnf("auto-verify failed: %s", strings.Join(check.Commands, " && "))
+	} else {
+		d.verifyRejects = 0
+		for _, cmd := range check.Commands {
+			d.clearRecheck(cmd)
+		}
+	}
+	return check, true
+}
+
+func (d *DirectAgent) noteRecheck(cmd string) {
+	for _, c := range d.recheckCmds {
+		if c == cmd {
+			return
+		}
+	}
+	d.recheckCmds = append(d.recheckCmds, cmd)
+}
+
+func (d *DirectAgent) clearRecheck(cmd string) {
+	if len(d.recheckCmds) == 0 {
+		return
+	}
+	kept := d.recheckCmds[:0]
+	for _, c := range d.recheckCmds {
+		if c != cmd {
+			kept = append(kept, c)
+		}
+	}
+	d.recheckCmds = kept
+}
+
+// verifyBeforeFinish re-runs the checks that last failed. Re-running (instead
+// of trusting a stale flag) keeps the gate honest both ways: a failure fixed by
+// editing another file clears, and a workspace that is still broken cannot be
+// declared done with "should be fine".
+func (d *DirectAgent) verifyBeforeFinish(ctx context.Context) (string, bool) {
+	if len(d.recheckCmds) == 0 {
+		return "", true
+	}
+	cmds := append([]string(nil), d.recheckCmds...)
+	run := d.recheckEdits
+	if run == nil {
+		run = d.defaultRecheck
+	}
+	check := run(ctx, cmds)
+	if !check.Ran() {
+		// The check cannot run now (shell disappeared, files removed). Do not
+		// hold the turn hostage over a check that is no longer possible.
+		d.recheckCmds = nil
+		return "", true
+	}
+	if check.Failed || check.TimedOut {
+		d.recheckCmds = cmds
+		d.verifyRejects++
+		if d.verifyRejects > directVerifyMaxRejects {
+			// The check keeps failing across attempts. Refusing forever turns a
+			// broken toolchain (wrong module, missing network) into a run that
+			// can never end, so the gate yields — loudly, with the diagnostics
+			// already in the transcript and an event the user can see.
+			d.o.log.Warnf("auto-verify still failing after %d finish attempts; allowing finish with the failure disclosed", d.verifyRejects)
+			d.o.events.Record("edit_check_waived", d.o.tree.RootID, map[string]any{
+				"commands": cmds,
+				"attempts": d.verifyRejects,
+			})
+			d.recheckCmds = nil
+			return "", true
+		}
+		return "finish REJECTED: the automatic check for your edits still fails. " +
+			"Fix the errors below and finish only after the check passes (" +
+			strings.Join(cmds, " && ") + "):\n" + check.Output, false
+	}
+	d.recheckCmds = nil
+	d.verifyRejects = 0
+	return "", true
+}
+
 func (d *DirectAgent) finishGate(ctx context.Context) (string, bool) {
 	gate, err := d.toolSandbox().PreFinishGate(ctx)
 	if err != nil {
@@ -945,6 +1147,7 @@ func directSystemGuide(sb *tools.Sandbox) string {
 	b.WriteString(directMarker)
 	b.WriteString("\n\n")
 	b.WriteString("You work in one growing tool transcript for this project. Use tools to actually read, search, edit, and verify. Do not claim success without checking real tool results. Do not invent file contents.\n")
+	b.WriteString("After write_file/replace_lines, a compile/type check for the edited package runs automatically and its result is appended to that tool output as [auto-verify]. Do not re-run the same build only to confirm it; fix the reported errors instead. finish is refused while that check still fails.\n")
 	b.WriteString("search_files and find_files are literal regex/glob matching, not a semantic index.\n")
 	b.WriteString("If a user follow-up arrives mid-loop, honor it from the next step; do not restart the whole task from scratch.\n")
 	b.WriteString("When the work for this turn is done, call finish with a concise, factual summary written for the user — that text is your reply. Do not call finish just to narrate a failed check; repair first.\n\n")
@@ -966,6 +1169,7 @@ func directSystemFor(web bool, dynamicTools string) string {
 	b.WriteString(directMarker)
 	b.WriteString("\n\n")
 	b.WriteString("You work in one growing tool transcript for this project. Use tools to actually read, search, edit, and verify. Do not claim success without checking real tool results. Do not invent file contents.\n")
+	b.WriteString("After write_file/replace_lines, a compile/type check for the edited package runs automatically and its result is appended to that tool output as [auto-verify]. Do not re-run the same build only to confirm it; fix the reported errors instead. finish is refused while that check still fails.\n")
 	b.WriteString("search_files and find_files are literal regex/glob matching, not a semantic index.\n")
 	b.WriteString("If a user follow-up arrives mid-loop, honor it from the next step; do not restart the whole task from scratch.\n")
 	b.WriteString("When the work for this turn is done, call finish with a concise, factual summary written for the user — that text is your reply. Do not call finish just to narrate a failed check; repair first.\n\n")

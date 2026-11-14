@@ -21,6 +21,7 @@ const kindMeta: Record<
   leaf_giveup: { label: '放弃', dot: 'bg-rose-500' },
   session_start: { label: '会话开始', dot: 'bg-slate-400' },
   session_end: { label: '会话结束', dot: 'bg-slate-400' },
+  edit_check: { label: '自动校验', dot: 'bg-sky-500' },
 }
 
 function summary(ev: StreamEvent): string {
@@ -66,6 +67,11 @@ function summary(ev: StreamEvent): string {
       return String(ev.reason ?? ev.error ?? '')
     case 'session_end':
       return `结果：${ev.outcome ?? ''}${ev.error ? `：${ev.error}` : ''}`
+    case 'edit_check': {
+      const cmds = Array.isArray(ev.commands) ? (ev.commands as string[]) : []
+      const ms = typeof ev.ms === 'number' ? ` · ${ev.ms}ms` : ''
+      return `${cmds.join(' && ') || '检查'}${ev.failed ? ' 未通过' : ' 通过'}${ms}`
+    }
     default:
       return ev.reason || ev.error ? String(ev.reason ?? ev.error) : ''
   }
