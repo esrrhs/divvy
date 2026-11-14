@@ -49,6 +49,66 @@ var (
 	reviewHunkStart = regexp.MustCompile(`^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@`)
 )
 
+// secretLooksReal reports whether a value under a secret-looking key looks
+// like an actual credential rather than a placeholder.
+//
+// The regexes above are shape-based, so they also match `password: "changeme"`,
+// `token: "YOUR_TOKEN_HERE"` and the sample key in a doc comment. Those are
+// normal code, and the finish gate BLOCKS on a secret finding: flagging them
+// makes the model rewrite work the user never asked for, on every turn that
+// touches the file.
+//
+// A real key mixes character classes or contains a word that only appears in
+// placeholders; prose and samples do not.
+func secretLooksReal(match string) bool {
+	value := secretValue(match)
+	if value == "" {
+		return false
+	}
+	low := strings.ToLower(value)
+	for _, p := range []string{
+		"your", "example", "changeme", "change_me", "change-me", "placeholder",
+		"dummy", "sample", "fake", "todo", "fixme", "redacted", "insert",
+		"replace", "xxxx", "notreal", "not-real",
+	} {
+		if strings.Contains(low, p) {
+			return false
+		}
+	}
+	var digits, upper, lower, other int
+	for _, r := range value {
+		switch {
+		case r >= '0' && r <= '9':
+			digits++
+		case r >= 'A' && r <= 'Z':
+			upper++
+		case r >= 'a' && r <= 'z':
+			lower++
+		default:
+			other++
+		}
+	}
+	if digits == 0 && upper == 0 && other == 0 {
+		// Only letters: a word, not a key.
+		return false
+	}
+	return true
+}
+
+// secretValue pulls the quoted value out of a secret-pattern match.
+func secretValue(match string) string {
+	i := strings.IndexAny(match, `"'`)
+	if i < 0 {
+		return ""
+	}
+	quote := match[i]
+	j := strings.IndexByte(match[i+1:], quote)
+	if j < 0 {
+		return ""
+	}
+	return match[i+1 : i+1+j]
+}
+
 // reviewFinding is one deterministic issue reported by the review.
 type reviewFinding struct {
 	kind   string // conflict | secret | debug | size
@@ -96,6 +156,13 @@ func (r *reviewResult) scanTextLine(file, content string, line int) {
 	}
 	for _, re := range reviewSecretPatterns {
 		if m := re.FindString(content); m != "" {
+			// A placeholder is not a leaked credential. Blocking a turn
+			// because the code says `password: "changeme"` sends the model off
+			// to rewrite the user's own example — work nobody asked for. The
+			// gate is here to catch a pasted real key.
+			if !secretLooksReal(m) {
+				break
+			}
 			r.add(reviewFinding{"secret", where, "possible hard-coded secret: " + clipReviewText(m)})
 			break
 		}

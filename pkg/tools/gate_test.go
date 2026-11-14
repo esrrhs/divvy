@@ -93,3 +93,20 @@ func TestPreFinishGate_BinaryUntrackedSkipped(t *testing.T) {
 		t.Fatalf("binary-only untracked file should yield clean gate, got %+v", gate)
 	}
 }
+
+// A placeholder password is normal code, not a leaked credential. The gate
+// blocks on a secret finding, so flagging one makes the model rewrite the
+// user's example on every turn that touches the file.
+func TestPreFinishGate_PlaceholderSecretDoesNotBlock(t *testing.T) {
+	sb := setupGitRepo(t, map[string]string{"main.go": "package main\n"})
+	if err := sb.WriteFile("config.go", "package config\n\nconst defaultPassword = \"changeme\"\n"); err != nil {
+		t.Fatal(err)
+	}
+	gate, err := sb.PreFinishGate(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gate != nil && gate.Blocking {
+		t.Fatalf("a placeholder password must not block finish:\n%s", gate.Report)
+	}
+}
