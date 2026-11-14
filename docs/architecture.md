@@ -273,10 +273,12 @@ SBPL 是权限黑名单式封锁，不是命名空间隔离：`/usr`、`/Library
 ### 加一个工具
 
 1. 在 `pkg/tools` 实现，签名挂在 `Sandbox` 上（`Sandbox` 已有 `Web` / `Browser` 之类的可选能力字段）。
-2. 在 `pkg/tools/call.go` 的 `Call` 分发表里注册名字。
+2. 在 `pkg/tools/call.go` 的 `callTool` 分发表里注册名字，并把常量加进 `knownToolNames`（`alias.go`）——否则"did you mean"永远指不到它。
 3. 在 `NativeXxx()` 里补一份原生 `tool_calls` 声明（仅 `-native-tools` 用）。
 4. 在 `Sandbox.DynamicToolDescriptions` 里加一行人类可读描述——**弱模型主要靠这段文字认识工具**。
 5. 若工具只读，记得在 `previewArgs`（`agent` 包）里加一行，否则运行日志里看不到它在操作什么。
+
+名字解析有两层，别搞混：`CanonicalToolName`（`pkg/tools/alias.go`）把模型凭记忆写出的别名换成真名，**在 agent 侧就做**（`canonicalizeToolNames`），因为 finish 拦截、编辑后自动校验、重复调用检测都按名字分支；`Sandbox.Call` 里也解析一次，是给绕过 agent 的调用方兜底。别名表只收语义唯一的名字：`search`（文件还是网页）和 `stop`（停运行还是结束回合）故意不收——猜错的别名比报错更坏。
 
 ### 改 prompt
 

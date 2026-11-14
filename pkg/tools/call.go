@@ -338,13 +338,23 @@ func NativeWebTools() []map[string]any {
 
 // Call executes a named tool. Returns a string result for the model.
 func (s *Sandbox) Call(ctx context.Context, name string, args map[string]any) (string, error) {
-	name = strings.ToLower(strings.TrimSpace(name))
+	typed := strings.ToLower(strings.TrimSpace(name))
+	// Resolve an invented name before any policy check, so an alias inherits
+	// exactly the confinement and consent rules of the tool it means: `bash`
+	// must be refused when run_bash is disabled, and `write` must ask for
+	// consent when write_file does.
+	name = CanonicalToolName(typed)
 	if reason, disabled := s.ToolDisabled(name); disabled {
 		return "", fmt.Errorf("%s", reason)
 	}
 	if err := s.checkActionConsent(name, args); err != nil {
 		return "", err
 	}
+	return s.callTool(ctx, name, args)
+}
+
+// callTool dispatches one already-resolved tool name.
+func (s *Sandbox) callTool(ctx context.Context, name string, args map[string]any) (string, error) {
 	switch name {
 	case ToolListDir:
 		path, _ := stringArg(args, "path")
@@ -687,7 +697,11 @@ func (s *Sandbox) Call(ctx context.Context, name string, args map[string]any) (s
 		return summary, nil
 
 	default:
-		return "", fmt.Errorf("unknown tool %q; use list_dir, read_file, write_file, replace_lines, delete_path, move_path, run_bash, search_files, find_files, outline, web_search, web_fetch, download_file, sqlite_query, finish", name)
+		hint := ""
+		if guess := suggestTool(name); guess != "" {
+			hint = "; did you mean " + guess + "?"
+		}
+		return "", fmt.Errorf("unknown tool %q%s; use %s", name, hint, strings.Join(knownToolNames, ", "))
 	}
 }
 

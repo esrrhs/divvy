@@ -64,6 +64,7 @@ func (o *Orchestrator) runWorker(ctx context.Context, sb *tools.Sandbox, node *m
 		o.log.Debugf("worker raw: %s", truncate(resp.Content, 400))
 
 		actions, incompleteHint := collectActions(resp)
+		canonicalizeToolNames(actions, nil)
 		if incompleteHint != "" {
 			// Same-turn re-ask: truncated/missing-field JSON is recoverable
 			// without burning MaxRetries. Does not advance the invalid streak
@@ -315,6 +316,21 @@ func collectActions(resp *llm.Response) (actions []taggedAction, incompleteHint 
 		return nil, hint
 	}
 	return []taggedAction{tagged}, ""
+}
+
+// canonicalizeToolNames rewrites invented-but-unambiguous tool names onto the
+// real ones before the loop reasons about them. Resolving at dispatch alone
+// would be too late: finish interception, the post-edit verify and the repeat
+// detector all key off the tool name, so `done` or `edit` would slip past them
+// and burn the step budget. Names owned by an MCP server are left untouched —
+// they are routed to their server before the sandbox ever sees them.
+func canonicalizeToolNames(actions []taggedAction, owned func(string) bool) {
+	for i := range actions {
+		if owned != nil && owned(actions[i].Name) {
+			continue
+		}
+		actions[i].Name = tools.CanonicalToolName(actions[i].Name)
+	}
 }
 
 // incompleteActionHint detects half-parsed / truncated tool JSON and returns a
