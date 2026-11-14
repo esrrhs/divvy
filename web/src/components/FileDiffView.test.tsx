@@ -102,6 +102,40 @@ describe('FileDiffList', () => {
     expect(payload.group_decisions).toEqual([true, false])
   })
 
+  it('splits two adjacent modifications into two groups', async () => {
+    const change: FileChange = {
+      path: 'calc.go',
+      status: 'modified',
+      // Two modifications right next to each other: one run of changed lines.
+      // They must still be two groups, or the user cannot keep one.
+      old_content: 'a\nb\nc\n',
+      new_content: 'A\nB\nc\n',
+    }
+    const apply = vi.fn()
+    await act(async () => {
+      root.render(<FileDiffList changes={[change]} editable mode="apply" onApply={apply} />)
+      await Promise.resolve()
+    })
+    const header = host.querySelector('button')
+    await act(async () => {
+      ;(header as HTMLButtonElement).click()
+      await Promise.resolve()
+    })
+
+    // Drop the second modification.
+    const span = Array.from(host.querySelectorAll('span')).find((s) => s.textContent === 'B')
+    expect(span).toBeTruthy()
+    const target = span?.closest('div')
+    await act(async () => {
+      ;(target as HTMLDivElement).click()
+      await Promise.resolve()
+    })
+
+    expect(apply).toHaveBeenCalledTimes(1)
+    const payload = apply.mock.calls[0][0] as { group_decisions?: boolean[] }
+    expect(payload.group_decisions).toEqual([true, false])
+  })
+
   it('leaves an unknown language uncoloured', async () => {
     const change: FileChange = {
       path: 'notes.txt',

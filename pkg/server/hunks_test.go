@@ -248,3 +248,31 @@ func TestHunkDecisionsFromGroups(t *testing.T) {
 		t.Fatalf("a dropped change must not be reported as accepted: %v", dec)
 	}
 }
+
+// Two modifications side by side are TWO groups: the user keeps one and drops
+// the other. Grouping the whole run made them inseparable, which is the one
+// case a line-level review exists for.
+func TestApplyGroupDecisions_SplitsAdjacentModifications(t *testing.T) {
+	old := "a\nb\nc\n"
+	updated := "A\nB\nc\n"
+
+	// Drop the first modification, keep the second.
+	got, _, err := applyGroupDecisions(old, updated, []bool{false, true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "a\nB\nc\n"
+	if got != want {
+		t.Fatalf("keeping only the second modification: got %q want %q", got, want)
+	}
+
+	// Drop the second, keep the first.
+	got, _, err = applyGroupDecisions(old, updated, []bool{true, false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = "A\nb\nc\n"
+	if got != want {
+		t.Fatalf("keeping only the first modification: got %q want %q", got, want)
+	}
+}

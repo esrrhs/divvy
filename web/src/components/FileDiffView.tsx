@@ -70,21 +70,46 @@ function hunkLines(change: FileChange): { hunks: { index: number; lines: DiffLin
 // coarse: two changes a few lines apart share a hunk (the context around them
 // overlaps), so rejecting one of them rejected both.
 function changeGroups(hunks: { lines: DiffLine[] }[]): number[] {
+	// The group of every line, in the order the hunks show them. A modification
+	// is a remove line plus an add line, and the two are PAIRED positionally:
+	// two modifications next to each other are two groups, so one can be
+	// dropped while the other is kept. The server pairs them the same way
+	// (changeGroups in pkg/server/hunks.go) — the two must agree, or the
+	// decisions land on the wrong lines.
 	const out: number[] = []
-	let gi = -1
-	let prevChanged = false
+	let gi = 0
+	let run: { removes: number[]; adds: number[] } = { removes: [], adds: [] }
+	const flush = () => {
+		if (!run.removes.length && !run.adds.length) return
+		const pairs = Math.min(run.removes.length, run.adds.length)
+		for (let k = 0; k < pairs; k++) {
+			out[run.removes[k]] = gi + k
+			out[run.adds[k]] = gi + k
+		}
+		gi += pairs
+		for (let k = pairs; k < run.removes.length; k++) {
+			out[run.removes[k]] = gi++
+		}
+		for (let k = pairs; k < run.adds.length; k++) {
+			out[run.adds[k]] = gi++
+		}
+		run = { removes: [], adds: [] }
+	}
+	let index = 0
 	for (const h of hunks) {
 		for (const l of h.lines) {
 			if (l.type === 'context') {
-				out.push(-1)
-				prevChanged = false
+				flush()
+				out[index] = -1
+				index++
 				continue
 			}
-			if (!prevChanged) gi++
-			out.push(gi)
-			prevChanged = true
+			if (l.type === 'remove') run.removes.push(index)
+			else run.adds.push(index)
+			index++
 		}
 	}
+	flush()
 	return out
 }
 

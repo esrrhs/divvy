@@ -211,13 +211,35 @@ func changeGroups(lines []diffLine) [][]int {
 		if lines[i].Type == "context" {
 			continue
 		}
-		start := i
+		var removes, adds []int
 		for i < len(lines) && lines[i].Type != "context" {
+			if lines[i].Type == "remove" {
+				removes = append(removes, i)
+			} else {
+				adds = append(adds, i)
+			}
 			i++
 		}
-		// The inner loop stops ON the first context line, so the group's last
-		// changed line is the one before it.
-		groups = append(groups, []int{start, i - 1})
+		// A modification shows up as a remove line plus an add line, so the
+		// removes and the adds of a run are PAIRED positionally: the i-th
+		// remove belongs to the i-th add. Two modifications that sit next to
+		// each other are therefore two groups, and the user can drop one and
+		// keep the other. Grouping the whole run instead made them
+		// inseparable.
+		pairs := len(removes)
+		if len(adds) < pairs {
+			pairs = len(adds)
+		}
+		for k := 0; k < pairs; k++ {
+			groups = append(groups, []int{removes[k], adds[k]})
+		}
+		// Whatever is left over is a pure deletion or a pure addition.
+		for k := pairs; k < len(removes); k++ {
+			groups = append(groups, []int{removes[k]})
+		}
+		for k := pairs; k < len(adds); k++ {
+			groups = append(groups, []int{adds[k]})
+		}
 	}
 	return groups
 }
@@ -237,34 +259,70 @@ func applyGroupDecisions(oldText, newText string, decisions []bool) (string, []d
 	if len(decisions) != len(groups) {
 		return "", nil, fmt.Errorf("group decisions (%d) do not match the %d changes", len(decisions), len(groups))
 	}
-	groupOf := make(map[int]int, len(lines))
-	for gi, g := range groups {
-		for _, i := range g {
-			groupOf[i] = gi
-		}
-	}
+	// The output has to follow the FILE's line order, not the diff's.
+	//
+	// The diff emits a run of changed lines as all the removals first and then
+	// all the additions. Walking it line by line therefore puts a KEPT
+	// removal (an old line that stays) before the addition that replaces
+	// another line — "b" then "A" instead of "A" then "b". The file's lines
+	// end up shuffled, which is worse than a rejected change.
+	//
+	// So the run is emitted group by group: an accepted group contributes its
+	// new lines, a rejected one its old lines, and the groups are in position
+	// order.
 	var b strings.Builder
-	for i, l := range lines {
-		var keep bool
-		switch l.Type {
-		case "context":
-			keep = true
-		case "add":
-			keep = decisions[groupOf[i]]
-		case "remove":
-			keep = !decisions[groupOf[i]]
-		default:
-			return "", nil, fmt.Errorf("unknown diff line type %q", l.Type)
-		}
-		if !keep {
-			continue
-		}
+	write := func(text string) {
 		if b.Len() > 0 {
 			b.WriteByte('\n')
 		}
-		b.WriteString(l.Text)
+		b.WriteString(text)
+	}
+	for i := 0; i < len(lines); {
+		l := lines[i]
+		switch l.Type {
+		case "context":
+			write(l.Text)
+			i++
+			continue
+		case "add", "remove":
+		default:
+			return "", nil, fmt.Errorf("unknown diff line type %q", l.Type)
+		}
+		// A run of changed lines: emit it group by group.
+		runStart := i
+		for i < len(lines) && lines[i].Type != "context" {
+			i++
+		}
+		for gi, g := range groups {
+			if gi >= len(decisions) || !groupInRange(g, runStart, i) {
+				continue
+			}
+			accepted := decisions[gi]
+			for _, li := range g {
+				line := lines[li]
+				if accepted && line.Type == "add" {
+					write(line.Text)
+				}
+				if !accepted && line.Type == "remove" {
+					write(line.Text)
+				}
+			}
+		}
 	}
 	return keepTrailingNL(oldText, newText, b.String()), hunks, nil
+}
+
+// groupInRange reports whether a group's lines all sit inside [start, end).
+func groupInRange(g []int, start, end int) bool {
+	if len(g) == 0 {
+		return false
+	}
+	for _, i := range g {
+		if i < start || i >= end {
+			return false
+		}
+	}
+	return true
 }
 
 // hunkDecisionsFromGroups folds the per-group decisions back into the
