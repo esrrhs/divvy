@@ -307,6 +307,31 @@ describe('AiEditDialog', () => {
     expect(undo).toHaveBeenCalledTimes(2)
   })
 
+  it('shows the change where it happens, with the surrounding lines', async () => {
+    vi.spyOn(api, 'aiEditStream').mockResolvedValue({
+      ...RESULT,
+      context_before: 'package p\n\nfunc A() int {\n',
+      context_after: '}\n',
+    })
+    await render()
+    await act(async () => {
+      typeInto(host.querySelector('textarea') as HTMLTextAreaElement, '改一下')
+      await Promise.resolve()
+    })
+    await act(async () => {
+      ;(Array.from(host.querySelectorAll('button')).find((b) => b.textContent?.includes('生成候选')) as HTMLButtonElement).click()
+      await Promise.resolve()
+    })
+
+    expect(host.textContent).toContain('改动所在的位置')
+    expect(host.textContent).toContain('func A() int {')
+    // The proposal is marked, the context is not.
+    const marked = Array.from(host.querySelectorAll('span')).find((sp) =>
+      sp.className.includes('bg-emerald-950'),
+    )
+    expect(marked?.textContent).toContain('return 2')
+  })
+
   it('drops the earlier turns when the user starts over', async () => {
     const bodies: AiEditRequest[] = []
     vi.spyOn(api, 'aiEditStream').mockImplementation(async (_id, body) => {

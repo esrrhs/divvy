@@ -439,6 +439,9 @@ export interface AiEditResponse {
   hunks: ReviewHunk[]
   preview: string
   truncated?: boolean
+  /** The lines around the edited region, so the change can be shown in place. */
+  context_before?: string
+  context_after?: string
 }
 
 export interface AiEditApplyRequest {

@@ -245,6 +245,19 @@ export function AiEditDialog() {
             </p>
           )}
 
+          {result && (result.context_before || result.context_after || result.new_text) && (
+            <div className="mb-3 overflow-hidden rounded-md border border-line bg-ink-950/50">
+              <div className="border-b border-line bg-ink-900 px-3 py-1.5 text-[11px] text-slate-500">
+                改动所在的位置（上下文）
+              </div>
+              <pre className="max-h-[220px] overflow-auto whitespace-pre-wrap break-all p-3 font-mono text-[11.5px] leading-[1.55] text-slate-500">
+                {result.context_before}
+                <span className="bg-emerald-950/50 text-emerald-200">{result.new_text}</span>
+                {result.context_after}
+              </pre>
+            </div>
+          )}
+
           {result && hunks.length === 0 && (
             <p className="rounded border border-line bg-ink-900 px-2.5 py-1.5 text-[12px] text-slate-400">
               模型返回的代码与原选区一致，没有可应用的改动。

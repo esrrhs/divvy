@@ -671,3 +671,47 @@ func TestAiEdit_UndoWithoutRecord(t *testing.T) {
 		t.Fatalf("undo without record: status=%d resp=%v", status, got)
 	}
 }
+
+// The dialog shows the change where it happens: the response carries the
+// lines around the region, so "keep this or drop it" can be judged in place.
+func TestAiEdit_ResponseCarriesSurroundingContext(t *testing.T) {
+	work := t.TempDir()
+	var lines []string
+	lines = append(lines, "package p", "")
+	for i := 1; i <= 30; i++ {
+		lines = append(lines, fmt.Sprintf("// line %d", i), fmt.Sprintf("var v%d = %d", i, i))
+	}
+	src := strings.Join(lines, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(work, "p.go"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ts, _ := aiEditHarness(t, work, "unused")
+	id := newAiEditConv(t, ts, work)
+
+	// Edit the region around line 21-22 (the "var v10 = 10" pair).
+	status, got := apiDo(t, http.MethodPost, apiBase(ts)+"/conversations/"+id+"/ai-edit?token=test-token", map[string]any{
+		"path":        "p.go",
+		"instruction": "fix",
+		"selection":   map[string]any{"start_line": 21, "end_line": 22},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("ai-edit status=%d resp=%v", status, got)
+	}
+	before := anyString(got["context_before"])
+	after := anyString(got["context_after"])
+	// The file is: package, blank, then "// line i" / "var vi = i" pairs. The
+	// region covers file lines 21-22, which are "// line 10" / "var v10 = 10".
+	if !strings.Contains(before, "// line 9") || !strings.Contains(before, "var v9 = 9") {
+		t.Fatalf("context_before should carry the lines before the region: %q", before)
+	}
+	if strings.Contains(before, "var v10 = 10") {
+		t.Fatalf("the region's own lines belong to the proposal, not the context: %q", before)
+	}
+	if !strings.Contains(after, "// line 11") || !strings.Contains(after, "var v11 = 11") {
+		t.Fatalf("context_after should carry the lines after the region: %q", after)
+	}
+	// The context is bounded: a big file must not ship the whole thing.
+	if len(before) > 4096 || len(after) > 4096 {
+		t.Fatalf("context must stay bounded: before=%d after=%d", len(before), len(after))
+	}
+}

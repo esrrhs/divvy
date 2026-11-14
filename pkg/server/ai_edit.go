@@ -72,6 +72,11 @@ type aiEditResponse struct {
 	NewText    string     `json:"new_text"`
 	Hunks      []diffHunk `json:"hunks"`
 	Preview    string     `json:"preview"`
+	// ContextBefore / ContextAfter are the lines around the edited region, so
+	// the dialog can show the change where it happens instead of a bare diff.
+	// Judging "keep this or drop it" needs the surroundings.
+	ContextBefore string `json:"context_before,omitempty"`
+	ContextAfter  string `json:"context_after,omitempty"`
 	// Truncated reports that the file was too large to send whole and only a
 	// window around the selection was used.
 	Truncated bool `json:"truncated,omitempty"`
@@ -97,6 +102,29 @@ type aiEditApplyResponse struct {
 	Rejected   int    `json:"rejected"`
 	NewContent string `json:"new_content"`
 	Conflict   bool   `json:"conflict"`
+}
+
+// aiEditContextLines is how many lines of context the dialog shows around the
+// edited region. Enough to see the function the change belongs to.
+const aiEditContextLines = 18
+
+// aiEditContext returns the lines around the edited region.
+func aiEditContext(content string, region aiEditRegion, radius int) (before, after string) {
+	if region.StartOffset < 0 || region.EndOffset > len(content) ||
+		region.StartOffset > region.EndOffset {
+		return "", ""
+	}
+	before = content[:region.StartOffset]
+	after = content[region.EndOffset:]
+	if radius > 0 {
+		if parts := strings.Split(strings.TrimRight(before, "\n"), "\n"); len(parts) > radius {
+			before = strings.Join(parts[len(parts)-radius:], "\n") + "\n"
+		}
+		if parts := strings.Split(strings.TrimRight(after, "\n"), "\n"); len(parts) > radius {
+			after = strings.Join(parts[:radius], "\n") + "\n"
+		}
+	}
+	return before, after
 }
 
 // aiEditContextChars bounds the file content pasted into the prompt. Beyond
@@ -244,18 +272,21 @@ func (s *Server) handleAiEdit(w http.ResponseWriter, r *http.Request) {
 	}
 	newText := stripCodeFence(raw)
 	hunks, preview := aiEditDiff(region.OldText, newText, region.StartLine)
+	before, after := aiEditContext(content, region, aiEditContextLines)
 
 	out := aiEditResponse{
-		Path:       rel,
-		BaseHash:   fileSHA256([]byte(content)),
-		StartLine:  region.StartLine,
-		EndLine:    region.EndLine,
-		InsertLine: region.InsertLine,
-		OldText:    Redact(region.OldText, secrets...),
-		NewText:    Redact(newText, secrets...),
-		Hunks:      redactDiffHunks(hunks, secrets),
-		Preview:    Redact(preview, secrets...),
-		Truncated:  region.Truncated,
+		Path:          rel,
+		BaseHash:      fileSHA256([]byte(content)),
+		StartLine:     region.StartLine,
+		EndLine:       region.EndLine,
+		InsertLine:    region.InsertLine,
+		OldText:       Redact(region.OldText, secrets...),
+		NewText:       Redact(newText, secrets...),
+		Hunks:         redactDiffHunks(hunks, secrets),
+		Preview:       Redact(preview, secrets...),
+		ContextBefore: Redact(before, secrets...),
+		ContextAfter:  Redact(after, secrets...),
+		Truncated:     region.Truncated,
 	}
 	if stream {
 		writeAiEditEvent(w, flusher, "done", out)
