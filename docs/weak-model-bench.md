@@ -22,7 +22,7 @@ go run ./cmd/bench -base-url https://api.example.com/v1 -model small-model -api-
 
 ## 语料库
 
-固定、版本化在 `cmd/bench/corpus.go` 里——基准的目标集一旦漂移，跨运行的比较就失去意义。五个目标覆盖五种任务形态（四个单文件 + 一个必须拆的多文件）：
+固定、版本化在 `cmd/bench/corpus.go` 里——基准的目标集一旦漂移，跨运行的比较就失去意义。**七个**目标覆盖七种任务形态（六个单文件 + 一个必须拆的多文件）：
 
 | 目标 | 形态 | 验收命令（`Goal.Accept`） |
 |---|---|---|
@@ -31,6 +31,7 @@ go run ./cmd/bench -base-url https://api.example.com/v1 -model small-model -api-
 | `http-health` | 构建可运行 HTTP 服务 + 单测 | `go build ./... && go test ./...` |
 | `config-cli` | **多文件**：契约测试 + 3 个职责不同的文件（config.go / run.go / main.go） | `go build ./... && go test ./...` |
 | `merge-intervals` | **恢复成本**：区间合并的经典相邻 off-by-one（契约在测试里，提示词不说 bug 在哪） | `go build ./... && go test ./...` |
+| `layered-config` | **恢复成本**：分层配置加载器（默认值 / JSON 文件 / 环境变量三层，空值与不可解析值都算未设置） | `go build ./... && go test ./...` |
 | `cmake-add` | CMake/C++ 目标 + ctest | `ctest --test-dir build --output-on-failure -R add` |
 
 选 Go 是因为它是唯一能**完全离线自验收**的栈（`go build`/`go test` 不需要网络），基准因此是 hermetic 的：结果差异只来自模型和引擎，不来自外部服务抖动。
