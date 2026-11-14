@@ -31,17 +31,24 @@ type benchReport struct {
 }
 
 // renderTable prints the human-readable per-run table. Columns are fixed
-// width so runs line up; the error column takes the remainder. The ACPT column
-// only carries meaning for direct runs (tree runs get their verdict from the
-// plan's DoD), so tree rows show "-".
+// width so runs line up; the error column takes the remainder.
+//
+// OK is the harness's verdict: the corpus's own acceptance command, the same
+// command for both loops. ENG is the engine's own verdict — for a tree run
+// that is the model's goal-level DoD passing. A row with OK=no and ENG=yes is
+// the interesting one: the engine accepted a deliverable that does not work.
 func renderTable(rs []RunResult) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%-14s %-6s %3s %3s %8s %6s %9s %6s %5s %5s %5s %5s  %s\n",
-		"GOAL", "LOOP", "REP", "OK", "WALL", "CALLS", "TOKENS", "LEAVES", "ACPT", "VFAIL", "RETRY", "STALL", "ERROR")
+	fmt.Fprintf(&b, "%-14s %-6s %3s %3s %3s %8s %6s %9s %6s %5s %5s %5s %5s %5s  %s\n",
+		"GOAL", "LOOP", "REP", "OK", "ENG", "WALL", "CALLS", "TOKENS", "LEAVES", "ACPT", "VFAIL", "RETRY", "STALL", "RESPLITS", "ERROR")
 	for _, r := range rs {
 		ok := "no"
 		if r.OK {
 			ok = "yes"
+		}
+		eng := "no"
+		if r.EngineOK {
+			eng = "yes"
 		}
 		loop := r.Loop
 		if loop == "" {
@@ -49,7 +56,6 @@ func renderTable(rs []RunResult) string {
 		}
 		acpt := "-"
 		switch {
-		case loop != loopDirect:
 		case !r.AcceptRan:
 			acpt = "skip"
 		case r.AcceptOK:
@@ -57,8 +63,8 @@ func renderTable(rs []RunResult) string {
 		default:
 			acpt = "FAIL"
 		}
-		fmt.Fprintf(&b, "%-14s %-6s %3d %3s %8s %6d %9d %6s %5s %5d %5d %5d %5d  %s\n",
-			r.Goal, loop, r.Repeat, ok, r.Wall().String(), r.LLMCalls, r.TotalTokens,
+		fmt.Fprintf(&b, "%-14s %-6s %3d %3s %3s %8s %6d %9d %6s %5s %5d %5d %5d %5d  %s\n",
+			r.Goal, loop, r.Repeat, ok, eng, r.Wall().String(), r.LLMCalls, r.TotalTokens,
 			fmt.Sprintf("%d/%d", r.LeavesDone, r.Leaves), acpt,
 			r.VerifyFail, r.Retries, r.Stalls, r.Resplits, r.Error)
 	}
@@ -71,9 +77,10 @@ func (r RunResult) Wall() time.Duration { return time.Duration(r.WallMS) * time.
 // renderAggregate prints the bench-level verdict line.
 func renderAggregate(a Aggregate) string {
 	return fmt.Sprintf(
-		"runs=%d ok=%d (%.0f%%) wall=%s calls=%d tokens=%d cost=$%.4f verify-fail=%d retries=%d stalls=%d resplits=%d\n",
+		"runs=%d ok=%d (%.0f%%) wall=%s calls=%d tokens=%d cost=$%.4f verify-fail=%d retries=%d stalls=%d resplits=%d self-pass=%d accept-only-pass=%d\n",
 		a.Runs, a.OK, a.SuccessRate*100, (time.Duration(a.WallMS) * time.Millisecond).String(),
-		a.LLMCalls, a.TotalTokens, a.CostUSD, a.VerifyFail, a.Retries, a.Stalls, a.Resplits)
+		a.LLMCalls, a.TotalTokens, a.CostUSD, a.VerifyFail, a.Retries, a.Stalls, a.Resplits,
+		a.SelfPass, a.AcceptOnlyPass)
 }
 
 // writeReport persists the JSON report. A write failure is reported but does

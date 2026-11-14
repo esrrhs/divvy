@@ -199,6 +199,102 @@ func TestBench_GoalRunEndToEnd(t *testing.T) {
 // TestBench_SeedWorkspaceIsolomorphic checks the fix-average corpus really
 // contains a failing bug (the bench is worthless if its goals are broken):
 // the seeded test must fail against the seeded implementation.
+// The tree mode used to be graded by the model's OWN goal-level DoD. A model
+// that wrote `true` as its acceptance passed the bench with a deliverable that
+// does not exist. The corpus declares the command that decides the goal
+// objectively, and it has to be the same command for both loops — otherwise
+// the two rows are not comparable and the tree row is the model grading
+// itself.
+func TestBench_TreeRunIsGradedByTheCorpusNotTheModelDoD(t *testing.T) {
+	step := 0
+	client := &llm.ScriptedClient{Handle: func(_ context.Context, req llm.Request) (*llm.Response, error) {
+		sys := ""
+		if len(req.Messages) > 0 {
+			sys = req.Messages[0].Content
+		}
+		if strings.Contains(sys, "software architect") {
+			// The model's acceptance is trivial and passes.
+			return &llm.Response{Content: mustJSON(map[string]any{
+				"is_atomic": true,
+				"reason":    "one file",
+				"contract": map[string]any{
+					"inputs":       []string{},
+					"outputs":      []string{"main.go"},
+					"dependencies": []string{},
+					"constraints":  []string{},
+				},
+				"dod": map[string]any{
+					"description": "whatever the model felt like writing",
+					"commands":    []string{"true"},
+					"timeout_sec": 30,
+				},
+			}), Usage: llm.Usage{PromptTokens: 10, CompletionTokens: 5}}, nil
+		}
+		step++
+		if step == 1 {
+			return &llm.Response{Content: mustJSON(map[string]any{
+				"thought": "write the file",
+				"action":  "write_file",
+				"args": map[string]any{
+					"path":    "main.go",
+					"content": "package main\n\nfunc main() {}\n",
+				},
+			}), Usage: llm.Usage{PromptTokens: 10, CompletionTokens: 5}}, nil
+		}
+		return &llm.Response{Content: mustJSON(map[string]any{
+			"thought": "done",
+			"action":  "finish",
+			"args":    map[string]any{"summary": "wrote main.go"},
+		}), Usage: llm.Usage{PromptTokens: 10, CompletionTokens: 5}}, nil
+	}}
+
+	g := Goal{
+		Name:   "self-pass",
+		Module: "selfpass",
+		Prompt: "write a main.go",
+		// The corpus's own acceptance: the deliverable must exist. The
+		// model's DoD says nothing about it.
+		Accept: "test -f deliverable.txt",
+	}
+	bc := benchConfig{
+		Model:      "scripted",
+		MaxSteps:   10,
+		MaxRetries: 1,
+		Timeout:    3 * time.Minute,
+		Root:       t.TempDir(),
+		Pricing:    cost.DefaultPricing(),
+		newClient:  func(agent.Config) llm.Client { return client },
+	}
+
+	res := runGoal(context.Background(), g, 1, bc)
+	if res.OK {
+		t.Fatalf("a run whose deliverable does not exist must not be ok: %+v", res)
+	}
+	// The engine thought it was done: that gap is the number worth seeing.
+	if !res.EngineOK {
+		t.Fatalf("expected the engine to consider the goal done (its own DoD passed): %+v", res)
+	}
+	if !res.AcceptRan || res.AcceptOK {
+		t.Fatalf("the corpus acceptance must have run and failed: %+v", res)
+	}
+	if !strings.Contains(res.Error, "acceptance failed") {
+		t.Fatalf("the error must say the acceptance failed: %q", res.Error)
+	}
+
+	// And the report has to show the gap, not hide it behind one verdict.
+	agg := aggregate([]RunResult{res})
+	if agg.SelfPass != 1 {
+		t.Fatalf("self-pass = %d, want 1 (the engine said done, the deliverable does not work)", agg.SelfPass)
+	}
+	if agg.OK != 0 {
+		t.Fatalf("ok = %d, want 0", agg.OK)
+	}
+	table := renderTable([]RunResult{res})
+	if !strings.Contains(table, "ENG") || !strings.Contains(table, "RESPLITS") {
+		t.Fatalf("the table must carry the engine verdict and the resplit count:\n%s", table)
+	}
+}
+
 func TestBench_SeedWorkspaceIsolomorphic(t *testing.T) {
 	g, ok := goalByName("fix-average")
 	if !ok {

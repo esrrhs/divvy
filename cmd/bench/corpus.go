@@ -20,11 +20,16 @@ import "strings"
 // run; the prompt is the goal divvy receives; Module is the go module name
 // seeded via `go mod init` (empty means the goal runs in a generic workspace).
 //
-// Accept is the command that decides the goal objectively. Tree mode gets its
-// acceptance from the plan's DoD, so Accept is unused there; direct mode has no
-// task contract, so the harness runs this itself once the loop returns. That is
-// the only fair way to compare the two loops: same goal, same command, same
-// workspace state.
+// Accept is the command that decides the goal objectively, and it is the
+// verdict for BOTH loops: the harness runs it against the finished workspace
+// after the loop returns. Same goal, same command, same workspace state —
+// otherwise the two rows are not comparable.
+//
+// This matters most for tree mode: its own acceptance is the model's
+// goal-level DoD, so grading a tree run by it lets the model grade itself
+// (a DoD of "ls" would pass a deliverable that does not work). The engine's
+// own verdict is still recorded, as EngineOK, so the gap between "the engine
+// said done" and "the deliverable works" is visible instead of averaged away.
 type Goal struct {
 	Name   string
 	Module string

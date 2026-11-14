@@ -96,10 +96,23 @@ type RunResult struct {
 	// -loop values is still readable.
 	Loop string `json:"loop,omitempty"`
 
-	// Accept* describe the harness-run acceptance of direct-mode runs. Tree
-	// mode decides completion through the plan's own DoD, so these stay false
-	// there; AcceptRan=false on a direct run means the host cannot execute
-	// commands at all and the loop's own verdict is all we have.
+	// EngineOK is the engine's OWN verdict: the tree's root completed (its
+	// goal-level DoD, written by the model, passed) or the direct loop
+	// finished without an error.
+	//
+	// It is kept next to the harness verdict because the gap between the two
+	// is the most interesting number in the report: an engine that says
+	// "done" while the deliverable does not work is a false positive, and
+	// the corpus's own acceptance command is the only thing that can see it.
+	EngineOK bool `json:"engine_ok"`
+
+	// Accept* describe the harness-run acceptance of the run. This is the
+	// verdict that decides OK: the corpus declares the command that decides
+	// the goal objectively, and it is the same command for both loops.
+	//
+	// AcceptRan=false means the host cannot execute commands at all (no
+	// isolation backend) — then the engine's own verdict is all we have, and
+	// the row says so.
 	AcceptRan bool   `json:"accept_ran"`
 	AcceptOK  bool   `json:"accept_ok"`
 	AcceptOut string `json:"accept_output,omitempty"`
@@ -121,6 +134,15 @@ type Aggregate struct {
 	Stalls      int     `json:"stalls"`
 	Resplits    int     `json:"resplits"`
 	SuccessRate float64 `json:"success_rate"`
+
+	// SelfPass counts runs the engine called done while the corpus's own
+	// acceptance says the deliverable does not work. It is the sharpest
+	// number in the report: it is exactly how often the engine's contract
+	// accepted a broken result.
+	SelfPass int `json:"self_pass"`
+	// AcceptOnlyPass counts the opposite: the engine gave up even though the
+	// deliverable works. A too-strict contract costs money too.
+	AcceptOnlyPass int `json:"accept_only_pass"`
 }
 
 func aggregate(rs []RunResult) Aggregate {
@@ -138,6 +160,13 @@ func aggregate(rs []RunResult) Aggregate {
 		a.Retries += r.Retries
 		a.Stalls += r.Stalls
 		a.Resplits += r.Resplits
+		// The gap between the engine's own verdict and the objective one.
+		if r.EngineOK && !r.OK {
+			a.SelfPass++
+		}
+		if !r.EngineOK && r.OK {
+			a.AcceptOnlyPass++
+		}
 	}
 	if a.Runs > 0 {
 		a.SuccessRate = float64(a.OK) / float64(a.Runs)
@@ -287,30 +316,38 @@ func runGoal(ctx context.Context, g Goal, repeat int, bc benchConfig) RunResult 
 		res.GiveUps = summary.GiveUps
 	}
 
+	// The engine's own verdict: did the engine consider the goal done? For a
+	// tree run that means the root completed, which means the MODEL'S OWN
+	// goal-level DoD passed. For a direct run it means the loop finished.
+	res.EngineOK = runErr == nil && (loop == loopDirect || rootCompleted(o))
+
+	// The harness's verdict: the corpus's own acceptance command, run against
+	// the finished workspace. Direct mode has no contract to satisfy, so this
+	// has always been its verdict. Tree mode used to be graded by the model's
+	// own DoD — but that DoD is written by the very model being measured, so a
+	// DoD of "ls" would pass a broken deliverable and the bench would report
+	// a capability that does not exist. Same command, same workspace, both
+	// modes; otherwise the two rows are not comparable.
+	//
+	// The acceptance gets the PARENT context, not the run's: a run that used
+	// up its whole budget must not make the acceptance fail on a deadline it
+	// did not cause.
+	ok, ran, out := runAcceptance(ctx, g, res.Workdir)
+	res.AcceptRan, res.AcceptOK, res.AcceptOut = ran, ok, out
 	switch {
 	case runErr != nil:
 		res.Error = oneLine(runErr.Error())
-	case loop == loopDirect:
-		// Direct mode has no contract to satisfy, so the harness supplies the
-		// verdict: run the same acceptance command the tree goals declare.
-		ok, ran, out := runAcceptance(runCtx, g, res.Workdir)
-		res.AcceptRan, res.AcceptOK, res.AcceptOut = ran, ok, out
-		switch {
-		case !ran:
-			// The host cannot execute commands (no isolation backend), so the
-			// loop's own finish gate is the only verdict available. Say so in
-			// the row instead of pretending the goal was verified.
-			res.OK = true
-			res.AcceptOut = out
-		case ok:
-			res.OK = true
-		default:
-			res.Error = "acceptance failed: " + oneLine(out)
-		}
-	case rootCompleted(o):
+	case !ran:
+		// The host cannot execute commands (no isolation backend), so the
+		// engine's own verdict is the only one available. Say so in the row
+		// instead of pretending the goal was verified.
+		res.OK = res.EngineOK
+		res.AcceptOut = out
+	case ok:
 		res.OK = true
 	default:
-		res.Error = "run returned no error but the root goal is not COMPLETED"
+		res.OK = false
+		res.Error = "acceptance failed: " + oneLine(out)
 	}
 	// A pass that required editing the test which defines the task is not a
 	// pass. Checked after the verdict so a run that already failed keeps its

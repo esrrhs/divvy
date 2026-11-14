@@ -61,6 +61,23 @@ go run ./cmd/bench -loop direct -goals fix-average -repeat 3
 - 成本按内置价目表估算；本地模型（Ollama）不在表内，记为 $0，token 数仍然有效。
 - 事件计数来自会话事件流（`agent.SummarizeEvents`），与 `-report` 复盘同一数据源。
 
+### 谁来判定成败：语料说了算，不是模型
+
+`OK` 这一列是**语料自己的验收命令**（`Goal.Accept`）在跑完的工作区上跑出来的结果，两种循环用的是**同一条命令**。
+
+树模式以前不是这样：它的成败由"根节点是否 COMPLETED"决定，也就是**模型自己写的根级 DoD** 通过了就算过。这等于让被测模型给自己打分——它把 DoD 写成 `ls` 或者 `true`，一个根本不存在的交付物也能"通过"。现在两种循环都由语料判定，模型自己的判定另记为 `ENG` 列。
+
+`ENG` 与 `OK` 不一致的行就是这个项目最该盯的数字：
+
+- `ENG=yes, OK=no` → **引擎的自判是假阳性**（聚合行里的 `self-pass=`）。根验收（模型写的）过了，交付物实际不能用。
+- `ENG=no, OK=yes` → 引擎过严（`accept-only-pass=`）。
+
+回归测试 `TestBench_TreeRunIsGradedByTheCorpusNotTheModelDoD` 用一个"模型的 DoD 写 `true`、语料的验收要求交付物存在"的目标钉住这条：模型那边判定为完成，语料这边判定为失败，最终 `OK=no`。
+
+顺带修掉两个小毛病：验收命令现在用**父 context** 而不是运行自己的 context（一次跑满预算的运行不该让验收因为它没造成的超时而失败）；表格的表头此前少了一列 `RESPLITS`，行里却打了这一列。
+
+> **已登记的历史数字的 caveat**：本节之前记下的树模式行，成败是由**模型自己的根级 DoD** 判的。查那几行当时模型写的 DoD：`fix-average` 是 `go build ./... && go test ./...`，`config-cli` 是 `go build ./... && go test ./... && go build -o /tmp/configcli . && ... && /tmp/configcli /tmp/cfg.json` —— 都是真的端到端命令，所以那几行的结论仍然站得住。但这是运气，不是保证：换一个写下 `true` 的模型，同一套工具会把它记成成功。从现在起判定权在语料手里。
+
 ## 工作区与事后解剖
 
 每个目标一次运行一个目录：`<root>/<goal>-r<n>/`，内含 seed 的初始 git 提交、运行出的代码、以及该次运行的 `.divvy` 会话数据（树 JSON / 事件流 / 日志）。默认全部保留：
