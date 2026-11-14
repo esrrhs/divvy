@@ -313,6 +313,57 @@ func planEditCheck(root string, paths []string) (ProjectType, []string, string) 
 	return project, cmds, ""
 }
 
+// maxProjectCheckCommands caps the project-wide check. It is one build plus a
+// vet per edited package: a turn that touched ten packages does not need ten
+// vets, and the build alone already covers most of the value.
+const maxProjectCheckCommands = 4
+
+// PlanProjectCheck returns the whole-project verification for a turn that
+// touched the given files.
+//
+// The per-edit check compiles the package that was edited. That is the right
+// cheap check for a single edit and the wrong gate for a turn: change a
+// function's signature and every package that calls it stops compiling — and
+// none of those packages is compiled by the edited package's own build. So a
+// turn could end "successfully" with a workspace that does not build.
+//
+// Only Go needs this. Rust's per-edit check is already `cargo check`
+// (project-wide), and Python/Node have no cheap offline project-wide type
+// check: their per-file syntax parse is all there is, and pretending
+// otherwise would be a gate that passes without proving anything.
+func PlanProjectCheck(root string, paths []string) (ProjectType, []string, string) {
+	project := DetectProject(root)
+	if project != ProjectGo {
+		return project, nil, ""
+	}
+	cmds := []string{"go build ./..."}
+	seen := map[string]bool{}
+	for _, p := range paths {
+		rel := filepath.ToSlash(strings.TrimSpace(p))
+		rel = strings.TrimPrefix(rel, "./")
+		if rel == "" || strings.HasPrefix(rel, "../") || !strings.HasSuffix(rel, ".go") {
+			continue
+		}
+		if underAnyDir(rel, "vendor", "testdata", "node_modules") {
+			continue
+		}
+		dir := path.Dir(rel)
+		if dir == "." {
+			dir = ""
+		}
+		// `go build` never looks at test files, so a rename in a.go that breaks
+		// a_test.go passes the build. Vet compiles the package's tests.
+		cmd := goVetCommand(dir)
+		if seen[cmd] || len(cmds) >= maxProjectCheckCommands {
+			continue
+		}
+		seen[cmd] = true
+		cmds = append(cmds, cmd)
+	}
+	return project, cmds, ""
+}
+
+// goBuildCommand builds one Go package.
 func goBuildCommand(dir string) string {
 	if dir == "" {
 		return "go build ."

@@ -410,3 +410,78 @@ func TestEditCheck_SyntaxOnlyWording(t *testing.T) {
 		t.Fatal("a mixed list includes a real build")
 	}
 }
+
+// TestPlanProjectCheck: the project-wide check exists because the per-edit
+// check only compiles the package that was touched — a change that breaks a
+// dependent package must still be caught.
+func TestPlanProjectCheck(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module m\n\ngo 1.22\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mk := func(rel string) {
+		p := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("package x\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk("pkg/a.go")
+	mk("pkg/b.go")
+	mk("vendor/v/x.go")
+
+	project, cmds, skip := PlanProjectCheck(root, []string{"pkg/a.go"})
+	if project != ProjectGo || skip != "" {
+		t.Fatalf("project=%v skip=%q", project, skip)
+	}
+	if len(cmds) != 2 || cmds[0] != "go build ./..." {
+		t.Fatalf("cmds=%q", cmds)
+	}
+	// The edited package is vetted as well: `go build` never looks at test
+	// files, so a rename that breaks a_test.go passes the build.
+	if cmds[1] != "go vet ./'pkg'" {
+		t.Fatalf("cmds=%q", cmds)
+	}
+
+	// A vendored file is not the project's code.
+	_, cmds, _ = PlanProjectCheck(root, []string{"vendor/v/x.go"})
+	if len(cmds) != 1 || cmds[0] != "go build ./..." {
+		t.Fatalf("cmds=%q", cmds)
+	}
+
+	// No Go project: there is no cheap project-wide build to promise.
+	plain := t.TempDir()
+	if err := os.WriteFile(filepath.Join(plain, "main.py"), []byte("print(1)\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, cmds, _ = PlanProjectCheck(plain, []string{"main.py"})
+	if len(cmds) != 0 {
+		t.Fatalf("a non-Go project must not get a project check: %q", cmds)
+	}
+}
+
+// The command list is capped: a turn that touched ten packages does not need
+// ten vets, and the build alone already carries most of the value.
+func TestPlanProjectCheck_CapsCommands(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module m\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var paths []string
+	for _, d := range []string{"a", "b", "c", "d", "e"} {
+		dir := filepath.Join(root, d)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "x.go"), []byte("package x\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		paths = append(paths, d+"/x.go")
+	}
+	_, cmds, _ := PlanProjectCheck(root, paths)
+	if len(cmds) > maxProjectCheckCommands {
+		t.Fatalf("cmds=%d, want <= %d: %q", len(cmds), maxProjectCheckCommands, cmds)
+	}
+}

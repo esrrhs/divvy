@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -91,6 +92,10 @@ type DirectAgent struct {
 	// (shell execution is unavailable on some hosts).
 	editCheck    func(ctx context.Context, paths []string) tools.EditCheck
 	recheckEdits func(ctx context.Context, cmds []string) tools.EditCheck
+	// projectCheck runs the whole-project check (before the first edit and
+	// again at finish). It is a field so tests can exercise the gate without
+	// a real toolchain.
+	projectCheck func(ctx context.Context, cmds []string) tools.EditCheck
 	// recheckCmds holds commands whose last post-edit check failed. Finish is
 	// refused while one of them still fails, so "it compiles" is not something
 	// the model can assert without the workspace agreeing.
@@ -98,6 +103,20 @@ type DirectAgent struct {
 	// verifyRejects counts consecutive finish refusals caused by the check, so
 	// an unfixable toolchain problem cannot trap the run forever.
 	verifyRejects int
+	// editedFiles are the workspace paths this turn touched. The project-wide
+	// check at finish needs them: it also vets the edited packages, so a
+	// rename that broke a test file is caught too.
+	editedFiles []string
+	// baselineDone records that the pre-edit baseline already ran, and
+	// baselineFP is the fingerprint of a project-wide check that was ALREADY
+	// failing before this turn's first edit. A final check that reproduces it
+	// is the user's own breakage, not this turn's work.
+	baselineDone bool
+	baselineFP   string
+	// projectRejects counts consecutive finish refusals caused by the
+	// project-wide check (same guard as verifyRejects, separate counter so
+	// the two checks do not share a budget).
+	projectRejects int
 	// skipNoted dedups "auto-verify skipped because ..." log lines per turn.
 	skipNoted map[string]bool
 
@@ -118,6 +137,7 @@ func NewDirect(o *Orchestrator, ctl DirectControl) *DirectAgent {
 	d := &DirectAgent{o: o, ctl: ctl, skipNoted: map[string]bool{}}
 	d.editCheck = d.defaultEditCheck
 	d.recheckEdits = d.defaultRecheck
+	d.projectCheck = d.defaultProjectCheck
 	return d
 }
 
@@ -129,6 +149,139 @@ const directEditCheckTimeout = 20 * time.Second
 // post-edit check before the gate yields and lets the turn end with the failure
 // disclosed.
 const directVerifyMaxRejects = 2
+
+// directProjectCheckTimeout bounds the whole-project check at finish. It is
+// generous compared with the per-edit check: this one builds every package in
+// the workspace, and a cold build cache makes the first one of a turn slow.
+const directProjectCheckTimeout = 120 * time.Second
+
+// isMutatingTool reports whether a tool changes the workspace. Only those
+// tools make the project-wide check at finish meaningful.
+func isMutatingTool(name string) bool {
+	switch name {
+	case tools.ToolWriteFile, tools.ToolReplaceLines, tools.ToolDeletePath, tools.ToolMovePath:
+		return true
+	default:
+		return false
+	}
+}
+
+// projectCheckTimeout returns the budget for the project-wide check.
+func (d *DirectAgent) projectCheckTimeout() time.Duration {
+	t := directProjectCheckTimeout
+	if d.o != nil && d.o.cfg.AutoVerifyTimeout > 0 {
+		if cfg := time.Duration(d.o.cfg.AutoVerifyTimeout) * time.Second; cfg > t {
+			t = cfg
+		}
+	}
+	return t
+}
+
+// defaultProjectCheck executes the project-wide commands against the sandbox
+// this turn works in (the mirror in manual-approval mode, the workspace
+// otherwise).
+func (d *DirectAgent) defaultProjectCheck(ctx context.Context, cmds []string) tools.EditCheck {
+	project := tools.DetectProject(d.toolSandbox().Root)
+	return d.toolSandbox().RunEditCheckCommands(ctx, project, cmds, d.projectCheckTimeout())
+}
+
+// projectBaseline runs the whole-project check once, before this turn's first
+// edit, so a workspace that was ALREADY broken is not blamed on the turn.
+//
+// Without it, every turn in a project the user is halfway through refactoring
+// would be refused at finish, and the model would be sent off to fix someone
+// else's breakage — the exact thing the tree mode's wave baseline exists to
+// prevent.
+func (d *DirectAgent) projectBaseline(ctx context.Context) {
+	if d.baselineDone {
+		return
+	}
+	d.baselineDone = true
+	if d.o.cfg.DisableAutoVerify {
+		return
+	}
+	_, cmds, _ := tools.PlanProjectCheck(d.toolSandbox().Root, nil)
+	if len(cmds) == 0 {
+		return
+	}
+	check := d.projectCheck(ctx, cmds)
+	if !check.Ran() || (!check.Failed && !check.TimedOut) {
+		return
+	}
+	d.baselineFP = stallFingerprint(d.o.projectType(), check.Output)
+	d.o.log.Warnf("project baseline: the workspace is ALREADY broken before this turn's first edit "+
+		"(%s); a project check that reproduces this failure is not this turn's work", strings.Join(check.Commands, " && "))
+	d.o.events.Record("project_baseline", d.o.tree.RootID, map[string]any{
+		"commands": check.Commands,
+		"failed":   check.Failed,
+		"output":   clip(check.Output, evReasonChars),
+	})
+}
+
+// projectCheckAtFinish runs the whole-project check once, right before the turn
+// may be declared done.
+//
+// The per-edit check compiles the package that was edited. That is the right
+// cheap check for one edit and the wrong gate for a turn: change a function's
+// signature and every package that calls it stops compiling, and none of
+// those packages is compiled by the edited package's own build. So a turn
+// could finish "successfully" with a workspace that does not build — the
+// "改完就说完成" failure the auto-verify was introduced to kill, still alive
+// one package out.
+//
+// A failure that reproduces the pre-edit baseline is the user's own breakage:
+// it must not block the turn, and it must not send the model off to fix
+// someone else's tree.
+func (d *DirectAgent) projectCheckAtFinish(ctx context.Context) (string, bool) {
+	if d.o.cfg.DisableAutoVerify {
+		return "", true
+	}
+	if len(d.editedFiles) == 0 {
+		return "", true // nothing was touched: nothing new to break
+	}
+	_, cmds, _ := tools.PlanProjectCheck(d.toolSandbox().Root, d.editedFiles)
+	if len(cmds) == 0 {
+		return "", true
+	}
+	check := d.projectCheck(ctx, cmds)
+	if !check.Ran() {
+		// The host cannot execute commands: do not hold the turn hostage over
+		// a check that is not possible here.
+		return "", true
+	}
+	if !check.Failed && !check.TimedOut {
+		d.projectRejects = 0
+		return "", true
+	}
+	fp := stallFingerprint(d.o.projectType(), check.Output)
+	if d.baselineFP != "" && fp == d.baselineFP {
+		d.o.log.Warnf("project check still fails, but exactly as it did before this turn: %s",
+			strings.Join(check.Commands, " && "))
+		d.o.events.Record("project_check_preexisting", d.o.tree.RootID, map[string]any{
+			"commands": check.Commands,
+			"output":   clip(check.Output, evReasonChars),
+		})
+		return "", true
+	}
+	d.projectRejects++
+	if d.projectRejects > directVerifyMaxRejects {
+		// The check keeps failing across attempts. Refusing forever turns a
+		// broken project into a run that can never end, so the gate yields —
+		// loudly, with the diagnostics already in the transcript.
+		d.o.log.Warnf("project check still failing after %d finish attempts; allowing finish with the failure disclosed",
+			d.projectRejects)
+		d.o.events.Record("project_check_waived", d.o.tree.RootID, map[string]any{
+			"commands": check.Commands,
+			"attempts": d.projectRejects,
+		})
+		return "", true
+	}
+	return "finish REJECTED: the whole project does not build. " +
+		"Your edits may have broken a package that depends on the one you changed — " +
+		"the per-file check only compiles the package you touched. Fix the errors below " +
+		"and finish only after the whole project builds (" +
+		strings.Join(cmds, " && ") + "):\n" + check.Output, false
+}
 
 func (d *DirectAgent) editCheckTimeout() time.Duration {
 	if d.o != nil && d.o.cfg.AutoVerifyTimeout > 0 {
@@ -730,6 +883,16 @@ func (d *DirectAgent) applyActions(ctx context.Context, nodeID string, actions [
 				_ = d.persist()
 				return false, "", nil
 			}
+			// The per-edit check only compiles the package that was touched.
+			// The whole project has to build before the turn can be declared
+			// done: an edit that breaks a dependent package is the failure
+			// mode this gate exists for.
+			if blocked, ok := d.projectCheckAtFinish(ctx); !ok {
+				d.appendToolOutcome(act, blocked)
+				d.skipRemaining(actions[i+1:], "Not executed: the run did not finish; finish was rejected because the whole project does not build.")
+				_ = d.persist()
+				return false, "", nil
+			}
 			summary, _ = stringFromArgs(act.Args, "summary")
 			if summary == "" {
 				summary = strings.TrimSpace(act.Thought)
@@ -845,6 +1008,12 @@ func (d *DirectAgent) applyActions(ctx context.Context, nodeID string, actions [
 			d.ctl.SetInTool(true)
 		}
 		callStart := time.Now()
+		// Before the first mutating call of the turn, record whether the
+		// project ALREADY did not build. Otherwise a workspace that was
+		// broken before the user typed anything would be blamed on this turn.
+		if isMutatingTool(act.Name) {
+			d.projectBaseline(ctx)
+		}
 		out, callErr := d.toolSandbox().Call(ctx, act.Name, act.Args)
 		if d.ctl != nil {
 			d.ctl.SetInTool(false)
@@ -1065,6 +1234,11 @@ func (d *DirectAgent) checkAfterEdit(ctx context.Context, act taggedAction, node
 	paths := editedPaths(act.Name, act.Args)
 	if len(paths) == 0 {
 		return tools.EditCheck{}, false
+	}
+	for _, p := range paths {
+		if !slices.Contains(d.editedFiles, p) {
+			d.editedFiles = append(d.editedFiles, p)
+		}
 	}
 	run := d.editCheck
 	if run == nil {
@@ -1368,6 +1542,7 @@ func directSystemGuide(sb *tools.Sandbox, dataDir string) string {
 	b.WriteString("\n\n")
 	b.WriteString("You work in one growing tool transcript for this project. Use tools to actually read, search, edit, and verify. Do not claim success without checking real tool results. Do not invent file contents.\n")
 	b.WriteString("After write_file/replace_lines, a compile/type check for the edited package runs automatically and its result is appended to that tool output as [auto-verify]. Do not re-run the same build only to confirm it; fix the reported errors instead. finish is refused while that check still fails.\n")
+	b.WriteString(projectCheckGuideLine(sb))
 	if sb != nil {
 		if reason, off := sb.ToolDisabled(tools.ToolRunBash); off {
 			// Be blunt: on this host the only observation is a parse pass, and a
@@ -1402,12 +1577,24 @@ func directSystemGuide(sb *tools.Sandbox, dataDir string) string {
 	return b.String()
 }
 
+// projectCheckGuideLine describes the whole-project check at finish. Only Go
+// has a cheap project-wide build here, so the line is scoped to it: telling a
+// Python model that "the whole project is built" would be a claim nothing
+// backs.
+func projectCheckGuideLine(sb *tools.Sandbox) string {
+	if sb == nil || tools.DetectProject(sb.Root) != tools.ProjectGo {
+		return ""
+	}
+	return "Before finish, the WHOLE project is built once as well: that check catches edits that break a package you did not touch (changing a function signature breaks everyone who calls it). finish is refused while the project does not build.\n"
+}
+
 func directSystemFor(web bool, dynamicTools string) string {
 	var b strings.Builder
 	b.WriteString(directMarker)
 	b.WriteString("\n\n")
 	b.WriteString("You work in one growing tool transcript for this project. Use tools to actually read, search, edit, and verify. Do not claim success without checking real tool results. Do not invent file contents.\n")
 	b.WriteString("After write_file/replace_lines, a compile/type check for the edited package runs automatically and its result is appended to that tool output as [auto-verify]. Do not re-run the same build only to confirm it; fix the reported errors instead. finish is refused while that check still fails.\n")
+	b.WriteString(projectCheckGuideLine(nil))
 	b.WriteString("search_files and find_files are literal regex/glob matching, not a semantic index.\n")
 	b.WriteString("Prefer replace_lines over write_file for edits: give one unique old_string anchor and the replacement. Indentation, trailing whitespace and read_file line numbers in the anchor are tolerated, but it must still match exactly one place; when it does not, the error quotes the closest lines — fix the anchor from that, do not resend the same one.\n")
 	b.WriteString("If an edit is refused with [stale-read], the file changed after you last read it — someone else edited it, or a command rewrote it. The same anchor may still match, which is exactly how an edit lands in the wrong place. Do not retry it: read the file again and edit against the content that is there now.\n")
