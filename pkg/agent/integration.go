@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/esrrhs/divvy/pkg/engine"
@@ -115,6 +116,11 @@ func (o *Orchestrator) handleAcceptanceFailure(ctx context.Context, output strin
 	requeueMsg := acceptanceRetryMarker + " the whole deliverable failed its final end-to-end check. " +
 		"Your own task DoD passing is NOT enough: run the command below yourself, " +
 		"fix what it reports, and re-run it before you finish.\n" + truncate(output, 3000)
+
+	// From here on the leaf is verified BY the acceptance. See
+	// widenGateToAcceptance for why the leaf's own DoD is not enough.
+	o.widenGateToAcceptance(intLeaf, root)
+
 	if err := o.sched.UpdateNodeState(intLeaf, models.TaskStatePending, requeueMsg); err != nil {
 		return err
 	}
@@ -127,6 +133,50 @@ func (o *Orchestrator) handleAcceptanceFailure(ctx context.Context, output strin
 		return err
 	}
 	return nil
+}
+
+// widenGateToAcceptance raises the integration leaf's verification bar to the
+// goal-level acceptance.
+//
+// The leaf's own DoD comes from the planner and is usually NARROWER than the
+// acceptance: "go test ./..." passes while the deliverable is broken. Left
+// alone, the leaf gets marked COMPLETED and merged, the acceptance fails in
+// exactly the same way, and the run ping-pongs between two states without ever
+// converging — "I told you the door is unlocked, I went and wiped the window".
+//
+// From the moment the acceptance has failed once, the leaf that owns the
+// deliverable is verified by that acceptance. The tree is assembled by then
+// (the integration leaf runs last), so the command is runnable in its mirror.
+//
+// The leaf's own commands are kept, not replaced: they may check something the
+// acceptance does not. The acceptance goes last, so a cheap failure still
+// short-circuits before the expensive end-to-end check.
+func (o *Orchestrator) widenGateToAcceptance(leafID string, root *models.TaskNode) {
+	if root == nil || len(root.DoD.Commands) == 0 {
+		return
+	}
+	leaf, ok := o.tree.CloneNode(leafID)
+	if !ok {
+		return
+	}
+	cmds := append([]string{}, leaf.DoD.Commands...)
+	for _, c := range root.DoD.Commands {
+		if !slices.Contains(cmds, c) {
+			cmds = append(cmds, c)
+		}
+	}
+	timeout := leaf.DoD.TimeoutSec
+	if root.DoD.TimeoutSec > timeout {
+		timeout = root.DoD.TimeoutSec
+	}
+	_ = o.tree.UpdateNode(leafID, func(n *models.TaskNode) error {
+		n.DoD.Commands = cmds
+		if n.DoD.TimeoutSec < timeout {
+			n.DoD.TimeoutSec = timeout
+		}
+		return nil
+	})
+	o.log.Warnf("integration leaf %s is now verified by the goal acceptance: %v", leafID, cmds)
 }
 
 // findIntegrationLeaf locates the node responsible for wiring the deliverable
