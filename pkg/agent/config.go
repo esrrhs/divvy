@@ -107,6 +107,12 @@ type Config struct {
 	// answer (0 = 15 minutes). After the deadline the loop continues
 	// with a "make a reasonable assumption" reply instead of hanging.
 	AskTimeout time.Duration
+	// DisableAutoVerify turns off the post-edit compile/type check that
+	// normally runs after every write in direct mode. Off by default: without
+	// it the loop's "observe" step depends on the model choosing to build.
+	DisableAutoVerify bool
+	// AutoVerifyTimeout bounds one post-edit check (0 = 20s).
+	AutoVerifyTimeout time.Duration
 
 	// DoDCommands is an operator-supplied acceptance ("what counts as done").
 	// When set it wins over anything the planner or the toolchain defaults
@@ -187,6 +193,17 @@ func DefaultConfig() Config {
 		RetryMaxInterval:  30 * time.Second,
 		Stream:            true,
 		PricingJSON:       strings.TrimSpace(os.Getenv("LLM_PRICING")),
+		DisableAutoVerify: envFlag("DIVVY_DISABLE_AUTO_VERIFY"),
+	}
+}
+
+// envFlag reads a boolean-ish environment switch ("1", "true", "yes", "on").
+func envFlag(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
 	}
 }
 

@@ -524,6 +524,7 @@ Environment:
   LLM_PRICING                      (custom price table JSON text or file path)
   DIVVY_HARD_MAX_STEPS             (default hard-leaf tool-call budget when -hard-max-steps=0)
   DIVVY_HARD_TIMEOUT               (default hard-leaf per-request timeout, e.g. 180s)
+  DIVVY_DISABLE_AUTO_VERIFY        (1 = skip the post-edit compile/type check in direct mode)
 
 Flags:
 `

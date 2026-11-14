@@ -3,6 +3,8 @@ import { api, ApiError } from './api/client'
 import { planFileOpen } from './lib/fileNav'
 import { EventSourceClient, type SseStatus } from './api/sse'
 import type {
+  AiEditResponse,
+  AiEditSelection,
   PhaseSnapshot,
   RunPhase,
   ApplyHunkRequest,
@@ -18,6 +20,11 @@ import type {
 // eventViewCap bounds how many events the timeline keeps in memory for the
 // 10k-event NFR; the event stream itself stays complete on disk.
 const eventViewCap = 1000
+
+// aiEditAbort cancels the in-flight inline edit when the dialog closes or a
+// second generation starts. Kept outside the store: it is request-scoped state
+// that should never be rendered or persisted.
+let aiEditAbort: AbortController | null = null
 
 function selectionsFor(byConv: Record<string, CodeSelection[]>, convId: string | null): CodeSelection[] {
   if (!convId) return []
@@ -128,6 +135,23 @@ interface AppState {
   confirmFileNav: () => void
   cancelFileNav: () => void
   attachSelection: (sel: CodeSelection, opts?: { conversationId?: string }) => void
+  // AI inline edit (Cursor Cmd-K style) dialog state.
+  aiEditOpen: boolean
+  aiEditPath: string | null
+  aiEditSelection: AiEditSelection | null
+  aiEditResult: AiEditResponse | null
+  // Raw code as it streams in, before the diff is known.
+  aiEditStreaming: string
+  aiEditBusy: boolean
+  // Set after a write so the dialog can offer a one-step undo.
+  aiEditApplied: { applied: number; rejected: number } | null
+  // Bumped after an inline edit is written so the open file reloads from disk.
+  fileReloadNonce: number
+  openAiEditDialog: (path: string, selection: AiEditSelection) => void
+  closeAiEditDialog: () => void
+  runAiEdit: (instruction: string) => Promise<boolean>
+  applyAiEdit: (decisions: boolean[]) => Promise<boolean>
+  undoAiEdit: () => Promise<boolean>
   removeSelection: (index: number) => void
   clearSelections: () => void
   clearError: () => void
@@ -181,6 +205,14 @@ export const useStore = create<AppState>((set, get) => ({
   apiError: null,
   actionError: null,
   _sse: null,
+  aiEditOpen: false,
+  aiEditPath: null,
+  aiEditSelection: null,
+  aiEditResult: null,
+  aiEditStreaming: '',
+  aiEditBusy: false,
+  aiEditApplied: null,
+  fileReloadNonce: 0,
 
   clearError: () => set({ apiError: null }),
   clearActionError: () => set({ actionError: null }),
@@ -723,6 +755,135 @@ export const useStore = create<AppState>((set, get) => ({
     const byConv = { ...get().pendingSelectionsByConv }
     delete byConv[id]
     set({ pendingSelectionsByConv: byConv, pendingSelections: [] })
+  },
+
+  openAiEditDialog: (path, selection) => {
+    aiEditAbort?.abort()
+    aiEditAbort = null
+    set({
+      aiEditOpen: true,
+      aiEditPath: path,
+      aiEditSelection: selection,
+      aiEditResult: null,
+      aiEditStreaming: '',
+      aiEditBusy: false,
+      aiEditApplied: null,
+      actionError: null,
+    })
+  },
+  closeAiEditDialog: () => {
+    // Closing must stop the model call: leaving it running would burn tokens
+    // for a dialog nobody is looking at.
+    aiEditAbort?.abort()
+    aiEditAbort = null
+    set({
+      aiEditOpen: false,
+      aiEditPath: null,
+      aiEditSelection: null,
+      aiEditResult: null,
+      aiEditStreaming: '',
+      aiEditBusy: false,
+      aiEditApplied: null,
+    })
+  },
+  runAiEdit: async (instruction) => {
+    const id = get().currentConvId
+    if (!id) {
+      set({ actionError: '没有打开的对话' })
+      return false
+    }
+    const path = get().aiEditPath
+    const sel = get().aiEditSelection
+    if (!path || !sel) {
+      set({ actionError: '未选中文件或选区' })
+      return false
+    }
+    aiEditAbort?.abort()
+    const ctrl = new AbortController()
+    aiEditAbort = ctrl
+    set({ actionError: null, aiEditBusy: true, aiEditResult: null, aiEditStreaming: '' })
+    try {
+      const res = await api.aiEditStream(
+        id,
+        { path, selection: sel, instruction },
+        (text) => set((s) => ({ aiEditStreaming: s.aiEditStreaming + text })),
+        ctrl.signal,
+      )
+      if (ctrl.signal.aborted) return false
+      set({ aiEditResult: res, aiEditBusy: false })
+      return true
+    } catch (e) {
+      if (ctrl.signal.aborted) return false
+      set({ aiEditBusy: false, actionError: errorText(e) })
+      return false
+    } finally {
+      if (aiEditAbort === ctrl) aiEditAbort = null
+    }
+  },
+  applyAiEdit: async (decisions) => {
+    const id = get().currentConvId
+    if (!id) {
+      set({ actionError: '没有打开的对话' })
+      return false
+    }
+    const res = get().aiEditResult
+    if (!res) {
+      set({ actionError: '还没有生成候选改动' })
+      return false
+    }
+    set({ actionError: null, aiEditBusy: true })
+    try {
+      const out = await api.aiEditApply(id, {
+        path: res.path,
+        base_hash: res.base_hash,
+        start_line: res.start_line,
+        end_line: res.end_line,
+        insert_line: res.insert_line,
+        old_text: res.old_text,
+        new_text: res.new_text,
+        decisions,
+      })
+      if (out.conflict) {
+        set({ aiEditBusy: false, actionError: `文件已被外部修改，未写回：${out.conflict_path || res.path}。请重新生成。` })
+        return false
+      }
+      // Keep the dialog open: the write is done but undo lives here, and
+      // closing immediately would strand the user with no way back.
+      set((s) => ({
+        aiEditBusy: false,
+        aiEditApplied: { applied: out.applied, rejected: out.rejected },
+        aiEditResult: null,
+        aiEditStreaming: '',
+        fileReloadNonce: s.fileReloadNonce + 1,
+      }))
+      return true
+    } catch (e) {
+      set({ aiEditBusy: false, actionError: errorText(e) })
+      return false
+    }
+  },
+  undoAiEdit: async () => {
+    const id = get().currentConvId
+    if (!id) {
+      set({ actionError: '没有打开的对话' })
+      return false
+    }
+    set({ actionError: null, aiEditBusy: true })
+    try {
+      await api.aiEditUndo(id)
+      set((s) => ({
+        aiEditBusy: false,
+        aiEditApplied: null,
+        aiEditOpen: false,
+        aiEditPath: null,
+        aiEditSelection: null,
+        fileReloadNonce: s.fileReloadNonce + 1,
+      }))
+      return true
+    } catch (e) {
+      set({ aiEditBusy: false, actionError: errorText(e) })
+      return false
+    }
   },
 
   connect: (id, t) => {

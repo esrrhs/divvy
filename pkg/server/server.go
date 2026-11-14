@@ -178,6 +178,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/conversations/{id}/turns/{sessionId}/changes", s.handleApplyTurnHunks)
 	mux.HandleFunc("POST /api/conversations/{id}/turns/{sessionId}/rollback", s.handleRollbackTurn)
 	mux.HandleFunc("POST /api/conversations/{id}/rollback/recover", s.handleRecoverRollback)
+	mux.HandleFunc("POST /api/conversations/{id}/ai-edit", s.handleAiEdit)
+	mux.HandleFunc("POST /api/conversations/{id}/ai-edit/apply", s.handleAiEditApply)
+	mux.HandleFunc("POST /api/conversations/{id}/ai-edit/undo", s.handleAiEditUndo)
 
 	// Static frontend (or placeholder) for everything else, including SPA
 	// client routes, with unknown paths falling back to index.html.

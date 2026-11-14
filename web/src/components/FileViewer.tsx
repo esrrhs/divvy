@@ -93,6 +93,8 @@ export function FileViewer({ sessionId, path }: { sessionId: string | null; path
   const confirmFileNav = useStore((s) => s.confirmFileNav)
   const cancelFileNav = useStore((s) => s.cancelFileNav)
   const attachSelection = useStore((s) => s.attachSelection)
+  const openAiEditDialog = useStore((s) => s.openAiEditDialog)
+  const fileReloadNonce = useStore((s) => s.fileReloadNonce)
   const [file, setFile] = useState<FsFileResponse | null>(null)
   const [draft, setDraft] = useState('')
   const [baseHash, setBaseHash] = useState('')
@@ -178,7 +180,7 @@ export function FileViewer({ sessionId, path }: { sessionId: string | null; path
     return () => {
       cancelled = true
     }
-  }, [path, sessionId, currentConvId, appliedKey])
+  }, [path, sessionId, currentConvId, appliedKey, fileReloadNonce])
 
   const lines = useMemo(() => {
     if (!file) return []
@@ -233,6 +235,39 @@ export function FileViewer({ sessionId, path }: { sessionId: string | null; path
         : `已附到对话：${path}:${range.start_line}-${range.end_line}。关闭编辑器后可随下一条需求发送。`,
     )
   }
+
+  function aiEdit() {
+    if (!canEdit) return
+    if (dirty) {
+      setAttachNote('有未保存的修改。AI 改写基于磁盘上的文件，请先保存再改写，免得覆盖你的草稿。')
+      return
+    }
+    if (!currentConvId) {
+      setAttachNote('请先打开一个项目对话，再在编辑器里用 AI 改写。')
+      return
+    }
+    const range = lineRangeFromOffsets(draft, sel.start, sel.end)
+    if (sel.end !== sel.start) {
+      openAiEditDialog(path, { start_line: range.start_line, end_line: range.end_line })
+    } else {
+      // No selection: Cursor-style "generate here" inserts at the caret line.
+      openAiEditDialog(path, { insert_line: range.start_line })
+    }
+  }
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey) || e.key.toLowerCase() !== 'k') return
+      if (useStore.getState().aiEditOpen) return
+      if (!canEdit) return
+      e.preventDefault()
+      aiEdit()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+    // aiEdit closes over the current draft/selection, so rebind when they change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canEdit, dirty, currentConvId, draft, sel, path])
 
   async function reload() {
     setLoading(true)
@@ -291,6 +326,19 @@ export function FileViewer({ sessionId, path }: { sessionId: string | null; path
                 className="rounded border border-line px-2 py-0.5 text-[11.5px] text-slate-200 hover:bg-ink-800 disabled:cursor-not-allowed disabled:text-slate-600"
               >
                 {saving ? '保存中…' : '保存'}
+              </button>
+              <button
+                type="button"
+                disabled={dirty}
+                onClick={aiEdit}
+                title={
+                  dirty
+                    ? '请先保存，AI 改写基于磁盘上的文件'
+                    : '让 AI 改写选中的代码（未选中时按光标位置插入）。⌘/Ctrl+K'
+                }
+                className="rounded border border-brand-700/60 bg-brand-950/40 px-2 py-0.5 text-[11.5px] text-brand-200 hover:bg-brand-900/50 disabled:cursor-not-allowed disabled:border-line disabled:bg-transparent disabled:text-slate-600"
+              >
+                AI 改写<span className="ml-1 text-[10px] opacity-70">⌘K</span>
               </button>
               <button
                 type="button"
