@@ -77,30 +77,11 @@ func appendRoBind(args []string, path string) []string {
 	return append(args, "--ro-bind", path, path)
 }
 
-// isolatedEnvAllow is the only host environment names that may be
-// inherited. Everything else (tokens, sentinels, user secrets, home
-// paths) is dropped. Go/npm module caches are provided as read-only
-// binds, not by exposing the host home directory.
-var isolatedEnvAllow = map[string]bool{
-	"PATH": true, "LANG": true, "LC_ALL": true, "LC_CTYPE": true,
-	"LC_MESSAGES": true, "LC_COLLATE": true, "LC_NUMERIC": true,
-	"LC_TIME": true, "LC_MONETARY": true, "TZ": true, "TERM": true,
-}
+// isolatedEnvAllow lives in sandbox_isolate_env.go (shared with the darwin
+// backend). This file only supplies the Linux-specific scratch dirs.
 
 func isolatedEnv(env []string) []string {
-	if env == nil {
-		env = os.Environ()
-	}
-	out := make([]string, 0, 16)
-	for _, kv := range env {
-		name, _, ok := strings.Cut(kv, "=")
-		if !ok {
-			continue
-		}
-		if isolatedEnvAllow[name] || strings.HasPrefix(name, "LC_") {
-			out = append(out, kv)
-		}
-	}
+	out := filterIsolatedEnv(env)
 	out = append(out,
 		"HOME=/tmp",
 		"TMPDIR=/tmp",

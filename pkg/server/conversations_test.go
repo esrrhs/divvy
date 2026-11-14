@@ -290,11 +290,17 @@ func TestConversation_BrowseAndRejectMissingDir(t *testing.T) {
 	}
 	ts := apiServer(t, work, data)
 
-	status, resp := apiDo(t, http.MethodGet, apiBase(ts)+"/browse?token=test-token&path="+work, nil)
+	// The API reports the resolved directory (macOS temp dirs live under
+	// /private/var), so ask about the resolved form.
+	resolved, err := filepath.EvalSymlinks(work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, resp := apiDo(t, http.MethodGet, apiBase(ts)+"/browse?token=test-token&path="+resolved, nil)
 	if status != http.StatusOK {
 		t.Fatalf("browse status=%d resp=%v", status, resp)
 	}
-	if resp["path"] != work {
+	if resp["path"] != resolved {
 		t.Fatalf("browse path=%v", resp["path"])
 	}
 	names := map[string]string{}

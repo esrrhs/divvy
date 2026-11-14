@@ -17,6 +17,9 @@ import (
 // typed environment error, and aborting must mark the root FAILED instead of
 // spending the retry budget trying to "repair" a command that never ran.
 func TestVerify_ExecutionUnavailableAbortsRun(t *testing.T) {
+	if ok, _ := tools.ProbeShellIsolation(t.TempDir()); ok {
+		t.Skip("this host has an execution backend; the unavailable path only exists without one")
+	}
 	work, data := t.TempDir(), t.TempDir()
 	cfg := mgrCfg(work, data, "sess_unavailable_"+t.Name())
 	tree := engine.NewTaskTree("t-unavailable", "root", "prove commands cannot run")

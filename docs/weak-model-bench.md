@@ -46,7 +46,7 @@ go run ./cmd/bench -loop direct -goals fix-average -repeat 3
 
 同一条验收命令、同一套种子工作区，所以两行数字可以直接比较；差别只在"谁来跑验收"。报告里带 `loop` 字段，混跑的报告不会互相冒充。
 
-非 Linux 宿主没有 bubblewrap/landlock，`run_bash` 直接不可用：直接模式的验收会标成 `skip` 并写明原因（`ACPT` 列），这一行**不算已验证**。测试 `TestBench_DirectLoopDrivesGoal` 特意做成不依赖 shell（脚本模型 + `write_file` + `finish`），这样 harness 本身在任何平台都能被验证，而验收只在能执行的地方发生。
+宿主没有可用的执行后端（Windows，或 macOS 上 `sandbox-exec` 不可用）时 `run_bash` 直接不可用：直接模式的验收会标成 `skip` 并写明原因（`ACPT` 列），这一行**不算已验证**。测试 `TestBench_DirectLoopDrivesGoal` 特意做成不依赖 shell（脚本模型 + `write_file` + `finish`），这样 harness 本身在任何平台都能被验证，而验收只在能执行的地方发生。
 
 ## 采集的指标
 
