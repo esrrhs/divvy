@@ -45,7 +45,7 @@ const (
 // left the first one unundoable, and the only way back was to hand-edit the
 // file. An editor's Cmd-Z reaches further than that.
 type aiEditUndoStack struct {
-	Version int                `json:"version"`
+	Version int                 `json:"version"`
 	Records []*aiEditUndoRecord `json:"records"`
 }
 
