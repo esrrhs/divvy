@@ -19,7 +19,7 @@ func (o *Orchestrator) runWorker(ctx context.Context, sb *tools.Sandbox, node *m
 	defer sb.ReleaseBrowser()
 
 	messages := []llm.Message{
-		{Role: llm.RoleSystem, Content: workerSystemFor(o.cfg.WebEnabled, sb.DynamicToolDescriptions())},
+		{Role: llm.RoleSystem, Content: workerSystemFor(o.cfg.WebEnabled, sb.DynamicToolDescriptions()) + projectRulesBlock(sb, o.cfg.DataDir)},
 		{Role: llm.RoleUser, Content: o.projectContext(sb, node, prevError)},
 	}
 
@@ -552,6 +552,10 @@ func (o *Orchestrator) projectContext(sb *tools.Sandbox, node *models.TaskNode, 
 
 	b.WriteString("\nWorkspace files:\n")
 	b.WriteString(sb.Snapshot())
+	if m := sb.RepoMap(4000); m != "" {
+		b.WriteString("\n\n")
+		b.WriteString(m)
+	}
 
 	injected := 0
 	for _, in := range node.Contract.Inputs {

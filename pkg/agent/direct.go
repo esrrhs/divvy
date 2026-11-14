@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/esrrhs/divvy/pkg/llm"
+	"github.com/esrrhs/divvy/pkg/mcp"
 	"github.com/esrrhs/divvy/pkg/models"
 	"github.com/esrrhs/divvy/pkg/tools"
 )
@@ -26,6 +27,10 @@ const (
 	directDefaultContextChars = 100_000
 	directMapMaxEntries       = 80
 	directMapMaxDepth         = 3
+	// directRepoMapChars bounds the ranked symbol map. It is orientation, not
+	// a substitute for reading the code, and the same budget is reused on
+	// follow-up turns where the transcript already holds earlier context.
+	directRepoMapChars = 4000
 	// directRepeatLimit is how many identical tool calls in a row count as a
 	// loop. Two would fire on a legitimate read-then-verify pair; four wastes
 	// a step on something already unmistakable.
@@ -33,6 +38,14 @@ const (
 	// directRepeatNags caps how many times one turn interrupts a repeated-call
 	// loop. The step budget still bounds the turn after that.
 	directRepeatNags = 2
+	// directFailureLimit is how many times the same verification command may
+	// fail with the same output before the loop demands a strategy change.
+	// Solo escalates on the second identical failure; direct is conversational,
+	// so it gets the same one-observation-round budget.
+	directFailureLimit = 2
+	// directFailureNags caps how many strategy-change prompts one turn gets,
+	// so the intervention itself cannot become the loop.
+	directFailureNags = 2
 )
 
 // directMarker is the leading sentence of the direct-mode system prompt so
@@ -71,6 +84,17 @@ type DirectAgent struct {
 	repeatKey   string
 	repeatCount int
 	repeatNags  int
+	// failKey / failCount / failNags catch the third loop shape: different
+	// calls (edits interleaved with the same verification command) that keep
+	// producing the same failure. The workspace changes, the outcome does not.
+	failKey   string
+	failCount int
+	failNags  int
+	// systemGuide is the per-turn base system prompt; the live plan is
+	// appended before each request so it survives context trimming.
+	systemGuide string
+	// mcp holds this turn's stdio MCP servers and their tool index.
+	mcp *mcp.Runtime
 }
 
 func NewDirect(o *Orchestrator, ctl DirectControl) *DirectAgent {
@@ -295,7 +319,7 @@ func (d *DirectAgent) Run(ctx context.Context) (runErr error) {
 		return err
 	}
 	d.applySandboxPolicy()
-	system := llm.Message{Role: llm.RoleSystem, Content: directSystemGuide(d.o.sandbox)}
+	system := llm.Message{Role: llm.RoleSystem, Content: directSystemGuide(d.o.sandbox, d.o.cfg.DataDir)}
 	switch {
 	case st == nil || len(st.Messages) < 2:
 		st = &directState{Version: 1, Messages: []llm.Message{system, {Role: llm.RoleUser, Content: d.openingPrompt()}}}
@@ -303,6 +327,7 @@ func (d *DirectAgent) Run(ctx context.Context) (runErr error) {
 		st.Messages[0] = system
 		st.Done = false
 		st.Summary = ""
+		st.Plan = nil
 		st.InFlight = nil
 		st.Step = 0
 		st.PendingAsk = ""
@@ -346,6 +371,11 @@ func (d *DirectAgent) Run(ctx context.Context) (runErr error) {
 		}
 		d.closeMirror()
 	}()
+
+	// Start MCP after isolation so external tools run against the mirror in
+	// manual approval mode, and close them however the turn exits.
+	d.setupMCP(ctx)
+	defer d.closeMCP()
 
 	return d.loop(ctx)
 }
@@ -444,7 +474,11 @@ func (d *DirectAgent) loop(ctx context.Context) error {
 	var native []llm.Tool
 	if d.o.cfg.NativeTools {
 		native = nativeToolDefs(d.toolSandbox())
+		native = append(native, directPlanNativeTool())
+		native = append(native, d.mcpToolDefs()...)
 	}
+	// Cache the base prompt once per turn; the plan block changes every step.
+	d.systemGuide = directSystemGuide(d.toolSandbox(), d.o.cfg.DataDir) + d.mcpGuide()
 
 	if d.st.PendingApproval {
 		if err := d.reviewAndMaybeMerge(ctx, d.st.Summary); err != nil {
@@ -486,6 +520,12 @@ func (d *DirectAgent) loop(ctx context.Context) error {
 		d.o.log.Actionf("direct step %d/%d", step, maxSteps)
 		d.o.events.Record("direct_step", nodeID, map[string]any{"step": step, "max": maxSteps})
 
+		// Rebuild the system prompt with the current plan. Rules may have
+		// changed since the last turn, and the plan must stay visible even
+		// after transcript trimming.
+		if len(d.st.Messages) > 0 && d.st.Messages[0].Role == llm.RoleSystem {
+			d.st.Messages[0].Content = d.systemGuide + directPlanBlock(d.st.Plan)
+		}
 		window, dropped := directRequestWindow(d.st.Messages, d.contextBudget())
 		if dropped > 0 {
 			d.o.log.Infof("direct context trimmed %d earlier messages (budget %d chars); system prompt and the original request were kept, and the full transcript is on disk", dropped, d.contextBudget())
@@ -614,6 +654,12 @@ func (d *DirectAgent) applyActions(ctx context.Context, nodeID string, actions [
 			// apply: unresolved conflict markers and hard-coded secrets must
 			// not be accepted as a successful turn. Warnings (debug prints,
 			// large diffs) are logged but do not block.
+			if blocked, ok := d.unfinishedPlanBlock(); !ok {
+				d.appendToolOutcome(act, blocked)
+				d.skipRemaining(actions[i+1:], "Not executed: finish was rejected because the plan still has unfinished steps. Update the plan or finish the work first.")
+				_ = d.persist()
+				return false, "", nil
+			}
 			if blocked, ok := d.finishGate(ctx); !ok {
 				d.appendToolOutcome(act, blocked)
 				d.skipRemaining(actions[i+1:], "Not executed: the run did not finish; finish was rejected by the review gate.")
@@ -653,6 +699,68 @@ func (d *DirectAgent) applyActions(ctx context.Context, nodeID string, actions [
 			d.skipRemaining(actions[i+1:], "Not executed: an earlier ask in the same model reply must be answered first. Re-issue this tool if it is still appropriate after the user's answer.")
 			_ = d.persist()
 			return false, "", nil
+		}
+
+		if act.Name == tools.ToolUpdatePlan {
+			out, perr := d.updatePlan(act.Args)
+			if perr != nil {
+				out = "ERROR: " + perr.Error()
+			}
+			d.appendToolOutcome(act, out)
+			_ = d.persist()
+			continue
+		}
+
+		// MCP tools live in external processes, not the filesystem sandbox.
+		// Run them through the same bookkeeping as built-in tools so pause,
+		// events, repeat detection and failure skipping stay consistent.
+		if d.mcp != nil && d.mcp.HasTool(act.Name) {
+			d.st.InFlight = &directInFlight{ID: act.ID, Name: act.Name, Args: act.Args, StartedUnix: time.Now().Unix()}
+			if err := d.persist(); err != nil {
+				return false, "", err
+			}
+			d.o.events.Record("tool_start", nodeID, map[string]any{
+				"tool": act.Name,
+				"args": clip(previewArgs(act), evReasonChars),
+			})
+			if d.ctl != nil {
+				d.ctl.SetInTool(true)
+			}
+			callStart := time.Now()
+			out, callErr := d.mcp.Call(ctx, act.Name, act.Args)
+			if d.ctl != nil {
+				d.ctl.SetInTool(false)
+			}
+			d.o.events.ToolCall(nodeID, act.Name, act.Args, out, callErr, callStart)
+			if callErr != nil {
+				out = "ERROR: " + callErr.Error()
+				d.o.log.Warnf("%s", out)
+			}
+			d.st.InFlight = nil
+			d.appendToolOutcome(act, out)
+			if err := d.persist(); err != nil {
+				return false, "", err
+			}
+			if d.pauseRequested() {
+				d.st.PendingActions = append([]taggedAction(nil), actions[i+1:]...)
+				_ = d.persist()
+				return false, "", ErrPaused
+			}
+			if err := ctx.Err(); err != nil {
+				d.skipRemaining(actions[i+1:], "Not executed: the run was canceled before this tool started. Do not assume it ran.")
+				_ = d.persist()
+				return false, "", err
+			}
+			if toolOutcomeFailed(act.Name, out, callErr) {
+				d.skipRemaining(actions[i+1:], "Not executed: an earlier MCP tool in the same model reply failed. Inspect that result before continuing; do not assume this tool ran.")
+				_ = d.persist()
+				return false, "", nil
+			}
+			if msg, looped := d.trackRepeatCall(act); looped {
+				d.st.Messages = append(d.st.Messages, llm.Message{Role: llm.RoleUser, Content: msg})
+				_ = d.persist()
+			}
+			continue
 		}
 
 		if err := ctx.Err(); err != nil {
@@ -713,7 +821,16 @@ func (d *DirectAgent) applyActions(ctx context.Context, nodeID string, actions [
 		// A failed check in this same reply must not be followed by finish
 		// (or later tools planned before the model saw the failure).
 		if toolOutcomeFailed(act.Name, out, callErr) {
+			// The repeated-call guard does not catch "edit, run the same
+			// failing check, edit again": the calls differ, but the outcome
+			// never does. Name that loop and demand an observation. The
+			// prompt is appended after the skipped tool results so a native
+			// tool_calls message is not interleaved with a user message.
+			msg, nag := d.trackRepeatedFailure(act, out, callErr)
 			d.skipRemaining(actions[i+1:], "Not executed: an earlier tool in the same model reply failed or returned a non-zero exit. Inspect that result, repair if needed, and re-issue only what is still appropriate. Do not assume this tool ran.")
+			if nag {
+				d.st.Messages = append(d.st.Messages, llm.Message{Role: llm.RoleUser, Content: msg})
+			}
 			_ = d.persist()
 			return false, "", nil
 		}
@@ -756,6 +873,67 @@ func (d *DirectAgent) trackRepeatCall(act taggedAction) (string, bool) {
 		"count": directRepeatLimit,
 	})
 	return directRepeatCallIntervention(act.Name, string(args), directRepeatLimit), true
+}
+
+// trackRepeatedFailure catches the loop shape the repeated-call guard misses:
+// the model edits, runs the same verification command, edits again, and the
+// command keeps failing the same way. The calls differ, so nothing looks
+// repeated, but the outcome never changes. After directFailureLimit identical
+// failures the model is told to observe before editing again — the same
+// escalation that measurably beat plain "fix it again" in solo mode.
+func (d *DirectAgent) trackRepeatedFailure(act taggedAction, out string, callErr error) (string, bool) {
+	if act.Name != tools.ToolRunBash {
+		return "", false
+	}
+	if !toolOutcomeFailed(act.Name, out, callErr) {
+		// A passing verification means the previous failure was addressed;
+		// the next failure is a new problem. A successful non-verify call
+		// (read/edit) does not reset the run: edits are exactly what the
+		// model does between identical failures.
+		d.failKey, d.failCount = "", 0
+		return "", false
+	}
+	if d.failNags >= directFailureNags {
+		return "", false
+	}
+	cmd, _ := stringFromArgs(act.Args, "command")
+	key := stallFingerprint(d.o.projectType(), act.Name+"\n"+cmd+"\n"+out)
+	if key == "" {
+		return "", false
+	}
+	if key == d.failKey {
+		d.failCount++
+	} else {
+		d.failKey, d.failCount = key, 1
+	}
+	if d.failCount < directFailureLimit {
+		return "", false
+	}
+	d.failCount = 0
+	d.failNags++
+	d.o.log.Warnf("direct: %q failed the same way %d times; demanding an observation before another edit", cmd, directFailureLimit)
+	d.o.events.Record("direct_repeated_failure", d.o.tree.RootID, map[string]any{
+		"command": clip(cmd, evReasonChars),
+		"count":   directFailureLimit,
+	})
+	return directFailureEscalation(cmd, out, directFailureLimit), true
+}
+
+func directFailureEscalation(command, output string, n int) string {
+	return fmt.Sprintf(`The same command has now failed the same way %d times in a row: %s
+
+%s
+
+Your last change did not alter the outcome. Do NOT edit the same lines again on another hunch, and do NOT weaken or delete the assertion to make it pass — that is how a previous attempt made things worse.
+
+Change strategy:
+1. State in one sentence what you believe the cause is, and what observation would confirm or refute it.
+2. Observe it: print the intermediate values around the failure, add temporary debug output, or run the failing scenario in a small scratch program kept inside the workspace so the project's own packages resolve.
+3. If the observation contradicts your theory, discard the theory and form a new one. Do not tune numbers until something passes.
+4. Only after the observation explains the failure, change the code where the observation points.
+5. Re-run the command yourself before calling finish.
+
+Keep everything that already works; this is a diagnosis step, not a rewrite.`, n, command, clip(output, 4000))
 }
 
 func directRepeatCallIntervention(name, args string, n int) string {
@@ -896,9 +1074,17 @@ func (d *DirectAgent) openingPrompt() string {
 	b.WriteString(strings.TrimSpace(d.o.cfg.Goal))
 	b.WriteString("\n\nWorking directory: ")
 	b.WriteString(d.o.sandbox.Root)
-	if m := directProjectMap(d.o.sandbox.Root, directMapMaxEntries, directMapMaxDepth); m != "" {
+	if m := directProjectMap(d.o.sandbox, directMapMaxEntries, directMapMaxDepth); m != "" {
 		b.WriteString("\n\nShallow project map (a bounded file listing, not a semantic index — use read_file, search_files, or find_files for real contents):\n")
 		b.WriteString(m)
+	}
+	if m := d.o.sandbox.RepoMap(directRepoMapChars); m != "" {
+		b.WriteString("\n\n")
+		b.WriteString(m)
+	}
+	if st := directWorkspaceStatus(d.o.sandbox.Root); st != "" {
+		b.WriteString("\n\n")
+		b.WriteString(st)
 	}
 	b.WriteString("\n\nRead and search the project as needed, make the change, run real verification, and repair from the tool output. Call finish with a concise summary of what you actually did; that summary is shown to the user as your reply.")
 	return b.String()
@@ -909,9 +1095,17 @@ func (d *DirectAgent) followUpPrompt() string {
 	b.WriteString("The earlier tool transcript is still in this conversation. New user request:\n")
 	b.WriteString(strings.TrimSpace(d.o.cfg.Goal))
 	b.WriteString("\n\nContinue from the current workspace (do not redo completed work unless the new request requires it). Use tools to inspect and verify. Call finish with a concise summary of this follow-up.")
-	if m := directProjectMap(d.o.sandbox.Root, directMapMaxEntries, directMapMaxDepth); m != "" {
+	if m := directProjectMap(d.o.sandbox, directMapMaxEntries, directMapMaxDepth); m != "" {
 		b.WriteString("\n\nCurrent shallow project map (bounded listing, not a semantic index):\n")
 		b.WriteString(m)
+	}
+	if m := d.o.sandbox.RepoMap(directRepoMapChars); m != "" {
+		b.WriteString("\n\n")
+		b.WriteString(m)
+	}
+	if st := directWorkspaceStatus(d.o.sandbox.Root); st != "" {
+		b.WriteString("\n\n")
+		b.WriteString(st)
 	}
 	return b.String()
 }
@@ -936,7 +1130,7 @@ func (d *DirectAgent) applyPolicyToSandbox(sb *tools.Sandbox) {
 	}
 }
 
-func directSystemGuide(sb *tools.Sandbox) string {
+func directSystemGuide(sb *tools.Sandbox, dataDir string) string {
 	dyn := ""
 	if sb != nil {
 		dyn = sb.DynamicToolDescriptions()
@@ -947,7 +1141,10 @@ func directSystemGuide(sb *tools.Sandbox) string {
 	b.WriteString("You work in one growing tool transcript for this project. Use tools to actually read, search, edit, and verify. Do not claim success without checking real tool results. Do not invent file contents.\n")
 	b.WriteString("search_files and find_files are literal regex/glob matching, not a semantic index.\n")
 	b.WriteString("If a user follow-up arrives mid-loop, honor it from the next step; do not restart the whole task from scratch.\n")
-	b.WriteString("When the work for this turn is done, call finish with a concise, factual summary written for the user — that text is your reply. Do not call finish just to narrate a failed check; repair first.\n\n")
+	b.WriteString("When the work for this turn is done, call finish with a concise, factual summary written for the user — that text is your reply. Do not call finish just to narrate a failed check; repair first.\n")
+	b.WriteString(directPlanGuide())
+	b.WriteString(projectRulesBlock(sb, dataDir))
+	b.WriteString("\n")
 	if sb != nil {
 		b.WriteString(sb.ToolGuide())
 	} else {
@@ -968,7 +1165,9 @@ func directSystemFor(web bool, dynamicTools string) string {
 	b.WriteString("You work in one growing tool transcript for this project. Use tools to actually read, search, edit, and verify. Do not claim success without checking real tool results. Do not invent file contents.\n")
 	b.WriteString("search_files and find_files are literal regex/glob matching, not a semantic index.\n")
 	b.WriteString("If a user follow-up arrives mid-loop, honor it from the next step; do not restart the whole task from scratch.\n")
-	b.WriteString("When the work for this turn is done, call finish with a concise, factual summary written for the user — that text is your reply. Do not call finish just to narrate a failed check; repair first.\n\n")
+	b.WriteString("When the work for this turn is done, call finish with a concise, factual summary written for the user — that text is your reply. Do not call finish just to narrate a failed check; repair first.\n")
+	b.WriteString(directPlanGuide())
+	b.WriteString("\n")
 	b.WriteString(tools.Descriptions())
 	if web {
 		b.WriteString("\n")
@@ -1139,23 +1338,24 @@ func inFlightRecoveryMessage(in *directInFlight, native bool) llm.Message {
 	return llm.Message{Role: llm.RoleUser, Content: content}
 }
 
-func directProjectMap(root string, maxEntries, maxDepth int) string {
-	if root == "" || maxEntries <= 0 {
+func directProjectMap(sb *tools.Sandbox, maxEntries, maxDepth int) string {
+	if sb == nil || strings.TrimSpace(sb.Root) == "" || maxEntries <= 0 {
 		return ""
 	}
-	var lines []string
+	type mapEntry struct{ text, rel string }
+	var entries []mapEntry
 	var walk func(dir, rel string, depth int)
 	walk = func(dir, rel string, depth int) {
-		if len(lines) >= maxEntries || depth > maxDepth {
+		if len(entries) >= maxEntries || depth > maxDepth {
 			return
 		}
-		entries, err := os.ReadDir(dir)
+		des, err := os.ReadDir(dir)
 		if err != nil {
 			return
 		}
-		for _, e := range entries {
-			if len(lines) >= maxEntries {
-				lines = append(lines, "…(truncated)")
+		for _, e := range des {
+			if len(entries) >= maxEntries {
+				entries = append(entries, mapEntry{text: "…(truncated)"})
 				return
 			}
 			name := e.Name()
@@ -1167,7 +1367,7 @@ func directProjectMap(root string, maxEntries, maxDepth int) string {
 				child = filepath.ToSlash(filepath.Join(rel, name))
 			}
 			if e.IsDir() {
-				lines = append(lines, child+"/")
+				entries = append(entries, mapEntry{text: child + "/", rel: child})
 				if depth < maxDepth {
 					walk(filepath.Join(dir, name), child, depth+1)
 				}
@@ -1177,10 +1377,29 @@ func directProjectMap(root string, maxEntries, maxDepth int) string {
 			if e.Type()&fs.ModeSymlink != 0 {
 				continue
 			}
-			lines = append(lines, child)
+			entries = append(entries, mapEntry{text: child, rel: child})
 		}
 	}
-	walk(root, "", 0)
+	walk(sb.Root, "", 0)
+	if len(entries) == 0 {
+		return ""
+	}
+	// The map is the onboarding view of the repo, so it should show the same
+	// files the project's own ignore rules consider part of the project.
+	rels := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.rel != "" {
+			rels = append(rels, e.rel)
+		}
+	}
+	ignored := sb.IgnoredPaths(rels)
+	lines := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.rel != "" && ignored[e.rel] {
+			continue
+		}
+		lines = append(lines, e.text)
+	}
 	return strings.Join(lines, "\n")
 }
 
@@ -1197,6 +1416,9 @@ type directState struct {
 	PendingActions  []taggedAction     `json:"pending_actions,omitempty"`
 	Mirror          *tools.MirrorState `json:"mirror,omitempty"`
 	InFlight        *directInFlight    `json:"in_flight,omitempty"`
+	// Plan is the model-maintained task list for this turn. It survives
+	// resume, resets when a new follow-up starts, and gates finish.
+	Plan []directPlanItem `json:"plan,omitempty"`
 }
 
 type directInFlight struct {
