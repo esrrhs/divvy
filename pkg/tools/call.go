@@ -26,6 +26,9 @@ const (
 	ToolWebFetch     = "web_fetch"
 	ToolDownloadFile = "download_file"
 	ToolFinish       = "finish"
+	// ToolUpdatePlan is handled by the direct conversation loop, which owns
+	// the per-turn task list; the filesystem sandbox has no state for it.
+	ToolUpdatePlan = "update_plan"
 
 	ToolHTTPRequest = "http_request"
 

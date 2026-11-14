@@ -22,6 +22,8 @@ func (s *Sandbox) FindSymbol(ctx context.Context, name, kind, glob string) (stri
 	}
 
 	var hits []string
+	type goFile struct{ abs, rel string }
+	var files []goFile
 	// A walk error (unreadable subdirectory, vanished file) must not abort the
 	// whole scan: skip that entry and keep the results gathered so far.
 	if err := filepath.WalkDir(s.Root, func(p string, d fs.DirEntry, err error) error {
@@ -43,11 +45,24 @@ func (s *Sandbox) FindSymbol(ctx context.Context, name, kind, glob string) (stri
 			return nil
 		}
 		if strings.HasSuffix(p, ".go") {
-			hits = append(hits, findGoSymbol(p, rel, name, kind)...)
+			files = append(files, goFile{abs: p, rel: rel})
 		}
 		return nil
 	}); err != nil {
 		return "", fmt.Errorf("find_symbol scan: %w", err)
+	}
+	// Ignore rules apply to symbol lookup too: generated vendored code under
+	// an ignored path should not outrank the project's own definitions.
+	rels := make([]string, 0, len(files))
+	for _, f := range files {
+		rels = append(rels, f.rel)
+	}
+	ignored := s.IgnoredPaths(rels)
+	for _, f := range files {
+		if ignored[f.rel] {
+			continue
+		}
+		hits = append(hits, findGoSymbol(f.abs, f.rel, name, kind)...)
 	}
 
 	// Non-Go / additional matches: regex fallback across all text files.

@@ -523,6 +523,14 @@ func (s *Sandbox) MovePath(from, to string) error {
 
 // ListDir lists files under path.
 func (s *Sandbox) ListDir(path string, recursive bool) (string, error) {
+	return s.listDir(path, recursive, false)
+}
+
+// listDir implements ListDir. filterIgnored is used by Snapshot so the
+// workspace listing injected into prompts omits paths the project itself
+// ignores (build output, local-only directories); an explicit ListDir call
+// still shows them so the model can inspect anything it needs.
+func (s *Sandbox) listDir(path string, recursive, filterIgnored bool) (string, error) {
 	abs, err := s.Resolve(path)
 	if err != nil {
 		return "", err
@@ -564,6 +572,11 @@ func (s *Sandbox) ListDir(path string, recursive bool) (string, error) {
 			fmt.Fprintf(&b, "%s\n", name)
 		}
 	} else {
+		type dirEntry struct {
+			rel string
+			dir bool
+		}
+		var entries []dirEntry
 		err = filepath.WalkDir(abs, func(p string, d os.DirEntry, err error) error {
 			if err != nil {
 				return err
@@ -578,24 +591,35 @@ func (s *Sandbox) ListDir(path string, recursive bool) (string, error) {
 			if skipDirNames[name] {
 				return nil
 			}
-			count++
-			if count > max {
-				truncated = true
-				if d.IsDir() {
-					return filepath.SkipDir
-				}
-				return nil
-			}
 			rel, _ := filepath.Rel(abs, p)
-			if d.IsDir() {
-				fmt.Fprintf(&b, "%s/\n", rel)
-			} else {
-				fmt.Fprintf(&b, "%s\n", rel)
-			}
+			entries = append(entries, dirEntry{rel: filepath.ToSlash(rel), dir: d.IsDir()})
 			return nil
 		})
 		if err != nil {
 			return "", err
+		}
+		var ignored map[string]bool
+		if filterIgnored {
+			rels := make([]string, 0, len(entries))
+			for _, e := range entries {
+				rels = append(rels, e.rel)
+			}
+			ignored = s.IgnoredPaths(rels)
+		}
+		for _, e := range entries {
+			if ignored[e.rel] {
+				continue
+			}
+			count++
+			if count > max {
+				truncated = true
+				break
+			}
+			if e.dir {
+				fmt.Fprintf(&b, "%s/\n", e.rel)
+			} else {
+				fmt.Fprintf(&b, "%s\n", e.rel)
+			}
 		}
 	}
 	if b.Len() == 0 {
@@ -610,7 +634,7 @@ func (s *Sandbox) ListDir(path string, recursive bool) (string, error) {
 
 // Snapshot is a short workspace listing for prompt injection.
 func (s *Sandbox) Snapshot() string {
-	out, err := s.ListDir(".", true)
+	out, err := s.listDir(".", true, true)
 	if err != nil {
 		return "(unable to list workspace: " + err.Error() + ")"
 	}
