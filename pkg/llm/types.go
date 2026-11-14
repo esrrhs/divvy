@@ -12,8 +12,13 @@ const (
 
 // Message is one turn in a chat completion request.
 type Message struct {
-	Role       string     `json:"role"`
-	Content    string     `json:"content,omitempty"`
+	Role string `json:"role"`
+	// Content is always serialized, even when empty. With `omitempty` an
+	// empty reply (a model that answered with nothing) made the field
+	// disappear, and the endpoint then read the message as "content: null"
+	// and rejected the whole request — one silent model reply killed the
+	// turn with a 400 instead of the engine's own "invalid reply" handling.
+	Content    string     `json:"content"`
 	Name       string     `json:"name,omitempty"`
 	ToolCallID string     `json:"tool_call_id,omitempty"`
 	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`

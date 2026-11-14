@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -604,5 +605,42 @@ func TestStripFenceUnwrapsMarkdownCodeBlocks(t *testing.T) {
 		if got := stripFence(tc.in); got != tc.want {
 			t.Errorf("%s: stripFence = %q, want %q", tc.name, got, tc.want)
 		}
+	}
+}
+
+// TestChatSendsEmptyContentInsteadOfDroppingIt: a model that answers with
+// nothing must not make the NEXT request invalid.
+//
+// With `omitempty` on Message.Content, an empty reply made the field vanish
+// from the JSON body. The endpoint then read the message as "content: null"
+// and rejected the whole request with
+//
+//	invalid message content type: <nil>
+//
+// One silent model reply killed the turn with a 400 — instead of the engine's
+// own "invalid reply, try again" handling. This is the exact shape of a real
+// run: qwen3.8:27b answered with an empty body once, and the turn died there.
+func TestChatSendsEmptyContentInsteadOfDroppingIt(t *testing.T) {
+	var body []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":""},"finish_reason":"stop"}]}`))
+	}))
+	defer srv.Close()
+
+	_, err := newTestClient(srv, nil).Chat(context.Background(), Request{
+		Model: "m",
+		Messages: []Message{
+			{Role: RoleUser, Content: "hi"},
+			{Role: RoleAssistant}, // the model said nothing
+			{Role: RoleUser, Content: "again"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("chat: %v", err)
+	}
+	if !strings.Contains(string(body), `"content":""`) {
+		t.Fatalf("the empty content must be sent as an empty string, not dropped:\n%s", body)
 	}
 }
