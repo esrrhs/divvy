@@ -118,8 +118,11 @@ export function AiEditDialog() {
     : `第 ${sel?.start_line ?? '?'}-${sel?.end_line ?? '?'} 行`
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-6 backdrop-blur-[1px]">
-      <div className="flex w-full max-w-[760px] flex-col overflow-hidden rounded-xl border border-brand-800/50 bg-ink-850 shadow-2xl">
+    // The dialog floats on the right instead of covering the screen: the point
+    // of the rewrite is to judge it in the file, and a full-screen modal hides
+    // exactly that.
+    <div className="fixed inset-0 z-50 flex items-center justify-end p-3 pointer-events-none">
+      <div className="pointer-events-auto flex max-h-[92vh] w-full max-w-[540px] flex-col overflow-hidden rounded-xl border border-brand-800/50 bg-ink-850 shadow-2xl">
         <div className="flex items-center gap-2 border-b border-line bg-brand-950/30 px-4 py-2.5">
           <span className={`h-2 w-2 rounded-full ${busy ? 'animate-pulse bg-brand-400' : 'bg-brand-700'}`} />
           <h3 className="text-[13px] font-semibold text-brand-200">AI 改写</h3>

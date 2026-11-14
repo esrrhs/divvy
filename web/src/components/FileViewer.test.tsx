@@ -138,3 +138,79 @@ describe('FileViewer search reveal and draft protection', () => {
     expect((host.querySelector('textarea') as HTMLTextAreaElement).value).toMatch(/draft change/)
   })
 })
+
+// A pending AI rewrite is reviewed IN PLACE: the panel shows the file with the
+// change applied, so the decision is made where the code is.
+describe('FileViewer AI rewrite preview', () => {
+  let root: Root
+  let host: HTMLElement
+
+  beforeEach(() => {
+    host = document.createElement('div')
+    document.body.appendChild(host)
+    root = createRoot(host)
+    ;(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
+    vi.spyOn(api, 'fsFile').mockResolvedValue({
+      path: FILE,
+      content: CONTENT,
+      size: CONTENT.length,
+      hash: 'hash-1',
+      editable: true,
+      mode: 0o644,
+    })
+    useStore.setState({
+      currentConvId: 'conv-a',
+      fileView: { path: FILE, sessionId: 'sess-a', line: 1, revealNonce: 1 },
+      aiEditOpen: true,
+      aiEditPath: FILE,
+      aiEditResult: {
+        path: FILE,
+        base_hash: 'hash-1',
+        start_line: 2,
+        end_line: 2,
+        old_text: 'line two\n',
+        new_text: 'line two rewritten\n',
+        hunks: [
+          {
+            index: 0,
+            lines: [
+              { type: 'remove', old_no: 2, text: 'line two' },
+              { type: 'add', new_no: 2, text: 'line two rewritten' },
+            ],
+          },
+        ],
+        preview: '@@ 块 1 @@',
+      },
+      aiEditStreaming: '',
+      aiEditBusy: false,
+      aiEditApplied: null,
+      aiEditHistory: [],
+      aiEditUndoDepth: 0,
+    })
+  })
+
+  afterEach(() => {
+    act(() => root.unmount())
+    host.remove()
+    vi.restoreAllMocks()
+  })
+
+  it('shows the file with the rewrite applied, and the changed line marked', async () => {
+    await act(async () => {
+      root.render(<FileViewer sessionId="sess-a" path={FILE} />)
+      await Promise.resolve()
+    })
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    expect(host.textContent).toContain('AI 改写预览')
+    // The proposed text is what is shown.
+    expect(host.textContent).toContain('line two rewritten')
+    // And the changed line is marked.
+    const marked = Array.from(host.querySelectorAll('span')).find((sp) =>
+      sp.className.includes('bg-emerald-950'),
+    )
+    expect(marked?.textContent).toContain('line two rewritten')
+  })
+})

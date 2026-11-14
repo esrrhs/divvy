@@ -9,6 +9,7 @@ import { scrollTopForLine } from '../lib/fileNav'
 import { FileDiffList } from './FileDiffView'
 import { DocIcon, SpinnerIcon, XIcon } from './icons'
 import { LangFromPath, tokenizeLines, type TokenKind } from '../lib/highlight'
+import type { AiEditResponse } from '../types'
 
 // Same rule as the diff view: only the kinds that carry meaning get a colour.
 // Plain text inherits the editor's own colour, so an unreadable file stays
@@ -27,6 +28,70 @@ function humanSize(n: number): string {
   if (n < 1024) return `${n} B`
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
   return `${(n / 1024 / 1024).toFixed(2)} MB`
+}
+
+// proposedView builds the file as it would look with the pending AI rewrite
+// applied, plus the line numbers the proposal touches.
+//
+// This is what makes the rewrite reviewable IN PLACE: the middle panel shows
+// the file with the change in it, instead of a diff floating in a dialog.
+function proposedView(content: string, r: AiEditResponse): { text: string; marked: Set<number> } {
+  const lines = content.split('\n')
+  const start = Math.max(0, (r.start_line ?? 1) - 1)
+  const end = r.insert_line ? start : Math.max(start, r.end_line ?? r.start_line ?? 1)
+  const before = lines.slice(0, start).join('\n')
+  const after = lines.slice(end).join('\n')
+  const text = before + '\n' + r.new_text + after
+  const marked = new Set<number>()
+  for (const h of r.hunks ?? []) {
+    for (const l of h.lines ?? []) {
+      if (l.type === 'add' && l.new_no) marked.add(l.new_no)
+    }
+  }
+  return { text, marked }
+}
+
+// ProposalView shows the file with the pending rewrite applied. It is
+// read-only on purpose: the proposal has not been accepted yet, so the file on
+// disk is still the user's, and a stray keystroke must not turn it into
+// something else.
+function ProposalView({ content, result }: { content: string; result: AiEditResponse }) {
+  const { text, marked } = useMemo(() => proposedView(content, result), [content, result])
+  const lines = text.split('\n')
+  const lang = LangFromPath(result.path)
+  const tokens = useMemo(() => tokenizeLines(text, lang), [text, lang])
+  return (
+    <div className="flex min-h-0 flex-1 overflow-hidden bg-ink-950/60">
+      <div
+        aria-hidden
+        className="w-14 shrink-0 overflow-hidden border-r border-ink-800 bg-ink-950/80 py-2 text-right font-mono text-[12px] leading-[1.6] text-slate-700"
+      >
+        {lines.map((_, i) => (
+          <div
+            key={i}
+            className={`px-2 ${marked.has(i + 1) ? 'bg-emerald-900/40 text-emerald-300' : ''}`}
+          >
+            {i + 1}
+          </div>
+        ))}
+      </div>
+      <pre className="min-h-0 min-w-0 flex-1 overflow-auto whitespace-pre px-3 py-2 font-mono text-[12px] leading-[1.6] text-slate-300">
+        {tokens.map((line, i) => (
+          <span
+            key={i}
+            className={`block ${marked.has(i + 1) ? 'bg-emerald-950/40 text-emerald-200' : ''}`}
+          >
+            {line.map((t, j) => (
+              <span key={j} className={TOKEN_CLASS[t.kind]}>
+                {t.text}
+              </span>
+            ))}
+            {'\n'}
+          </span>
+        ))}
+      </pre>
+    </div>
+  )
 }
 
 export function CodeEditor({
@@ -143,6 +208,9 @@ export function FileViewer({ sessionId, path }: { sessionId: string | null; path
   const attachSelection = useStore((s) => s.attachSelection)
   const openAiEditDialog = useStore((s) => s.openAiEditDialog)
   const fileReloadNonce = useStore((s) => s.fileReloadNonce)
+  // A pending AI rewrite for THIS file is reviewed in place, in this panel.
+  const proposal = useStore((s) => s.aiEditResult)
+  const proposalPath = useStore((s) => s.aiEditPath)
   const [file, setFile] = useState<FsFileResponse | null>(null)
   const [draft, setDraft] = useState('')
   const [baseHash, setBaseHash] = useState('')
@@ -471,7 +539,16 @@ export function FileViewer({ sessionId, path }: { sessionId: string | null; path
         </div>
       )}
 
-      {(!change || !showDiff) && !loading && !problem && file && (
+      {(!change || !showDiff) && !loading && !problem && file && proposal && proposalPath === path && (
+        <>
+          <p className="shrink-0 border-b border-line bg-brand-950/40 px-4 py-1.5 text-[11.5px] text-brand-200">
+            AI 改写预览：下面是应用这次改写后的样子（尚未写回磁盘）。接受/拒绝在右侧的对话框里。
+          </p>
+          <ProposalView content={file.content} result={proposal} />
+        </>
+      )}
+
+      {(!change || !showDiff) && !loading && !problem && file && !(proposal && proposalPath === path) && (
         <CodeEditor
           key={path}
           value={draft}
