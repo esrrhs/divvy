@@ -2,6 +2,8 @@ package agent
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/esrrhs/divvy/pkg/engine"
@@ -239,6 +241,15 @@ func (o *Orchestrator) planBlockers() []string {
 		blockers = append(blockers, fmt.Sprintf(
 			"goal acceptance references %q but no leaf declares it as an output", miss))
 	}
+	// The mirror image of the check above: a path the acceptance READS that
+	// neither exists nor is produced. Observed on a real run whose DoD was
+	// `... && /tmp/config_cli test.json` — nobody was ever going to create
+	// test.json, so acceptance could not pass no matter how good the work was.
+	for _, miss := range o.uncoveredGoalInputs(root) {
+		blockers = append(blockers, fmt.Sprintf(
+			"goal acceptance reads %q but nothing creates it and it is not in the workspace "+
+				"(add a subtask that produces it, or drop it from the command)", miss))
+	}
 	// Empty outputs after ensureOutputs should be rare; when they slip through
 	// they break entry-point checks and the parallel mutex. Treat them as
 	// structural defects so -plan -strict / replan can force a fix.
@@ -305,69 +316,6 @@ func (o *Orchestrator) uncoveredGoalPaths(root *models.TaskNode) []string {
 	return missing
 }
 
-// goalCommandPaths extracts the concrete deliverable paths a command needs to
-// exist. Only unambiguous forms are recognized; anything that names a package
-// pattern (go test ./..., go build ./...) or the module root yields nothing,
-// because a package-wide check cannot point at one missing file and guessing
-// would produce false blockers.
-func goalCommandPaths(cmds []string) []string {
-	var out []string
-	seen := map[string]bool{}
-	add := func(p string) {
-		p = strings.TrimSpace(strings.Trim(strings.TrimSpace(p), `"'`))
-		if p == "" || seen[p] {
-			return
-		}
-		seen[p] = true
-		out = append(out, p)
-	}
-	for _, cmd := range cmds {
-		fields := strings.Fields(cmd)
-		// Skip leading env assignments: "GOFLAGS=-mod=mod go run ./x".
-		for len(fields) > 0 && strings.Contains(fields[0], "=") {
-			fields = fields[1:]
-		}
-		if len(fields) == 0 {
-			continue
-		}
-		switch {
-		case len(fields) >= 3 && fields[0] == "go" && fields[1] == "run":
-			if isDeliverablePath(fields[2]) {
-				add(fields[2])
-			}
-		case len(fields) >= 3 && fields[0] == "go" && fields[1] == "build":
-			for i := 2; i < len(fields); i++ {
-				f := fields[i]
-				// -o names the build OUTPUT, not a package. Treating its value
-				// as a required path would flag every "go build -o bin/app ./x".
-				if f == "-o" || f == "--output" {
-					i++
-					continue
-				}
-				if strings.HasPrefix(f, "-") {
-					continue
-				}
-				if isDeliverablePath(f) {
-					add(f)
-					break
-				}
-			}
-		case isExecPath(fields[0]):
-			if isDeliverablePath(fields[0]) {
-				add(fields[0])
-			}
-		case len(fields) >= 2:
-			switch fields[0] {
-			case "python", "python3", "node", "deno", "bun", "sh", "bash", "zsh", "pwsh":
-				if isDeliverablePath(fields[1]) {
-					add(fields[1])
-				}
-			}
-		}
-	}
-	return out
-}
-
 // isExecPath reports whether the command word is a direct path to an
 // executable, on either separator convention.
 func isExecPath(s string) bool {
@@ -413,6 +361,43 @@ func pathCoveredByOutputs(target string, outputs []string) bool {
 		}
 	}
 	return false
+}
+
+// uncoveredGoalInputs returns the file paths the goal-level acceptance READS
+// that neither exist in the workspace nor are produced by any leaf.
+//
+// This is the input-side twin of uncoveredGoalPaths. The output side asks "can
+// the thing the command runs exist?"; this asks "can the files it feeds into
+// that thing exist?". A real plan wrote `go build -o /tmp/app . && /tmp/app
+// test.json` with no task producing test.json and no test.json in the
+// workspace: the work could be perfect and acceptance still could not pass.
+func (o *Orchestrator) uncoveredGoalInputs(root *models.TaskNode) []string {
+	if len(root.DoD.Commands) == 0 {
+		return nil
+	}
+	inputs := analyzeAcceptance(root.DoD.Commands).inputs
+	if len(inputs) == 0 {
+		return nil
+	}
+	outputs := o.allOutputs()
+	var missing []string
+	for _, p := range inputs {
+		if pathCoveredByOutputs(p, outputs) || o.workspaceHas(p) {
+			continue
+		}
+		missing = append(missing, p)
+	}
+	return missing
+}
+
+// workspaceHas reports whether p already exists in the workspace. Seeds count:
+// a test fixture committed with the goal is not something a leaf must produce.
+func (o *Orchestrator) workspaceHas(p string) bool {
+	if o.sandbox == nil || o.sandbox.Root == "" {
+		return true // cannot tell — never invent a blocker out of ignorance
+	}
+	_, err := os.Stat(filepath.Join(o.sandbox.Root, filepath.FromSlash(p)))
+	return err == nil
 }
 
 // planStructureMarker tags a replan triggered by planBlockers (as opposed to
