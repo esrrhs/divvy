@@ -34,6 +34,17 @@ func (vr VerifyResult) UnavailableErr() error {
 }
 
 func (o *Orchestrator) verify(ctx context.Context, sb *tools.Sandbox, node *models.TaskNode) VerifyResult {
+	return o.verifyAs(ctx, sb, node, "verify")
+}
+
+// verifyAs is verify with an explicit event kind. The pre-run baseline probe
+// uses "wave_baseline" instead: its failure is the seeded bug in the workspace,
+// not a verification failure of anyone's work, and counting it as one made the
+// bench report VFAIL=1 for runs that verified cleanly on the first try.
+func (o *Orchestrator) verifyAs(ctx context.Context, sb *tools.Sandbox, node *models.TaskNode, kind string) VerifyResult {
+	if kind == "" {
+		kind = "verify"
+	}
 	cmds := node.DoD.Commands
 	if len(cmds) == 0 {
 		ensureDoD(&node.DoD, node.Contract.Outputs, tools.DetectProject(sb.Root))
@@ -56,7 +67,7 @@ func (o *Orchestrator) verify(ctx context.Context, sb *tools.Sandbox, node *mode
 			msg := fmt.Sprintf("command %q failed to start: %v", cmd, err)
 			o.log.Errorf("%s", msg)
 			unavailable := errors.Is(err, tools.ErrExecutionUnavailable)
-			o.events.Record("verify", node.ID, map[string]any{
+			o.events.Record(kind, node.ID, map[string]any{
 				"command": cmd, "ok": false, "exit_code": -1,
 				"duration_ms": duration, "error": clip(err.Error(), evReasonChars),
 				"unavailable": unavailable,
@@ -93,7 +104,7 @@ func (o *Orchestrator) verify(ctx context.Context, sb *tools.Sandbox, node *mode
 			raw := fmt.Sprintf("VERIFY TIMED OUT: %s\n%stimed out\n", cmd, combined.String())
 			msg := o.withDiagnostics(sb, raw)
 			o.log.Errorf("verify timeout: %s", cmd)
-			o.events.Record("verify", node.ID, map[string]any{
+			o.events.Record(kind, node.ID, map[string]any{
 				"command": cmd, "ok": false, "exit_code": res.ExitCode,
 				"timed_out":   true,
 				"duration_ms": duration,
@@ -113,7 +124,7 @@ func (o *Orchestrator) verify(ctx context.Context, sb *tools.Sandbox, node *mode
 		}
 		if res.ExitCode != 0 {
 			o.log.Errorf("verify failed: %s (exit %d)", cmd, res.ExitCode)
-			o.events.Record("verify", node.ID, map[string]any{
+			o.events.Record(kind, node.ID, map[string]any{
 				"command": cmd, "ok": false, "exit_code": res.ExitCode,
 				"duration_ms": duration,
 				"output_tail": tailClip(combined.String(), evVerifyTail),
@@ -121,7 +132,7 @@ func (o *Orchestrator) verify(ctx context.Context, sb *tools.Sandbox, node *mode
 			return VerifyResult{OK: false, Command: cmd, Output: o.withDiagnostics(sb, combined.String()), ExitCode: res.ExitCode}
 		}
 		o.log.Okf("verify passed: %s", cmd)
-		o.events.Record("verify", node.ID, map[string]any{
+		o.events.Record(kind, node.ID, map[string]any{
 			"command": cmd, "ok": true, "exit_code": 0,
 			"duration_ms": duration,
 		})
@@ -141,7 +152,7 @@ func (o *Orchestrator) verify(ctx context.Context, sb *tools.Sandbox, node *mode
 			// of failing on an unmatchable sentence.
 			if looksLikeExpectationPhrase(want, blob) {
 				o.log.Warnf("expected_output %q reads like a description, not printed text; trusting exit codes", want)
-				o.events.Record("verify", node.ID, map[string]any{
+				o.events.Record(kind, node.ID, map[string]any{
 					"ok": true, "expected_output": clip(want, 300),
 					"note": "phrase-like expectation, trusted exit codes",
 				})
@@ -149,7 +160,7 @@ func (o *Orchestrator) verify(ctx context.Context, sb *tools.Sandbox, node *mode
 			}
 			msg := blob + fmt.Sprintf("expected output %q not found\n", want)
 			o.log.Errorf("verify output mismatch: expected %q", want)
-			o.events.Record("verify", node.ID, map[string]any{
+			o.events.Record(kind, node.ID, map[string]any{
 				"ok": false, "command": cmds[len(cmds)-1],
 				"expected_output": clip(want, 300),
 				"output_tail":     tailClip(blob, evVerifyTail),

@@ -165,3 +165,32 @@ go run ./cmd/bench -root bench-runs/<stamp> -repeat 3 -extra '{"reasoning_effort
 `-max-stall` 默认值（3）这份数据**无法判断**：9 次运行一次都没触发停滞检测。要
 评价它是否偏激进，需要更弱的模型或更容易卡住的目标——这是一个待设计的实验，
 而不是从现有数字能得出的结论。
+
+### direct vs tree 对照（2026-11-14，M1 Pro/32GB，macOS `sandbox-exec`）
+
+直接模式此前在 macOS 上根本没法验收（没有执行后端，报告里只能标 `skip`），所以这是 direct 的第一批真实数字。两边同目标、同种子工作区、同一条验收命令：
+
+```bash
+go run ./cmd/bench -loop direct -goals fix-average -extra '{"reasoning_effort":"none"}' -root bench-runs/<tag>
+go run ./cmd/bench -loop tree   -goals fix-average -extra '{"reasoning_effort":"none"}' -root bench-runs/<tag>
+```
+
+| 运行 | 循环 | 成败 | 墙钟 | LLM 调用 | token | 验收 | VFAIL |
+|---|---|---|---|---|---|---|---|
+| 1 | direct | ✅ | 3m24s | 6 | 11,824 | pass | 0 |
+| 2 | direct（下表两处修复后） | ✅ | 1m49s | 5 | 9,710 | pass | 0 |
+| 1 | tree | ✅ | 2m31s | 4 | 7,672 | — | **1**（误计，见下） |
+| 2 | tree（两处修复后） | ✅ | 1m47s | 4 | 7,715 | — | 0 |
+
+读表前先读这三条：
+
+1. **n=1，同一模型同一目标，方差比差异大。** 第 2 次 direct 只用了 5 次调用，不是因为改了什么，而是这次模型没再发明工具名（第 1 次它开局调用了不存在的 `batch_read`）。墙钟的改善还有一部分来自模型已在显存、prompt 缓存命中——第一次含 20~40 秒加载。**比较以 calls / tokens 为主，墙钟只当参考。**
+2. **`fix-average` 是树模式最有利的形态。** 拆解判成 atomic（1.8k token）后退化成 1 个叶子，tree = decompose + 3 步 worker = 4 次调用；direct 的开销在别处：每步系统提示都带项目地图、声明索引和项目规则，5 次调用约 9.7k prompt token。要看清两条路的差别，语料需要一个**必须拆**的多文件目标——这是语料库的下一步。
+3. **两边都一次做对**，没有重试、停滞或重新拆解。所以这张表还测不出"模型第一次改错"时的恢复成本，而那正是引擎立论所在；要看那条得换更难的语料或更小的模型。
+
+和 2026-10-15 那轮对照：同一目标的 tree 是 4 次调用 / 6,600 token，这次 4 次 / 7,715 token（+17%），**调用数完全一致**，说明树模式在这个目标上的执行路径是稳定的；direct 的 5~6 次则取决于模型开局怎么读文件。
+
+#### 这一轮跑出来、并且已经修掉的两件事
+
+- **`batch_read`**：模型凭记忆编工具名，代价是一整次 LLM 往返（本机约 60 秒、1.9k token）。现在有一张不歧义别名表接住它（`pkg/tools/alias.go`，见 README「工具名写错不会浪费一轮」）。
+- **VFAIL 把基线检查算成了失败**：跑之前引擎会先探一眼没动过的工作区（区分"本来就坏"和"这一波弄坏的"），`fix-average` 的种子 bug 让这一步天然失败，于是零失败的运行也显示 `VFAIL=1`。会撒谎的指标比没有指标更糟，所以基线改记 `wave_baseline` 事件、不进 VFAIL。表里第 1 次 tree 的 1 就是这个误计。
