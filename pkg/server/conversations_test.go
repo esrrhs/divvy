@@ -846,6 +846,90 @@ func TestConversation_HunkAcceptRejectWritesWorkdir(t *testing.T) {
 	}
 }
 
+// The review UI decides per change group; the endpoint has to honour it. Both
+// halves of that feature were tested on their own — the frontend's payload and
+// the server's application — and nothing proved they fit together.
+func TestConversation_GroupDecisionsApplyOverHTTP(t *testing.T) {
+	work, data := t.TempDir(), t.TempDir()
+	old := "package p\n\nfunc A() int {\n\treturn 1\n}\n\nfunc B() int {\n\treturn 2\n}\n"
+	updated := "package p\n\nfunc A() int {\n\treturn 11\n}\n\nfunc B() int {\n\treturn 22\n}\n"
+	if err := os.WriteFile(filepath.Join(work, "calc.go"), []byte(old), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	const plan = `{
+	  "is_atomic": true,
+	  "reason": "one file",
+	  "contract": {"outputs": ["calc.go"]},
+	  "dod": {"commands": ["test -f calc.go"]},
+	  "subtasks": []
+	}`
+	client := &llm.ScriptedClient{
+		Handle: func(ctx context.Context, req llm.Request) (*llm.Response, error) {
+			sys := ""
+			if len(req.Messages) > 0 {
+				sys = req.Messages[0].Content
+			}
+			if strings.Contains(sys, "software architect") {
+				return &llm.Response{Content: plan}, nil
+			}
+			for _, m := range req.Messages {
+				if m.Role == llm.RoleUser && strings.Contains(m.Content, "Tool write_file result") {
+					return &llm.Response{Content: `{"action":"finish","args":{"summary":"done"}}`}, nil
+				}
+			}
+			content, _ := json.Marshal(updated)
+			return &llm.Response{Content: `{"action":"write_file","args":{"path":"calc.go","content":` + string(content) + `}}`}, nil
+		},
+	}
+	ts := apiServerWithClient(t, work, data, func(agent.Config) llm.Client { return client })
+	status, resp := apiDo(t, http.MethodPost, apiBase(ts)+"/conversations?token=test-token", map[string]any{
+		"workdir": work, "model": "scripted", "base_url": "http://127.0.0.1:9/v1",
+		"api_key": testSecretKey, "isolate": true,
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("create status=%d resp=%v", status, resp)
+	}
+	id := anyString(resp["id"])
+	status, resp = apiDo(t, http.MethodPost, apiBase(ts)+"/conversations/"+id+"/messages?token=test-token", map[string]any{
+		"text": "change both functions",
+	})
+	if status != http.StatusAccepted {
+		t.Fatalf("message status=%d resp=%v", status, resp)
+	}
+	sid := anyString(resp["current_session_id"])
+	waitLivePhase(t, ts, sid, string(agent.PhasePlanReview))
+	apiDo(t, http.MethodPost, apiBase(ts)+"/sessions/"+sid+"/plan/approve?token=test-token", map[string]any{})
+	waitConvPhase(t, func() string {
+		_, got := apiDo(t, http.MethodGet, apiBase(ts)+"/conversations/"+id+"?token=test-token", nil)
+		msgs, _ := got["messages"].([]any)
+		for _, item := range msgs {
+			m := item.(map[string]any)
+			if m["kind"] == kindRunFinished && m["outcome"] == "completed" {
+				return string(agent.PhaseDone)
+			}
+		}
+		return anyString(got["run_phase"])
+	}, string(agent.PhaseDone))
+
+	// Keep the first change, drop the second.
+	status, got := apiDo(t, http.MethodPost, apiBase(ts)+"/conversations/"+id+"/turns/"+sid+"/changes?token=test-token", map[string]any{
+		"path":            "calc.go",
+		"group_decisions": []bool{true, false},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("apply status=%d resp=%v", status, got)
+	}
+	onDisk, err := os.ReadFile(filepath.Join(work, "calc.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "package p\n\nfunc A() int {\n\treturn 11\n}\n\nfunc B() int {\n\treturn 2\n}\n"
+	if string(onDisk) != want {
+		t.Fatalf("file = %q\nwant  %q", onDisk, want)
+	}
+}
+
 func TestConversation_HunkApplyBlockedWhileRunning(t *testing.T) {
 	work, data := t.TempDir(), t.TempDir()
 	gate := make(chan struct{})
