@@ -45,6 +45,21 @@ type aiEditRequest struct {
 	// Stream asks for an SSE response with incremental code as it is produced.
 	// The final parsed result arrives as the `done` event.
 	Stream bool `json:"stream,omitempty"`
+	// History carries the earlier turns of the same inline edit, so a
+	// follow-up ("再补一个超时分支") is answered in the context of what came
+	// before instead of starting from the original code every time.
+	//
+	// The proposals are NOT on disk yet: the server replays them onto the
+	// file in memory, so the model revises its own last proposal while the
+	// diff the user reviews stays relative to the file on disk.
+	History []aiEditTurn `json:"history,omitempty"`
+}
+
+// aiEditTurn is one earlier round of an inline edit: what the user asked for
+// and what the model proposed for the region.
+type aiEditTurn struct {
+	Instruction string `json:"instruction"`
+	Code        string `json:"code"`
 }
 
 type aiEditResponse struct {
@@ -87,6 +102,11 @@ type aiEditApplyResponse struct {
 // aiEditContextChars bounds the file content pasted into the prompt. Beyond
 // this the model gets a window around the selection instead of the whole file.
 const aiEditContextChars = 24000
+
+// aiEditMaxHistoryTurns bounds how many earlier rounds of an inline edit are
+// replayed into the prompt. Each turn carries a whole code block, so an
+// unbounded history would grow the prompt until the request becomes useless.
+const aiEditMaxHistoryTurns = 6
 
 // aiEditWindowLines is the context radius used when the file is too large.
 const aiEditWindowLines = 80
@@ -140,6 +160,30 @@ func (s *Server) handleAiEdit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A follow-up turn revises the PREVIOUS PROPOSAL, not the file: the
+	// proposal has not been written yet, so the code the model must change is
+	// the code it produced last time. The file in memory is rewritten with
+	// that proposal so the model sees one consistent picture — the file as it
+	// would look with its own last change in it.
+	history := req.History
+	if len(history) > aiEditMaxHistoryTurns {
+		// The prompt carries every earlier turn, so an endless conversation
+		// would grow it without bound. The recent turns are the ones that
+		// matter; the oldest ones are dropped.
+		history = history[len(history)-aiEditMaxHistoryTurns:]
+	}
+	promptContent := content
+	promptRegion := region
+	if len(history) > 0 {
+		virtual, vregion, verr := aiEditVirtualRegion(content, region, history[len(history)-1].Code)
+		if verr != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": verr.Error()})
+			return
+		}
+		promptContent = virtual
+		promptRegion = vregion
+	}
+
 	cfg, err := s.configForConversation(c)
 	if err != nil {
 		writeJSON(w, statusForConvErr(err), map[string]string{"error": err.Error()})
@@ -148,7 +192,7 @@ func (s *Server) handleAiEdit(w http.ResponseWriter, r *http.Request) {
 	client := s.newClient(cfg)
 	secrets := s.secretsFor(c.ID)
 
-	prompt := buildAiEditPrompt(rel, content, region, req.Instruction)
+	prompt := buildAiEditPrompt(rel, promptContent, promptRegion, req.Instruction, history)
 
 	// SSE only if the client asked for it and the ResponseWriter can flush.
 	flusher, canFlush := w.(http.Flusher)
@@ -167,7 +211,7 @@ func (s *Server) handleAiEdit(w http.ResponseWriter, r *http.Request) {
 		Model:       cfg.Model,
 		Messages:    prompt,
 		Temperature: 0.1,
-		MaxTokens:   aiEditMaxTokens(region),
+		MaxTokens:   aiEditMaxTokens(promptRegion),
 		Stream:      stream,
 	}
 	if stream {
@@ -426,6 +470,58 @@ func aiEditRegionFor(content string, sel aiEditSelection) (aiEditRegion, error) 
 	}, nil
 }
 
+// aiEditVirtualRegion applies a previous proposal to the file WITHOUT writing
+// it, and returns the file the model should see plus the region inside it.
+//
+// This is what makes a follow-up turn possible: the proposal is not on disk
+// yet, so the code the model has to revise is the code it produced last
+// time, not the original selection. Nothing is written here — the file on
+// disk keeps the original text, and the diff the user reviews stays relative
+// to it, so the apply path (base hash + old text) does not change at all.
+func aiEditVirtualRegion(content string, region aiEditRegion, code string) (string, aiEditRegion, error) {
+	if strings.TrimSpace(code) == "" {
+		return "", aiEditRegion{}, fmt.Errorf("the previous turn produced no code to revise")
+	}
+	replacement := code
+	if region.InsertLine > 0 {
+		// An insertion has no old text to inherit line breaks from, so make
+		// sure it cannot glue itself onto the neighbouring lines.
+		if !strings.HasSuffix(replacement, "\n") {
+			replacement += "\n"
+		}
+		if region.StartOffset > 0 && content[region.StartOffset-1] != '\n' {
+			replacement = "\n" + replacement
+		}
+		virtual := content[:region.StartOffset] + replacement + content[region.EndOffset:]
+		return virtual, aiEditRegion{
+			InsertLine:  region.InsertLine,
+			StartLine:   region.InsertLine,
+			EndLine:     region.InsertLine - 1,
+			StartOffset: region.StartOffset,
+			EndOffset:   region.StartOffset,
+			OldText:     replacement,
+		}, nil
+	}
+	// A replacement inherits the old region's line break: the old text ran to
+	// the start of the next line, so the proposal has to end the same way or
+	// the next line glues onto it.
+	if strings.HasSuffix(region.OldText, "\n") && !strings.HasSuffix(replacement, "\n") {
+		replacement += "\n"
+	}
+	virtual := content[:region.StartOffset] + replacement + content[region.EndOffset:]
+	lines := strings.Count(replacement, "\n")
+	if !strings.HasSuffix(replacement, "\n") {
+		lines++
+	}
+	return virtual, aiEditRegion{
+		StartLine:   region.StartLine,
+		EndLine:     region.StartLine + lines - 1,
+		StartOffset: region.StartOffset,
+		EndOffset:   region.StartOffset + len(replacement),
+		OldText:     replacement,
+	}, nil
+}
+
 // lineStartOffsets returns the byte offset of every line start plus
 // len(content), so line L spans [offsets[L-1], offsets[L]).
 func lineStartOffsets(content string) []int {
@@ -469,7 +565,7 @@ func aiEditTimeout(cfg agent.Config) time.Duration {
 // buildAiEditPrompt renders the system+user messages. The whole file is sent
 // when it fits, because an inline edit that cannot see the types and helpers
 // around it produces plausible garbage.
-func buildAiEditPrompt(rel, content string, region aiEditRegion, instruction string) []llm.Message {
+func buildAiEditPrompt(rel, content string, region aiEditRegion, instruction string, history []aiEditTurn) []llm.Message {
 	lineCount := len(lineStartOffsets(content)) - 1
 	body, truncated := aiEditContextBlock(content, region)
 
@@ -489,6 +585,17 @@ func buildAiEditPrompt(rel, content string, region aiEditRegion, instruction str
 	user := fmt.Sprintf("文件：%s（共 %d 行）\n%s\n", rel, lineCount, target)
 	if truncated {
 		user += "注意：文件较大，下面只给出选区附近的窗口。\n"
+	}
+	if len(history) > 0 {
+		// The model is revising its own last proposal. Without the earlier
+		// turns it would answer "再补一个超时分支" from the ORIGINAL code and
+		// throw away the work the previous turn did.
+		user += fmt.Sprintf("\n这是同一处代码的第 %d 轮改写。之前的指令与产出：\n", len(history)+1)
+		for i, h := range history {
+			user += fmt.Sprintf("\n第 %d 轮指令：%s\n第 %d 轮产出：\n%s\n", i+1, h.Instruction, i+1, h.Code)
+		}
+		user += "\n下面选区里的代码已经是上一轮的产出。请在它的基础上执行新的指令，" +
+			"保留上一轮已经做对的部分，仍只输出选区范围的完整替换代码。\n"
 	}
 	user += "\n" + body + "\n改写指令：" + instruction + "\n\n只输出替换后的代码："
 	return []llm.Message{

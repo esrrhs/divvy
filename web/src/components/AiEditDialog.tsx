@@ -36,7 +36,9 @@ export function AiEditDialog() {
   const streaming = useStore((s) => s.aiEditStreaming)
   const busy = useStore((s) => s.aiEditBusy)
   const applied = useStore((s) => s.aiEditApplied)
+  const history = useStore((s) => s.aiEditHistory)
   const runAiEdit = useStore((s) => s.runAiEdit)
+  const resetAiEdit = useStore((s) => s.resetAiEdit)
   const applyAiEdit = useStore((s) => s.applyAiEdit)
   const undoAiEdit = useStore((s) => s.undoAiEdit)
   const closeAiEditDialog = useStore((s) => s.closeAiEditDialog)
@@ -65,6 +67,18 @@ export function AiEditDialog() {
     if (streamBox.current) streamBox.current.scrollTop = streamBox.current.scrollHeight
   }, [streaming])
 
+  // One entry point for both the button and the keyboard shortcut: the
+  // instruction box is cleared only after the model answered, so a failed
+  // turn can be retried without retyping it.
+  const send = () => {
+    const text = instruction.trim()
+    if (!text || busy) return
+    clearActionError()
+    void runAiEdit(text).then((ok) => {
+      if (ok) setInstruction('')
+    })
+  }
+
   useEffect(() => {
     if (!open) return
     const onKey = (e: KeyboardEvent) => {
@@ -77,7 +91,7 @@ export function AiEditDialog() {
       if (!mod) return
       if (e.key === 'Enter' && instruction.trim() && !busy) {
         e.preventDefault()
-        void runAiEdit(instruction)
+        send()
       } else if (e.key.toLowerCase() === 's' && result && accepted > 0 && !busy) {
         e.preventDefault()
         void applyAiEdit(decisionsFor(hunks, rejected))
@@ -104,6 +118,9 @@ export function AiEditDialog() {
               {path}
             </span>
             <span className="shrink-0">{rangeText}</span>
+            {history.length > 0 && (
+              <span className="shrink-0 text-brand-300">第 {history.length} 轮</span>
+            )}
           </span>
           <button
             type="button"
@@ -132,7 +149,11 @@ export function AiEditDialog() {
             <textarea
               autoFocus
               className="input min-h-[76px] resize-y"
-              placeholder="例如：给这个函数加文档注释、修掉空指针、把这段循环改成 map、补上边界测试"
+              placeholder={
+                result
+                  ? '继续说要改什么（例如：再补一个超时分支、把参数校验也加上）'
+                  : '例如：给这个函数加文档注释、修掉空指针、把这段循环改成 map、补上边界测试'
+              }
               value={instruction}
               onChange={(e) => setInstruction(e.target.value)}
             />
@@ -156,20 +177,32 @@ export function AiEditDialog() {
               type="button"
               disabled={busy || !instruction.trim()}
               className="btn-primary px-3 py-1.5 text-[12px]"
-              onClick={() => {
-                clearActionError()
-                void runAiEdit(instruction)
-              }}
+              onClick={send}
             >
               {busy && <SpinnerIcon width={13} height={13} />}
-              {busy ? '生成中…' : result ? '重新生成' : '生成候选'}
+              {busy ? '生成中…' : result ? '继续改' : '生成候选'}
             </button>
-            {result && hunks.length > 0 && (
-              <span className="text-[11px] text-slate-400">
-                将应用 {accepted} / {hunks.length} 块
-                {rejected.size > 0 && ` · 已拒绝 ${rejected.size} 块`}
-              </span>
-            )}
+            <div className="flex items-center gap-3">
+              {history.length > 0 && (
+                <button
+                  type="button"
+                  className="text-[11px] text-slate-500 underline decoration-dotted hover:text-slate-300"
+                  title="丢掉前面的对话，从原选区重新开始"
+                  onClick={() => {
+                    resetAiEdit()
+                    setInstruction('')
+                  }}
+                >
+                  从头再来
+                </button>
+              )}
+              {result && hunks.length > 0 && (
+                <span className="text-[11px] text-slate-400">
+                  将应用 {accepted} / {hunks.length} 块
+                  {rejected.size > 0 && ` · 已拒绝 ${rejected.size} 块`}
+                </span>
+              )}
+            </div>
           </div>
 
           {actionError && (
@@ -209,7 +242,7 @@ export function AiEditDialog() {
           {result && hunks.length > 0 && (
             <div className="overflow-hidden rounded-md border border-line">
               <div className="flex items-center justify-between border-b border-line bg-ink-900 px-3 py-1.5 text-[11px] text-slate-400">
-                <span className="font-mono">候选 diff（点块标题可整块拒绝 / 接受）</span>
+                <span className="font-mono">候选 diff（相对文件原文，点块标题可整块拒绝 / 接受）</span>
                 <span className="flex gap-2">
                   <button
                     type="button"
