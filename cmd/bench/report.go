@@ -54,7 +54,7 @@ func renderTable(rs []RunResult) string {
 		if loop == "" {
 			loop = loopTree
 		}
-		acpt := "-"
+		var acpt string
 		switch {
 		case !r.AcceptRan:
 			acpt = "skip"
