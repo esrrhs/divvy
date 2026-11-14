@@ -36,7 +36,9 @@ func TestRunBash_ExplainsSandboxWriteRefusal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run_bash: %v", err)
 	}
-	if !strings.Contains(out, "exit_code: 1") {
+	// Not "exit_code: 1": dash and bash disagree about the status of a failed
+	// redirect (Linux CI reported 2), and the exact number is not the contract.
+	if strings.Contains(out, "exit_code: 0") {
 		t.Fatalf("the write must fail, got:\n%s", out)
 	}
 	if !strings.Contains(out, sandboxWriteHint) {
