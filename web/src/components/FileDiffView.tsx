@@ -6,6 +6,21 @@ import {
   initialHunkAccepts,
 } from '../lib/conversation'
 import { computeDiff, toHunks, type DiffLine } from '../lib/diff'
+import { LangFromPath, tokenizeLines, type Token, type TokenKind } from '../lib/highlight'
+
+// Only the kinds that carry meaning get a colour. Plain text inherits the
+// row's colour, so an added line still reads as added (emerald) and a removed
+// one as removed (rose) — the syntax colours sit on top of that, the way a
+// code review tool is supposed to look.
+const TOKEN_CLASS: Record<TokenKind, string> = {
+  plain: '',
+  keyword: 'text-sky-300',
+  type: 'text-teal-300',
+  string: 'text-emerald-300',
+  number: 'text-amber-300',
+  comment: 'text-slate-500 italic',
+  func: 'text-brand-300',
+}
 
 const statusMeta: Record<FileChange['status'], { label: string; cls: string }> = {
   added: { label: '新增', cls: 'border-emerald-700/60 bg-emerald-900/20 text-emerald-300' },
@@ -51,7 +66,7 @@ function hunkLines(change: FileChange): { hunks: { index: number; lines: DiffLin
   return { hunks: toHunks(lines).map((h, i) => ({ index: i, lines: h.lines })), truncated }
 }
 
-function DiffRow({ l }: { l: DiffLine }) {
+function DiffRow({ l, tokens }: { l: DiffLine; tokens?: Token[] }) {
   const cls =
     l.type === 'add'
       ? 'bg-emerald-950/40 text-emerald-200'
@@ -68,7 +83,17 @@ function DiffRow({ l }: { l: DiffLine }) {
         {l.newNo ?? ''}
       </span>
       <span className="w-4 shrink-0 select-none text-center">{sign}</span>
-      <span className="whitespace-pre-wrap break-all">{l.text}</span>
+      <span className="whitespace-pre-wrap break-all">
+        {tokens && tokens.length ? (
+          tokens.map((t, i) => (
+            <span key={i} className={TOKEN_CLASS[t.kind]}>
+              {t.text}
+            </span>
+          ))
+        ) : (
+          l.text
+        )}
+      </span>
     </div>
   )
 }
@@ -93,6 +118,25 @@ function FileDiff({
   const tc = asTurn(change)
   const { hunks, truncated } = useMemo(() => hunkLines(change), [change])
   const [accepts, setAccepts] = useState(() => initialHunkAccepts(hunks.length, tc.hunk_decisions))
+
+  // Syntax colours for the reviewed code. The tokens come from the WHOLE file
+  // (not from the diff line) so a comment or a raw string that spans lines
+  // keeps its state: its tail must not be coloured as code.
+  const lang = LangFromPath(change.path)
+  const oldTokens = useMemo(
+    () => tokenizeLines(change.old_content ?? '', lang),
+    [change.old_content, lang],
+  )
+  const newTokens = useMemo(
+    () => tokenizeLines(change.new_content ?? '', lang),
+    [change.new_content, lang],
+  )
+  const tokensFor = (l: DiffLine): Token[] | undefined => {
+    if (l.type === 'remove') return l.oldNo ? oldTokens[l.oldNo - 1] : undefined
+    if (l.newNo) return newTokens[l.newNo - 1]
+    if (l.oldNo) return oldTokens[l.oldNo - 1]
+    return undefined
+  }
 
   useEffect(() => {
     setAccepts(initialHunkAccepts(hunks.length, asTurn(change).hunk_decisions))
@@ -233,7 +277,7 @@ function FileDiff({
                       </div>
                     )}
                     {h.lines.map((l, j) => (
-                      <DiffRow key={j} l={l} />
+                      <DiffRow key={j} l={l} tokens={tokensFor(l)} />
                     ))}
                   </div>
                 )

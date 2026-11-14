@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import { ApiError, api } from '../api/client'
 import { sameRelPath } from '../lib/conversation'
 import { useStore } from '../store'
@@ -8,6 +8,20 @@ import { draftLocateNotice } from '../lib/search'
 import { scrollTopForLine } from '../lib/fileNav'
 import { FileDiffList } from './FileDiffView'
 import { DocIcon, SpinnerIcon, XIcon } from './icons'
+import { LangFromPath, tokenizeLines, type TokenKind } from '../lib/highlight'
+
+// Same rule as the diff view: only the kinds that carry meaning get a colour.
+// Plain text inherits the editor's own colour, so an unreadable file stays
+// readable.
+const TOKEN_CLASS: Record<TokenKind, string> = {
+  plain: '',
+  keyword: 'text-sky-300',
+  type: 'text-teal-300',
+  string: 'text-emerald-300',
+  number: 'text-amber-300',
+  comment: 'text-slate-500 italic',
+  func: 'text-brand-300',
+}
 
 function humanSize(n: number): string {
   if (n < 1024) return `${n} B`
@@ -15,8 +29,9 @@ function humanSize(n: number): string {
   return `${(n / 1024 / 1024).toFixed(2)} MB`
 }
 
-function CodeEditor({
+export function CodeEditor({
   value,
+  path,
   onChange,
   readOnly,
   onSelect,
@@ -24,6 +39,7 @@ function CodeEditor({
   revealNonce,
 }: {
   value: string
+  path: string
   onChange: (next: string) => void
   readOnly?: boolean
   onSelect: (start: number, end: number) => void
@@ -32,11 +48,24 @@ function CodeEditor({
 }) {
   const ta = useRef<HTMLTextAreaElement | null>(null)
   const gutter = useRef<HTMLDivElement | null>(null)
+  const layer = useRef<HTMLPreElement | null>(null)
   const lineCount = Math.max(1, value.split('\n').length)
+
+  // The highlighted layer sits behind a transparent textarea. It must lag the
+  // typing, not block it: tokenizing a big file on every keystroke would make
+  // the editor feel sticky.
+  const deferred = useDeferredValue(value)
+  const tokens = useMemo(() => tokenizeLines(deferred, LangFromPath(path)), [deferred, path])
 
   function syncScroll() {
     if (gutter.current && ta.current) {
       gutter.current.scrollTop = ta.current.scrollTop
+    }
+    // The highlighted layer sits behind the textarea, so it has to scroll
+    // with it — horizontally too, or a long line drifts out of its column.
+    if (layer.current && ta.current) {
+      layer.current.scrollTop = ta.current.scrollTop
+      layer.current.scrollLeft = ta.current.scrollLeft
     }
   }
 
@@ -45,6 +74,7 @@ function CodeEditor({
     const top = scrollTopForLine(revealLine)
     ta.current.scrollTop = top
     if (gutter.current) gutter.current.scrollTop = top
+    if (layer.current) layer.current.scrollTop = top
   }, [revealLine, revealNonce, value])
 
   return (
@@ -60,20 +90,38 @@ function CodeEditor({
           </div>
         ))}
       </div>
-      <textarea
-        ref={ta}
-        value={value}
-        readOnly={readOnly}
-        spellCheck={false}
-        wrap="off"
-        onChange={(e) => onChange(e.target.value)}
-        onScroll={syncScroll}
-        onSelect={(e) => {
-          const el = e.currentTarget
-          onSelect(el.selectionStart, el.selectionEnd)
-        }}
-        className="min-h-0 min-w-0 flex-1 resize-none bg-transparent px-3 py-2 font-mono text-[12px] leading-[1.6] text-slate-300 outline-none"
-      />
+      <div className="relative min-h-0 min-w-0 flex-1">
+        <pre
+          aria-hidden
+          ref={layer}
+          className="pointer-events-none absolute inset-0 overflow-hidden whitespace-pre px-3 py-2 font-mono text-[12px] leading-[1.6] text-slate-300"
+        >
+          {tokens.map((line, i) => (
+            <span key={i}>
+              {line.map((t, j) => (
+                <span key={j} className={TOKEN_CLASS[t.kind]}>
+                  {t.text}
+                </span>
+              ))}
+              {'\n'}
+            </span>
+          ))}
+        </pre>
+        <textarea
+          ref={ta}
+          value={value}
+          readOnly={readOnly}
+          spellCheck={false}
+          wrap="off"
+          onChange={(e) => onChange(e.target.value)}
+          onScroll={syncScroll}
+          onSelect={(e) => {
+            const el = e.currentTarget
+            onSelect(el.selectionStart, el.selectionEnd)
+          }}
+          className="relative min-h-0 min-w-0 h-full w-full resize-none bg-transparent px-3 py-2 font-mono text-[12px] leading-[1.6] text-transparent caret-slate-300 outline-none"
+        />
+      </div>
     </div>
   )
 }
@@ -427,6 +475,7 @@ export function FileViewer({ sessionId, path }: { sessionId: string | null; path
         <CodeEditor
           key={path}
           value={draft}
+          path={path}
           readOnly={!canEdit}
           revealLine={revealLine}
           revealNonce={revealNonce}
