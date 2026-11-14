@@ -18,6 +18,18 @@ var isolatedEnvAllow = map[string]bool{
 	"LC_TIME": true, "LC_MONETARY": true, "TZ": true, "TERM": true,
 }
 
+// isolatedGOFlags is forced for every sandboxed command that runs the Go
+// toolchain.
+//
+// `go build` stamps VCS state into a main package's binary, which means
+// running git — and git cannot run inside the sandbox (on macOS xcode-select
+// is denied, on Linux most of the filesystem is masked away). The result is
+// "error obtaining VCS status: exit status 1" on a build that is perfectly
+// fine, and in the first config-cli bench run that artifact sent the model
+// chasing git, xcode-select and sudo for ten steps before it gave up. A build
+// inside a sandbox has no meaningful VCS state to stamp anyway.
+const isolatedGOFlags = "-buildvcs=false"
+
 // filterIsolatedEnv keeps only the allow-listed host variables. A nil env means
 // "inherit the current process"; the result is always freshly allocated so
 // callers can append to it.

@@ -142,6 +142,7 @@ func darwinEnv(env []string, dirs execDirs) []string {
 		"GOTOOLCHAIN=local",
 		"GOPROXY=off",
 		"GOSUMDB=off",
+		"GOFLAGS="+isolatedGOFlags,
 	)
 	// GOMODCACHE must stay on the host (it is read-only from inside), otherwise
 	// every offline build with dependencies fails to find its modules.

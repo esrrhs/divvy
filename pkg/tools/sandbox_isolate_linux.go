@@ -93,6 +93,7 @@ func isolatedEnv(env []string) []string {
 		"GOTOOLCHAIN=local",
 		"GOPROXY=off",
 		"GOSUMDB=off",
+		"GOFLAGS="+isolatedGOFlags,
 		"XDG_CACHE_HOME=/tmp/divvy-xdg-cache",
 	)
 	return out

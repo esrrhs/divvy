@@ -385,3 +385,69 @@ func TestBench_CorpusDeclaresAcceptance(t *testing.T) {
 		}
 	}
 }
+
+// TestBench_ConfigCLISeedFailsFirst keeps the newest goal honest: a workspace
+// with the contract but no implementation must fail, otherwise passing it says
+// nothing about the model.
+func TestBench_ConfigCLISeedFailsFirst(t *testing.T) {
+	g, ok := goalByName("config-cli")
+	if !ok {
+		t.Fatal("corpus is missing the config-cli goal")
+	}
+	dir := t.TempDir()
+	if err := g.seedWorkspace(dir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "main_test.go")); err != nil {
+		t.Fatalf("main_test.go not seeded: %v", err)
+	}
+	if out, err := runCmd(dir, "go", "test", "./..."); err == nil {
+		t.Fatalf("seeded workspace must fail before the model implements anything:\n%s", out)
+	}
+}
+
+// TestBench_GuardCatchesEditedTaskFile: the contract test is the verdict, so
+// editing it must not count as success.
+func TestBench_GuardCatchesEditedTaskFile(t *testing.T) {
+	g, ok := goalByName("config-cli")
+	if !ok {
+		t.Fatal("corpus is missing the config-cli goal")
+	}
+	dir := t.TempDir()
+	if err := g.seedWorkspace(dir); err != nil {
+		t.Fatal(err)
+	}
+	if viol := guardViolation(dir, g); viol != "" {
+		t.Fatalf("fresh seed must be intact, got %q", viol)
+	}
+	path := filepath.Join(dir, "main_test.go")
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The cheapest way to "pass": delete the assertions.
+	if err := os.WriteFile(path, append(body, "\n// relaxed\n"...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if viol := guardViolation(dir, g); viol == "" {
+		t.Fatal("an edited task file must be reported")
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if viol := guardViolation(dir, g); viol == "" || !strings.Contains(viol, "missing") {
+		t.Fatalf("a deleted task file must be reported as missing, got %q", viol)
+	}
+}
+
+// TestBench_GuardPathsAreSeeded stops a typo in Guard from silently guarding
+// nothing (which would disable the anti-gaming check for that goal).
+func TestBench_GuardPathsAreSeeded(t *testing.T) {
+	for _, g := range Corpus {
+		for _, rel := range g.Guard {
+			if _, ok := g.Seed[rel]; !ok {
+				t.Errorf("goal %q guards %q, which it does not seed", g.Name, rel)
+			}
+		}
+	}
+}

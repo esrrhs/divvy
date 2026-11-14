@@ -22,18 +22,23 @@ go run ./cmd/bench -base-url https://api.example.com/v1 -model small-model -api-
 
 ## 语料库
 
-固定、版本化在 `cmd/bench/corpus.go` 里——基准的目标集一旦漂移，跨运行的比较就失去意义。四个目标覆盖四种任务形态：
+固定、版本化在 `cmd/bench/corpus.go` 里——基准的目标集一旦漂移，跨运行的比较就失去意义。五个目标覆盖五种任务形态（四个单文件 + 一个必须拆的多文件）：
 
 | 目标 | 形态 | 验收命令（`Goal.Accept`） |
 |---|---|---|
 | `string-utils` | 从零创建包（3 个函数 + 表驱动测试） | `go build ./... && go test ./...` |
 | `fix-average` | 修复 seeded 差一 bug（含空切片 NaN） | `go test ./...` |
 | `http-health` | 构建可运行 HTTP 服务 + 单测 | `go build ./... && go test ./...` |
+| `config-cli` | **多文件**：契约测试 + 3 个职责不同的文件（config.go / run.go / main.go） | `go build ./... && go test ./...` |
 | `cmake-add` | CMake/C++ 目标 + ctest | `ctest --test-dir build --output-on-failure -R add` |
 
 选 Go 是因为它是唯一能**完全离线自验收**的栈（`go build`/`go test` 不需要网络），基准因此是 hermetic 的：结果差异只来自模型和引擎，不来自外部服务抖动。
 
 `fix-average` 的 workspace 自带一个**会失败**的测试——harness 测试（`TestBench_SeedWorkspaceIsolomorphic`）守着这条不变量：如果语料本身不失败，这个目标就退化成了"从零创建"，基准失去区分度。它同时考察引擎最核心的弱模型能力：读失败输出 → 定位 → 最小修复。
+
+`config-cli` 是唯一**逼着拆**的目标：契约写在一个只有测试、没有实现的 workspace 里，提示词要求把实现分到 `config.go` / `run.go` / `main.go` 三个文件。它同时补上了另一个缺口——前面四个目标都是"单文件、可一次做完"，树模式的拆解成本在那里永远摊不开，`direct vs tree` 也就只能比较"最小修复"这一类。
+
+这个目标的判定靠 `main_test.go`，所以它进了 `Goal.Guard`：跑完会比对受保护种子文件的字节，被改过或删掉就判失败（`protected seed file: main_test.go was modified`）。否则把断言删掉就能"通过"，基准测的就不再是模型实现契约的能力。`TestBench_GuardPathsAreSeeded` 守着"Guard 里的路径必须真的出现在 Seed 里"，免得一个笔误把反作弊检查悄悄关掉。
 
 ## 测哪个循环（`-loop tree|direct`）
 
@@ -194,3 +199,36 @@ go run ./cmd/bench -loop tree   -goals fix-average -extra '{"reasoning_effort":"
 
 - **`batch_read`**：模型凭记忆编工具名，代价是一整次 LLM 往返（本机约 60 秒、1.9k token）。现在有一张不歧义别名表接住它（`pkg/tools/alias.go`，见 README「工具名写错不会浪费一轮」）。
 - **VFAIL 把基线检查算成了失败**：跑之前引擎会先探一眼没动过的工作区（区分"本来就坏"和"这一波弄坏的"），`fix-average` 的种子 bug 让这一步天然失败，于是零失败的运行也显示 `VFAIL=1`。会撒谎的指标比没有指标更糟，所以基线改记 `wave_baseline` 事件、不进 VFAIL。表里第 1 次 tree 的 1 就是这个误计。
+
+### `config-cli`：第一个必须拆的目标（2026-11-14）
+
+| 运行 | 循环 | 叶子步数 | 成败 | 墙钟 | 调用 | token | 叶子 | 说明 |
+|---|---|---|---|---|---|---|---|---|
+| 1 | direct | 40 | ❌ | 6m31s | 19 | 60,689 | — | 3 次连续非法 JSON 中止（根因见下） |
+| 2 | direct | 40 | ✅ | 2m06s | 9 | 21,384 | — | 修掉 VCS stamping 之后 |
+| 3 | tree | 15 | ✅ | 3m10s | 7 | 16,808 | 1/1 | 拆解仍判 atomic，没拆 |
+| 4 | tree | 6 | ❌ | 14m36s | 23 | 58,670 | 4/4 | 拆成 4 叶全完成，败在根验收 |
+
+第 1 次的 19 次调用 / 60k token **不是模型能力问题**：`go build` 会给 main 包做 VCS stamping，而沙箱里 git 跑不起来（macOS 上 `xcode-select` 被拒），于是每一条 `[auto-verify] go build .` 都报 `error obtaining VCS status`。模型把它当代码错误，先后去查 git、再想 `xcode-select`、再试 `sudo`（被沙箱挡住），十步之后开始输出截断的 JSON。修法是把 `GOFLAGS=-buildvcs=false` 强制进沙箱环境（`pkg/tools/sandbox_isolate_env.go`，两个平台共用）——沙箱里本来就没有有意义的 VCS 状态可打。回归测试 `TestDarwinBackend_BuildsMainPackageInGitRepo` 把这条钉住：去掉修复，它立刻复现同一条 `error obtaining VCS status`。修完后同一目标 9 次调用、2 分 06 秒通过。
+
+第 3 次说明**拆解器的原子偏置比任务规模更强**：即使任务明确要求三个文件，15 步预算下仍判成 atomic。
+
+第 4 次把叶子预算压到 6（`Goal.LeafSteps`，见 `config-cli` 定义），真的拆成 4 叶、全部 COMPLETED，但根验收失败。失败的是模型自己写的 DoD：
+
+```
+go test ./... && go build -o /tmp/config_cli . && /tmp/config_cli test.json
+```
+
+两处都不成立，而引擎没有拦住任何一处：
+
+1. **macOS 沙箱没有可写的 `/tmp`**（只有被重定向的 `TMPDIR`），`go build -o /tmp/config_cli` 直接 `mkdir /tmp/: operation not permitted`。bwrap 后端能给私有 tmpfs，seatbelt 不能，只能拒绝——这是安全策略差异，不是 bug，但模型生成的 DoD 里 `/tmp` 是最常见的临时路径。
+2. **`test.json` 谁都不负责产出**：仓库里没有，计划里也没有叶子声明它。引擎到目前为止只检查"DoD 引用的路径有没有人产出"（`planBlockers` 的 outputs 侧），不检查**输入**。
+
+而且重试路径也没救回来：验收失败被路由到集成叶子 `impl_main`，但那个叶子执行的是它自己的 DoD（`go build ./...`），不是那条失败的验收命令，于是"修好"了别的东西，根验收原样再失败一次，2 次重试用尽判 FAILED。
+
+这两条都还是**未决**（见下），所以 `config-cli` 目前在 tree 侧是 known-failing：它测出了引擎的真实缺口，而不是把缺口藏起来。
+
+**接下来要决定的两件事**（都不是"改个参数"就能解决的）：
+
+- **沙箱要不要给一个可写的 `/tmp`。** 不给，模型生成的 `-o /tmp/xxx`、`mktemp` 之外的显式 `/tmp` 路径都会失败，而且错误信息看起来像代码问题；给，就等于承认 macOS 上没有私有临时目录（允许写会让沙箱进程能读别的进程放进 `/tmp` 的文件）。这是安全边界，得单独拍板。
+- **集成叶子应当继承失败的验收命令。** 现在它跑自己的 DoD，等于"你告诉我门没锁，我去擦了窗户"。让它以失败的那条命令为 DoD，重试才有意义；但要先处理第一条，否则它会一直撞 `/tmp`。

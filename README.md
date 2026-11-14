@@ -613,7 +613,7 @@ go run ./cmd/bench -loop direct -goals string-utils,fix-average ...
 
 如果宿主根本没有执行能力（Windows 上没有后端，或 macOS 上 `sandbox-exec` 不可用），直接模式的验收会标成 `skipped` 并在报告里写明原因——这一行**不算已验证**，只是"模型自己说完成了"。
 
-语料库刻意小且版本化在代码里（基准的目标集漂移就无法发现回归）；当前四个目标覆盖四种任务形态：从零创建包（`string-utils`）、修复 seeded bug（`fix-average`，语料自带失败测试，harness 测试会守住"这个目标真的会失败"）、构建可运行服务（`http-health`）、CMake/C++ 目标（`cmake-add`）。默认端点是本机 Ollama，方法论与参考数字见 **[docs/weak-model-bench.md](docs/weak-model-bench.md)**。
+语料库刻意小且版本化在代码里（基准的目标集漂移就无法发现回归）；当前五个目标覆盖五种任务形态：从零创建包（`string-utils`）、修复 seeded bug（`fix-average`，语料自带失败测试，harness 测试会守住"这个目标真的会失败"）、构建可运行服务（`http-health`）、**必须拆到多个文件**的契约实现（`config-cli`，契约写在只有测试、没有实现的 workspace 里，改这个测试会被 `Goal.Guard` 按字节比对抓出来）、CMake/C++ 目标（`cmake-add`）。默认端点是本机 Ollama，方法论与参考数字见 **[docs/weak-model-bench.md](docs/weak-model-bench.md)**。
 
 ---
 

@@ -227,3 +227,45 @@ func TestDarwinProfile_QuotesPaths(t *testing.T) {
 		t.Fatalf("profile with a quoted path did not run: %s", reason)
 	}
 }
+
+// TestDarwinBackend_BuildsMainPackageInGitRepo covers the toolchain artifact
+// the first config-cli bench run hit: `go build` stamps VCS state into a main
+// package's binary, and git cannot run inside the sandbox (xcode-select is
+// denied). Without -buildvcs=false the build fails on a workspace that is
+// perfectly fine, and the model spends its steps chasing git and xcode.
+func TestDarwinBackend_BuildsMainPackageInGitRepo(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go is not installed")
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not installed")
+	}
+	sb := requireDarwinBackend(t)
+	if err := sb.WriteFile("go.mod", "module demo\n\ngo 1.21\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := sb.WriteFile("main.go", "package main\n\nfunc main() {}\n"); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"init", "-q"},
+		{"config", "user.email", "t@example.com"},
+		{"config", "user.name", "t"},
+		{"add", "-A"},
+		{"commit", "-q", "-m", "seed"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = sb.Root
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+
+	res := runDarwin(t, sb, "go build -o /dev/null .")
+	if res.ExitCode != 0 {
+		t.Fatalf("building a main package in a git repo must not need VCS stamping: %+v", res)
+	}
+	if res := runDarwin(t, sb, "go env GOFLAGS"); !strings.Contains(res.Stdout, "buildvcs=false") {
+		t.Fatalf("GOFLAGS should disable VCS stamping inside the sandbox, got %q", res.Stdout)
+	}
+}
