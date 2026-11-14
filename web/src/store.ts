@@ -780,7 +780,9 @@ export const useStore = create<AppState>((set, get) => ({
       aiEditStreaming: '',
       aiEditBusy: false,
       aiEditApplied: null,
-      aiEditHistory: [],
+      // The history is NOT cleared here: a follow-up on another file must
+      // still see what the previous turn changed. It is cleared when the
+      // conversation changes.
       aiEditUndoDepth: 0,
       actionError: null,
     })
@@ -798,7 +800,6 @@ export const useStore = create<AppState>((set, get) => ({
       aiEditStreaming: '',
       aiEditBusy: false,
       aiEditApplied: null,
-      aiEditHistory: [],
       aiEditUndoDepth: 0,
     })
   },
@@ -835,7 +836,7 @@ export const useStore = create<AppState>((set, get) => ({
       set((s) => ({
         aiEditResult: res,
         aiEditBusy: false,
-        aiEditHistory: [...s.aiEditHistory, { instruction, code: res.new_text }],
+        aiEditHistory: [...s.aiEditHistory, { instruction, code: res.new_text, path }],
       }))
       return true
     } catch (e) {
@@ -880,6 +881,10 @@ export const useStore = create<AppState>((set, get) => ({
         aiEditApplied: { applied: out.applied, rejected: out.rejected },
         aiEditResult: null,
         aiEditStreaming: '',
+        // The write is on disk now: a later turn must not replay it.
+        aiEditHistory: s.aiEditHistory.map((t, i) =>
+          i === s.aiEditHistory.length - 1 ? { ...t, applied: true } : t,
+        ),
         // The write just made is undoable, on top of whatever was before it.
         aiEditUndoDepth: s.aiEditUndoDepth + 1,
         fileReloadNonce: s.fileReloadNonce + 1,

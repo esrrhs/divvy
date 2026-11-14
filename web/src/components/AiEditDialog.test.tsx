@@ -332,6 +332,50 @@ describe('AiEditDialog', () => {
     expect(marked?.textContent).toContain('return 2')
   })
 
+  it('keeps the earlier turns across dialog invocations, for a follow-up on another file', async () => {
+    const bodies: AiEditRequest[] = []
+    vi.spyOn(api, 'aiEditStream').mockImplementation(async (_id, body) => {
+      bodies.push(body)
+      return RESULT
+    })
+
+    await render()
+    const ta = host.querySelector('textarea') as HTMLTextAreaElement
+    await act(async () => {
+      typeInto(ta, '改一下签名')
+      await Promise.resolve()
+    })
+    await act(async () => {
+      ;(Array.from(host.querySelectorAll('button')).find((b) => b.textContent?.includes('生成候选')) as HTMLButtonElement).click()
+      await Promise.resolve()
+    })
+
+    // The user closes the dialog and opens it again on ANOTHER file.
+    act(() => useStore.getState().closeAiEditDialog())
+    await act(async () => {
+      useStore.getState().openAiEditDialog('pkg/b.go', { start_line: 9, end_line: 11 })
+      await Promise.resolve()
+    })
+    await render()
+    const ta2 = host.querySelector('textarea') as HTMLTextAreaElement
+    await act(async () => {
+      typeInto(ta2, '调用方也要跟着改')
+      await Promise.resolve()
+    })
+    await act(async () => {
+      ;(Array.from(host.querySelectorAll('button')).find((b) => b.textContent?.includes('生成候选')) as HTMLButtonElement).click()
+      await Promise.resolve()
+    })
+
+    expect(bodies).toHaveLength(2)
+    const history = bodies[1].history ?? []
+    expect(history).toHaveLength(1)
+    expect(history[0].instruction).toBe('改一下签名')
+    // The turn knows which file it was about, so the server does not paste it
+    // into the new file.
+    expect(history[0].path).toBe('pkg/a.go')
+  })
+
   it('drops the earlier turns when the user starts over', async () => {
     const bodies: AiEditRequest[] = []
     vi.spyOn(api, 'aiEditStream').mockImplementation(async (_id, body) => {

@@ -715,3 +715,69 @@ func TestAiEdit_ResponseCarriesSurroundingContext(t *testing.T) {
 		t.Fatalf("context must stay bounded: before=%d after=%d", len(before), len(after))
 	}
 }
+
+// TestAiEdit_CrossFileFollowUpKeepsTheOtherFileAsContext: the flow "I changed
+// the signature, now fix the caller" needs the previous turn visible to the
+// model — but its code belongs to ANOTHER file. Replaying it onto this file
+// would paste the wrong code into the caller's neighbourhood, and the model
+// would rewrite THAT instead of the caller.
+func TestAiEdit_CrossFileFollowUpKeepsTheOtherFileAsContext(t *testing.T) {
+	work := t.TempDir()
+	if err := os.WriteFile(filepath.Join(work, "a.go"), []byte("package p\n\nfunc Add(a, b int) int {\n\treturn a + b\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(work, "b.go"), []byte("package p\n\nfunc Use() int {\n\treturn Add(1, 2)\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var seen []llm.Request
+	client := &llm.ScriptedClient{Handle: func(_ context.Context, req llm.Request) (*llm.Response, error) {
+		seen = append(seen, req)
+		return &llm.Response{Content: "func Use() int {\n\treturn Add(1, 2)\n}\n"}, nil
+	}}
+	data := t.TempDir()
+	ts := apiServerWithClient(t, work, data, func(agent.Config) llm.Client { return client })
+	id := newAiEditConv(t, ts, work)
+
+	status, got := apiDo(t, http.MethodPost, apiBase(ts)+"/conversations/"+id+"/ai-edit?token=test-token", map[string]any{
+		"path":        "b.go",
+		"instruction": "the caller must match the new signature",
+		"selection":   map[string]any{"start_line": 3, "end_line": 5},
+		"history": []map[string]any{
+			{
+				"instruction": "Add now returns (int, error)",
+				"code":        "func Add(a, b int) (int, error) {\n\treturn a + b, nil\n}\n",
+				"path":        "a.go",
+			},
+		},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("ai-edit status=%d resp=%v", status, got)
+	}
+	if len(seen) == 0 {
+		t.Fatal("the model was never called")
+	}
+	prompt := ""
+	for _, m := range seen[0].Messages {
+		prompt += m.Content
+	}
+	// The previous turn stays in the prompt as context.
+	if !strings.Contains(prompt, "the caller must match") &&
+		!strings.Contains(prompt, "Add now returns") {
+		t.Fatalf("the previous turn must remain as context:\n%s", prompt)
+	}
+	// But the SELECTED region is this file's own code, not the other file's
+	// proposal. The marked lines (>>) are what the model is asked to rewrite.
+	marked := ""
+	for _, line := range strings.Split(prompt, "\n") {
+		if strings.Contains(line, ">>") {
+			marked += line + "\n"
+		}
+	}
+	if !strings.Contains(marked, "func Use() int {") {
+		t.Fatalf("the selection must be this file's code:\n%s", marked)
+	}
+	if strings.Contains(marked, "func Add(a, b int) (int, error)") {
+		t.Fatalf("the other file's proposal was pasted into this region:\n%s", marked)
+	}
+}

@@ -416,6 +416,10 @@ export interface AiEditSelection {
 export interface AiEditTurn {
   instruction: string
   code: string
+  /** The file the turn was about; a turn about another file is context only. */
+  path?: string
+  /** The turn's code is already on disk, so it must not be replayed. */
+  applied?: boolean
 }
 
 export interface AiEditRequest {

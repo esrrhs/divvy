@@ -60,6 +60,13 @@ type aiEditRequest struct {
 type aiEditTurn struct {
 	Instruction string `json:"instruction"`
 	Code        string `json:"code"`
+	// Path is the file the turn was about. A turn about ANOTHER file is
+	// context, not a pending change: its code must not be pasted into this
+	// file. An empty path means the same file (older clients).
+	Path string `json:"path,omitempty"`
+	// Applied reports that the turn's code is already on disk. The file
+	// carries it, so replaying it would apply it twice.
+	Applied bool `json:"applied,omitempty"`
 }
 
 type aiEditResponse struct {
@@ -203,13 +210,21 @@ func (s *Server) handleAiEdit(w http.ResponseWriter, r *http.Request) {
 	promptContent := content
 	promptRegion := region
 	if len(history) > 0 {
-		virtual, vregion, verr := aiEditVirtualRegion(content, region, history[len(history)-1].Code)
-		if verr != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": verr.Error()})
-			return
+		last := history[len(history)-1]
+		// Only a turn about THIS file, and not yet written, is a pending
+		// change to replay onto it. A turn about another file — or one whose
+		// code is already on disk — is context the model must see, but the
+		// file underneath it must not change.
+		sameFile := last.Path == "" || last.Path == rel
+		if sameFile && !last.Applied {
+			virtual, vregion, verr := aiEditVirtualRegion(content, region, last.Code)
+			if verr != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": verr.Error()})
+				return
+			}
+			promptContent = virtual
+			promptRegion = vregion
 		}
-		promptContent = virtual
-		promptRegion = vregion
 	}
 
 	cfg, err := s.configForConversation(c)
