@@ -100,6 +100,29 @@ NewFromGoal / Load
 
 `mergeMu` 只保证合并串行，不解决语义冲突——语义冲突由上面三层负责。
 
+### 执行后端：没有沙箱就不跑命令
+
+`run_bash` 的执行路径按平台分文件（`pkg/tools/sandbox_isolate_{linux,darwin,other}.go`），共享的只有两样东西：`isolatedEnv`（剥掉继承环境，只留 PATH/HOME/TMPDIR 等，见 `sandbox_isolate_env.go`）和 `ProbeShellIsolation`。
+
+| 平台 | 后端 | 手段 |
+|---|---|---|
+| Linux | bubblewrap（`bwrap`） | 空网络命名空间、`/` 只读挂载、工作区与临时目录可写 |
+| macOS | `sandbox-exec` + SBPL profile | `(deny default)` 后逐条 allow；家目录不 allow 即不可读；`(deny network*)`；按名字 deny `com.apple.securityd` / `trustd` |
+| Windows | 无 | 直接返回 `ErrExecutionUnavailable` |
+
+三条不变量对所有后端都成立：
+
+1. **不可用就报错，不退回裸 shell。** 沙箱建不起来（`sandbox-exec` 不在、profile 生成失败、`DIVVY_EXEC_BACKEND=none`）时返回 `ErrExecutionUnavailable` 且**命令根本没启动**。这是 `ApplyRuntimePolicy` 的存在意义：宁可让 agent 瞎着，也不让它无隔离地跑模型写的命令。
+2. **启动时实测，不信假设。** 两个平台的探针都真跑一次命令（`ProbeShellIsolation`）：Linux 确认 `bwrap` 在并且能跑通 `true`；macOS 额外验证两条**否定性**断言——往工作区外写被拒、家目录里的哨兵文件读不到。判定靠 `os.Stat` 和退出码，不抓输出（输出格式跨版本不稳）。探针不过界面上就显示"不可用"，而不是运行到一半才发现。
+3. **临时目录与 HOME 是重定向的。** 每次执行都用 `$TMPDIR/divvy-exec` 下的私有 `home`/`gopath`，`HOME` 指过去，所以 `ls ~` 看到的不是真实家目录。Go 的 build cache 单独放在 `divvy-gocache` 并跨次复用，否则每次 `go build` 都从零编译。
+
+macOS 后端有两个只能靠实测发现的坑，值得记下来：
+
+- **Seatbelt 按调用者拼写的路径匹配。** `os.TempDir()` 在 macOS 返回 `/var/folders/...`，内核看到的是 `/private/var/folders/...`；`/var` 在 SBPL 里写 `(subpath "/var/...")` **不会**匹配 `/private/var/...`。所以 profile 里每条路径都要同时写 literal 与 `realPath` 两种拼写，并且传给子进程的 `TMPDIR`/`GOCACHE` 必须是解析后的拼写——否则 `go build` 会以 `mkdir ... operation not permitted` 失败，而 profile 看上去"明明允许了"。
+- **`sandbox-exec` 是 deprecated 但仍可用。** Apple 从 10.15 起在文档里弃用它，实测到 macOS 26/27 仍工作。所以探针是唯一可信的判据：将来它被移除，探针失败、`run_bash` 退回不可用，引擎行为不会改变。
+
+SBPL 是权限黑名单式封锁，不是命名空间隔离：`/usr`、`/Library` 这类系统前缀在沙箱内可读，可写面仍只有工作区与临时目录，网络出口被 deny。够用来跑构建和测试，不等价于"只读整个磁盘"——家目录的私有文件靠"不 allow"挡住，而不是靠"看不见"。
+
 ## 失败与恢复
 
 | 情况 | 行为 |
@@ -200,13 +223,13 @@ NewFromGoal / Load
 3. 结果以 `[auto-verify]` 追加在**同一条工具输出**里。失败时：同一回复里后续动作不执行（它们是在模型看到错误之前就计划好的），并把命令记进 `recheckCmds`。
 4. `finish` 前重跑 `recheckCmds`。重跑而不是信一个布尔位：修在别的文件里的错误也能清掉，仍然坏的工作区则不能宣称完成。
 
-三条边界：宿主没有隔离执行能力（非 Linux）时整段跳过并记日志，**不**降级成无沙箱执行；识别不出工具链时给出一行 `skipped: ...` 而不是假装验证过；检查本身出错按"跳过"处理，不让工具的故障卡死交付。另外，同一失败连续拒绝 `finish` 两次后闸门放行并记 `edit_check_waived` 事件——否则"工具链本身坏了"（模块路径不对、要联网下载依赖）会变成一个永远结束不了的回合；诊断已经留在转录里，用户看得到。
+三条边界：宿主没有可用的执行后端（Windows，或 macOS 上 `sandbox-exec` 不可用）时整段跳过并记日志，**不**降级成无沙箱执行；识别不出工具链时给出一行 `skipped: ...` 而不是假装验证过；检查本身出错按"跳过"处理，不让工具的故障卡死交付。另外，同一失败连续拒绝 `finish` 两次后闸门放行并记 `edit_check_waived` 事件——否则"工具链本身坏了"（模块路径不对、要联网下载依赖）会变成一个永远结束不了的回合；诊断已经留在转录里，用户看得到。
 
 ### 没有 shell 时的进程内兜底
 
-非 Linux 上没有 bubblewrap/landlock，`run_bash` 直接不可用，上面那套构建命令一条也跑不了。这不是可以靠"降级"绕过的：`ApplyRuntimePolicy` 明确不提供无沙箱执行。结果是 macOS/Windows 上的直接模式曾经**完全没有观察**——改了代码，没有任何东西会说话。
+**Linux 和 macOS 都有后端，Windows 没有**，`run_bash` 不可用时上面那套构建命令一条也跑不了。这不是可以靠"降级"绕过的：`ApplyRuntimePolicy` 明确不提供无沙箱执行。结果是 Windows 上的直接模式曾经（macOS 也是，在 `sandbox-exec` 后端之前）**完全没有观察**——改了代码，没有任何东西会说话。
 
-`go/parser` 补上了这一层，代价为零个进程：编辑后的 `.go` 文件在进程内解析，错误同样带 `file:line:col`，同样进 `[auto-verify]`、同样记进 `recheckCmds` 让 `finish` 被拒。
+`go/parser` 补上了这一层，代价为零个进程：编辑后的 `.go` 文件在进程内解析，错误同样带 `file:line:col`，同样进 `[auto-verify]`、同样记进 `recheckCmds` 让 `finish` 被拒。它是**兜底**而不是替代——有后端时仍然跑真构建，只有拿不到 shell 才降级到解析。
 
 设计上有三个刻意的选择：
 

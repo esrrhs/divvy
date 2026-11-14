@@ -60,7 +60,9 @@ func eventsOfKind(events []traceEvent, kind string) []traceEvent {
 // the JSONL event stream carries every event kind needed for post-mortems,
 // and that the human-readable log file is populated.
 func TestSessionTrace_EventStreamAndLog(t *testing.T) {
-	work := t.TempDir()
+	// macOS temp dirs are symlinked (/var -> /private/var); the engine records
+	// the resolved working directory, so compare against the resolved path.
+	work := resolvedTempDir(t)
 	data := t.TempDir()
 
 	client := &llm.ScriptedClient{Handle: twoLeafWorkerHandle(nil)}
@@ -282,4 +284,15 @@ func TestSessionTrace_RetryKeepsErrorHistory(t *testing.T) {
 	if len(rn.ErrorHistory) == 0 {
 		t.Fatal("error history not persisted")
 	}
+}
+
+// resolvedTempDir is t.TempDir() with symlinks resolved, for assertions that
+// compare against a path the engine reported.
+func resolvedTempDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		return resolved
+	}
+	return dir
 }

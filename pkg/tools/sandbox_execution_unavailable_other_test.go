@@ -15,6 +15,9 @@ import (
 // command failure. Callers use errors.Is to abort the run rather than
 // retrying or asking the model to repair code that was never executed.
 func TestRunBash_ExecutionUnavailable(t *testing.T) {
+	if ok, _ := ProbeShellIsolation(t.TempDir()); ok {
+		t.Skip("this host has an execution backend; the unavailable path only exists without one")
+	}
 	sb, err := NewSandbox(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
