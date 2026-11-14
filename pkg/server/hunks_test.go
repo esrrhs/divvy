@@ -219,3 +219,32 @@ func TestApplyGroupDecisions(t *testing.T) {
 		t.Fatal("a wrong number of decisions must be refused")
 	}
 }
+
+// The status the write-back reports must not claim "accepted" for a hunk
+// whose second change was dropped.
+func TestHunkDecisionsFromGroups(t *testing.T) {
+	old := "a\nb\nc\nd\ne\nf\ng\nh\n"
+	updated := "a\nB\nc\nd\ne\nf\ng\nH\n"
+	lines, _ := computeDiffLines(old, updated)
+	hunks := toDiffHunks(lines, hunkContextRadius)
+
+	// Both changes accepted: every hunk is accepted.
+	dec := hunkDecisionsFromGroups(lines, hunks, []bool{true, true})
+	for i, d := range dec {
+		if !d {
+			t.Fatalf("hunk %d should be accepted: %v", i, dec)
+		}
+	}
+
+	// The second change dropped: the hunk it lives in is not accepted.
+	dec = hunkDecisionsFromGroups(lines, hunks, []bool{true, false})
+	allAccepted := true
+	for _, d := range dec {
+		if !d {
+			allAccepted = false
+		}
+	}
+	if allAccepted {
+		t.Fatalf("a dropped change must not be reported as accepted: %v", dec)
+	}
+}

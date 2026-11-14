@@ -267,6 +267,29 @@ func applyGroupDecisions(oldText, newText string, decisions []bool) (string, []d
 	return keepTrailingNL(oldText, newText, b.String()), hunks, nil
 }
 
+// hunkDecisionsFromGroups folds the per-group decisions back into the
+// per-hunk shape the stored status uses: a hunk counts as accepted only when
+// all of its groups are. Reporting "accepted" for a hunk whose second change
+// was dropped is exactly the kind of lie this project does not tell.
+func hunkDecisionsFromGroups(lines []diffLine, hunks []diffHunk, decisions []bool) []bool {
+	groups := changeGroups(lines)
+	out := make([]bool, len(hunks))
+	for i := range out {
+		out[i] = true
+	}
+	for gi, g := range groups {
+		if gi >= len(decisions) || decisions[gi] {
+			continue
+		}
+		for _, li := range g {
+			if hi := hunkIndexAt(hunks, li); hi >= 0 {
+				out[hi] = false
+			}
+		}
+	}
+	return out
+}
+
 func parseHunkDecisions(n int, items []hunkDecision, all string) ([]bool, error) {
 	out := make([]bool, n)
 	for i := range out {

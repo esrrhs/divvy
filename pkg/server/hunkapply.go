@@ -154,8 +154,12 @@ func (s *Server) handleApplyTurnHunks(w http.ResponseWriter, r *http.Request) {
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 				return
 			}
-			stored = storeDecisions(make([]bool, len(hunks)))
-			status = decisionSummary(make([]bool, len(hunks)))
+			// The status has to reflect the groups: a hunk whose second change
+			// was dropped is not "accepted".
+			lines, _ := computeDiffLines(ch.Old, ch.New)
+			hunkDec := hunkDecisionsFromGroups(lines, hunks, req.GroupDecisions)
+			stored = storeDecisions(hunkDec)
+			status = decisionSummary(hunkDec)
 		} else {
 			dec, err := parseHunkDecisions(len(hunks), req.Decisions, req.All)
 			if err != nil {
