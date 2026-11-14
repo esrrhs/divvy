@@ -55,6 +55,33 @@ func (o *Orchestrator) markAcceptancePassed() error {
 	})
 }
 
+// acceptanceRetryMarker prefixes the ErrorMsg of a leaf that was re-queued
+// because the goal-level acceptance failed. executeLeaf reads it (and clears
+// it) to seed the retry prompt: the leaf must see the command that actually
+// failed, not just its own narrower DoD passing again.
+const acceptanceRetryMarker = "[goal-acceptance]"
+
+// consumeAcceptanceRetry returns the seeded retry text for a leaf re-queued by
+// an acceptance failure, clearing the marker so it is delivered exactly once.
+func (o *Orchestrator) consumeAcceptanceRetry(id string) (string, bool) {
+	live, ok := o.tree.CloneNode(id)
+	if !ok {
+		return "", false
+	}
+	msg := strings.TrimSpace(live.ErrorMsg)
+	if !strings.HasPrefix(msg, acceptanceRetryMarker) {
+		return "", false
+	}
+	seed := strings.TrimSpace(strings.TrimPrefix(msg, acceptanceRetryMarker))
+	_ = o.tree.UpdateNode(id, func(n *models.TaskNode) error {
+		if strings.HasPrefix(strings.TrimSpace(n.ErrorMsg), acceptanceRetryMarker) {
+			n.ErrorMsg = ""
+		}
+		return nil
+	})
+	return seed, true
+}
+
 func (o *Orchestrator) handleAcceptanceFailure(ctx context.Context, output string) error {
 	root, _ := o.tree.CloneNode(o.tree.RootID)
 	root.RetryCount++
@@ -81,8 +108,14 @@ func (o *Orchestrator) handleAcceptanceFailure(ctx context.Context, output strin
 	// Route the failure to the integration leaf: reset it to PENDING so the
 	// main loop re-executes it with the acceptance error. Bubbling makes the
 	// root RUNNING again; acceptance is re-run once the leaf completes.
-	if err := o.sched.UpdateNodeState(intLeaf, models.TaskStatePending,
-		"goal acceptance failed; fix assembly. Error: "+truncate(output, 3000)); err != nil {
+	//
+	// The message is not just bookkeeping — executeLeaf turns it into the retry
+	// prompt. It has to say out loud that the leaf's own DoD is the weaker bar,
+	// because a model that sees only its own green check mark will do nothing.
+	requeueMsg := acceptanceRetryMarker + " the whole deliverable failed its final end-to-end check. " +
+		"Your own task DoD passing is NOT enough: run the command below yourself, " +
+		"fix what it reports, and re-run it before you finish.\n" + truncate(output, 3000)
+	if err := o.sched.UpdateNodeState(intLeaf, models.TaskStatePending, requeueMsg); err != nil {
 		return err
 	}
 	o.log.Warnf("re-route acceptance failure to integration leaf %s", intLeaf)

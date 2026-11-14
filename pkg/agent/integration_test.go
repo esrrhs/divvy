@@ -70,8 +70,14 @@ func TestRootAcceptance_RoutesFailureToIntegrationLeaf(t *testing.T) {
 	if integrate.State != models.TaskStatePending {
 		t.Fatalf("integrate state = %s, want PENDING", integrate.State)
 	}
-	if !strings.Contains(integrate.ErrorMsg, "goal acceptance failed") {
-		t.Fatalf("missing routed error: %q", integrate.ErrorMsg)
+	// The routed message must carry the failing command, not just a verdict:
+	// executeLeaf feeds it to the worker as the retry seed, and a leaf that
+	// only learns "acceptance failed" cannot do anything with it.
+	if !strings.HasPrefix(integrate.ErrorMsg, acceptanceRetryMarker) {
+		t.Fatalf("routed error must be marked as an acceptance retry: %q", integrate.ErrorMsg)
+	}
+	if !strings.Contains(integrate.ErrorMsg, "test -f definitely_missing_smoke") {
+		t.Fatalf("routed error must name the failing command: %q", integrate.ErrorMsg)
 	}
 	root := o.tree.GetRoot()
 	if root.State == models.TaskStateCompleted {

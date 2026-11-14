@@ -913,7 +913,18 @@ func (o *Orchestrator) executeLeaf(ctx context.Context, leaf *models.TaskNode) e
 		}()
 	}
 
+	// A leaf re-queued by a goal-level acceptance failure arrives carrying the
+	// failing command and its output in ErrorMsg. Seed the first attempt from
+	// it, because the alternative is what a real run did: the leaf re-ran with
+	// no knowledge of the acceptance error, satisfied its own (narrower) DoD,
+	// and the goal failed identically — 14 minutes and 23 model calls to change
+	// nothing. The seed is consumed once so a later retry cannot re-inject text
+	// that has already been acted on.
 	prevErr := ""
+	if msg, ok := o.consumeAcceptanceRetry(leaf.ID); ok {
+		prevErr = msg
+		o.log.Warnf("%s re-queued by goal acceptance; seeding retry with its failure", leaf.ID)
+	}
 	for attempt := 1; ; attempt++ {
 		live, ok := o.tree.CloneNode(leaf.ID)
 		if !ok {
