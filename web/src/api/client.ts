@@ -1,6 +1,11 @@
 import type {
   ApprovalPayload,
   ApplyHunkRequest,
+  AiEditApplyRequest,
+  AiEditApplyResponse,
+  AiEditRequest,
+  AiEditResponse,
+  AiEditUndoResponse,
   CreateResult,
   FsEntry,
   CodeSelection,
@@ -257,4 +262,87 @@ export const api = {
 
   resumeConversation: (id: string, apiKey?: string) =>
     request<Conversation>('POST', `/conversations/${id}/resume`, apiKey ? { api_key: apiKey } : {}),
+
+  aiEdit: (id: string, body: AiEditRequest) =>
+    request<AiEditResponse>('POST', `/conversations/${id}/ai-edit`, body),
+
+  // aiEditStream consumes the SSE form of the same endpoint so the dialog can
+  // show code as the model produces it. Resolves with the parsed result carried
+  // by the `done` event; `onDelta` receives raw code chunks.
+  aiEditStream: async (
+    id: string,
+    body: AiEditRequest,
+    onDelta: (text: string) => void,
+    signal?: AbortSignal,
+  ): Promise<AiEditResponse> => {
+    const res = await fetch(`/api/conversations/${id}/ai-edit`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ ...body, stream: true }),
+      signal,
+    })
+    if (!res.ok) {
+      const text = await res.text()
+      let msg = `${res.status} ${res.statusText}`
+      try {
+        const parsed = JSON.parse(text) as { error?: string }
+        if (parsed?.error) msg = parsed.error
+      } catch {
+        if (text) msg = text
+      }
+      throw new ApiError(res.status, msg)
+    }
+    if (!res.body) throw new ApiError(0, '浏览器不支持流式响应')
+
+    const reader = res.body.getReader()
+    const decoder = new TextDecoder()
+    let buf = ''
+    let event = ''
+    let done: AiEditResponse | null = null
+    let failure: string | null = null
+
+    const handleFrame = (frame: string) => {
+      for (const line of frame.split('\n')) {
+        if (line.startsWith('event: ')) {
+          event = line.slice(7).trim()
+        } else if (line.startsWith('data: ')) {
+          const payload = line.slice(6)
+          if (event === 'delta') {
+            const d = JSON.parse(payload) as { text?: string }
+            if (d.text) onDelta(d.text)
+          } else if (event === 'done') {
+            done = JSON.parse(payload) as AiEditResponse
+          } else if (event === 'error') {
+            const e = JSON.parse(payload) as { error?: string }
+            failure = e.error ?? '生成失败'
+          }
+        }
+      }
+    }
+
+    for (;;) {
+      const { value, done: eof } = await reader.read()
+      if (value) buf += decoder.decode(value, { stream: true })
+      let sep = buf.indexOf('\n\n')
+      while (sep >= 0) {
+        const frame = buf.slice(0, sep)
+        buf = buf.slice(sep + 2)
+        handleFrame(frame)
+        sep = buf.indexOf('\n\n')
+      }
+      if (eof) break
+    }
+    if (buf.trim()) handleFrame(buf)
+    if (failure) throw new ApiError(502, failure)
+    if (!done) throw new ApiError(502, '生成结束但没有收到结果')
+    return done
+  },
+
+  aiEditApply: (id: string, body: AiEditApplyRequest) =>
+    request<AiEditApplyResponse>('POST', `/conversations/${id}/ai-edit/apply`, body),
+
+  aiEditUndo: (id: string) => request<AiEditUndoResponse>('POST', `/conversations/${id}/ai-edit/undo`, {}),
 }

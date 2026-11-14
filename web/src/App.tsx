@@ -4,6 +4,7 @@ import { RightPanel } from './components/RightPanel'
 import { Sidebar } from './components/Sidebar'
 import { TopBar } from './components/TopBar'
 import { AskDialog } from './components/AskDialog'
+import { AiEditDialog } from './components/AiEditDialog'
 import { ActionToast } from './components/ActionToast'
 import { getToken } from './api/client'
 import { useStore } from './store'
@@ -59,6 +60,7 @@ export default function App() {
         <RightPanel />
       </div>
       <AskDialog />
+      <AiEditDialog />
       <ActionToast />
     </div>
   )

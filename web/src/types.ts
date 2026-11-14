@@ -396,3 +396,59 @@ export interface Conversation {
   live_stream_id?: string
   leaf_approving?: string
 }
+
+// ---- AI inline edit (Cursor Cmd-K style) ----
+
+/** The line range the user highlighted. `insert_line` makes it an insertion. */
+export interface AiEditSelection {
+  start_line?: number
+  end_line?: number
+  insert_line?: number
+}
+
+export interface AiEditRequest {
+  path: string
+  selection: AiEditSelection
+  instruction: string
+  stream?: boolean
+}
+
+/** The server diffs the model's code reply against the region it sent. */
+export interface AiEditResponse {
+  path: string
+  base_hash: string
+  start_line: number
+  end_line: number
+  insert_line?: number
+  old_text: string
+  new_text: string
+  hunks: ReviewHunk[]
+  preview: string
+  truncated?: boolean
+}
+
+export interface AiEditApplyRequest {
+  path: string
+  base_hash: string
+  start_line: number
+  end_line: number
+  insert_line?: number
+  old_text: string
+  new_text: string
+  decisions: boolean[]
+}
+
+export interface AiEditApplyResponse {
+  path: string
+  applied: number
+  rejected: number
+  new_content: string
+  conflict: boolean
+  conflict_path?: string
+}
+
+export interface AiEditUndoResponse {
+  path: string
+  restored: boolean
+  new_content: string
+}
