@@ -107,6 +107,19 @@ jobs:
           go-version: "1.27"
           cache: true
 
+      # A compiled binary slipped into a commit once (cmd/bench, 20 MiB) and
+      # .gitignore did not cover it. Such a blob is permanent: deleting the file
+      # in a later commit does not shrink anyone's clone. Cheap guard, because
+      # "I built the binary in the repo root" is not a mistake you make once.
+      - name: No large tracked files
+        run: |
+          big=$(git ls-files -z | xargs -0 wc -c | awk '$1 > 1048576 && $2 != "total"')
+          if [ -n "$big" ]; then
+            echo "::error::tracked files over 1 MiB — commit source, not build output:"
+            echo "$big"
+            exit 1
+          fi
+
       # Pin the major version: golangci-lint v1 is built with an older Go and
       # refuses to load a config targeting go 1.27 ("the Go language version
       # used to build golangci-lint is lower than the targeted Go version").
