@@ -195,14 +195,34 @@ func OutputSetClaims(outputs []string) map[string]bool {
 	return set
 }
 
-// OutputSetConflicts reports whether any of outputs is already in claimed.
+// OutputSetConflicts reports whether any of outputs overlaps an already
+// claimed path.
+//
+// The overlap is directory-aware: a leaf that declares "pkg/a" and a sibling
+// that declares "pkg/a/x.go" write into the same place, even though the paths
+// are not equal. Exact matching would let them run concurrently, and whichever
+// merged last would silently discard the other's verified work. The agent's own
+// coverage check (pathCoveredByOutputs) has always treated a directory as
+// covering the files under it; the scheduler's mutex has to agree.
 func OutputSetConflicts(outputs []string, claimed map[string]bool) bool {
 	if len(claimed) == 0 || len(outputs) == 0 {
 		return false
 	}
 	for _, o := range outputs {
-		if n := NormalizeOutputPath(o); n != "" && claimed[n] {
+		n := NormalizeOutputPath(o)
+		if n == "" {
+			continue
+		}
+		if claimed[n] {
 			return true
+		}
+		for c := range claimed {
+			if c == "" {
+				continue
+			}
+			if strings.HasPrefix(n, c+"/") || strings.HasPrefix(c, n+"/") {
+				return true
+			}
 		}
 	}
 	return false

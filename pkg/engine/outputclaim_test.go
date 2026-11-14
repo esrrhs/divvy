@@ -193,3 +193,28 @@ func TestGetReadyLeafNodesAvoidingRespectsDependencies(t *testing.T) {
 		t.Fatalf("nested should become ready after alpha, got %v", ready)
 	}
 }
+
+// TestOutputSetConflictsIsDirectoryAware: a leaf that declares a directory and
+// a sibling that declares a file inside it write into the same place. Exact
+// matching let them run concurrently, and whichever merged last silently
+// discarded the other's verified work.
+func TestOutputSetConflictsIsDirectoryAware(t *testing.T) {
+	dirClaim := OutputSetClaims([]string{"pkg/a"})
+	if !OutputSetConflicts([]string{"pkg/a/x.go"}, dirClaim) {
+		t.Error("a file inside a claimed directory must conflict")
+	}
+	if !OutputSetConflicts([]string{"pkg/a"}, OutputSetClaims([]string{"pkg/a/x.go"})) {
+		t.Error("a claimed file inside a directory claim must conflict")
+	}
+	if !OutputSetConflicts([]string{"pkg/a/deep/x.go"}, OutputSetClaims([]string{"pkg/a"})) {
+		t.Error("a nested file under a claimed directory must conflict")
+	}
+	// Siblings in the same directory are still parallel: only overlapping
+	// paths are mutually exclusive.
+	if OutputSetConflicts([]string{"pkg/b/x.go"}, dirClaim) {
+		t.Error("a different directory must not conflict")
+	}
+	if OutputSetConflicts([]string{"pkg/ab/x.go"}, dirClaim) {
+		t.Error("a name that merely shares a prefix must not conflict")
+	}
+}
