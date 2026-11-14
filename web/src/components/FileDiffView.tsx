@@ -1,10 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { ApplyHunkRequest, FileChange, TurnChange } from '../types'
-import {
-  appliedStatusLabel,
-  decisionsFromAccepts,
-  initialHunkAccepts,
-} from '../lib/conversation'
+import { appliedStatusLabel } from '../lib/conversation'
 import { computeDiff, toHunks, type DiffLine } from '../lib/diff'
 import { LangFromPath, tokenizeLines, type Token, type TokenKind } from '../lib/highlight'
 
@@ -66,7 +62,45 @@ function hunkLines(change: FileChange): { hunks: { index: number; lines: DiffLin
   return { hunks: toHunks(lines).map((h, i) => ({ index: i, lines: h.lines })), truncated }
 }
 
-function DiffRow({ l, tokens }: { l: DiffLine; tokens?: Token[] }) {
+// changeGroups assigns every line of the diff to a change group: a maximal run
+// of consecutive changed lines. A modification shows up as a remove line plus
+// an add line, and that pair is ONE change — half of it would delete the line.
+//
+// The groups are what the review decides on. Per-hunk decisions are too
+// coarse: two changes a few lines apart share a hunk (the context around them
+// overlaps), so rejecting one of them rejected both.
+function changeGroups(hunks: { lines: DiffLine[] }[]): number[] {
+	const out: number[] = []
+	let gi = -1
+	let prevChanged = false
+	for (const h of hunks) {
+		for (const l of h.lines) {
+			if (l.type === 'context') {
+				out.push(-1)
+				prevChanged = false
+				continue
+			}
+			if (!prevChanged) gi++
+			out.push(gi)
+			prevChanged = true
+		}
+	}
+	return out
+}
+
+function DiffRow({
+	l,
+	tokens,
+	group,
+	rejected,
+	onToggle,
+}: {
+	l: DiffLine
+	tokens?: Token[]
+	group: number
+	rejected: boolean
+	onToggle?: (group: number) => void
+}) {
   const cls =
     l.type === 'add'
       ? 'bg-emerald-950/40 text-emerald-200'
@@ -74,8 +108,17 @@ function DiffRow({ l, tokens }: { l: DiffLine; tokens?: Token[] }) {
         ? 'bg-rose-950/40 text-rose-200'
         : 'text-slate-400'
   const sign = l.type === 'add' ? '+' : l.type === 'remove' ? '-' : ' '
+  // A rejected change is shown as reverted: the lines it would have written
+  // are dimmed, and the line it would have removed stays as it is.
+  const rowCls = rejected ? 'opacity-45' : ''
   return (
-    <div className={`flex font-mono text-[11.5px] leading-[1.55] ${cls}`}>
+    <div
+      onClick={onToggle ? () => onToggle(group) : undefined}
+      title={onToggle ? '点击这一处改动：保留或撤销（⌘/Ctrl+Z 撤销的是 AI 改写，不是这里）' : undefined}
+      className={`flex font-mono text-[11.5px] leading-[1.55] ${cls} ${rowCls} ${
+        onToggle ? 'cursor-pointer hover:bg-ink-900/60' : ''
+      }`}
+    >
       <span className="w-10 shrink-0 select-none border-r border-ink-700/60 pr-2 text-right text-slate-600">
         {l.oldNo ?? ''}
       </span>
@@ -117,7 +160,30 @@ function FileDiff({
   const meta = statusMeta[change.status]
   const tc = asTurn(change)
   const { hunks, truncated } = useMemo(() => hunkLines(change), [change])
-  const [accepts, setAccepts] = useState(() => initialHunkAccepts(hunks.length, tc.hunk_decisions))
+  // The decisions are per change group, not per hunk: two changes a few lines
+  // apart share a hunk, and the user has to be able to keep one and drop the
+  // other.
+  const groupOf = useMemo(() => changeGroups(hunks), [hunks])
+  const hunksLayout = useMemo(() => {
+		const out: { groups: number[]; offset: number }[] = []
+		let at = 0
+		for (const h of hunks) {
+			const set = new Set<number>()
+			for (let k = 0; k < h.lines.length; k++) {
+				const g = groupOf[at + k]
+				if (g >= 0) set.add(g)
+			}
+			out.push({ groups: [...set], offset: at })
+			at += h.lines.length
+		}
+		return out
+	}, [hunks, groupOf])
+  const groupCount = useMemo(() => {
+		let max = -1
+		for (const g of groupOf) if (g > max) max = g
+		return max + 1
+	}, [groupOf])
+	const [rejectedGroups, setRejectedGroups] = useState<Set<number>>(new Set())
 
   // Syntax colours for the reviewed code. The tokens come from the WHOLE file
   // (not from the diff line) so a comment or a raw string that spans lines
@@ -138,31 +204,60 @@ function FileDiff({
     return undefined
   }
 
+  // The stored decisions are per hunk; the group model derives them from it.
   useEffect(() => {
-    setAccepts(initialHunkAccepts(hunks.length, asTurn(change).hunk_decisions))
-  }, [change, hunks.length])
+    const stored = asTurn(change).hunk_decisions
+    const next = new Set<number>()
+    if (stored) {
+      hunksLayout.forEach(({ groups }, hi) => {
+        const v = (stored[hi] ?? '').toLowerCase()
+        const wasAccepted = v === 'accept' || v === 'accepted' || v === 'true'
+        if (!wasAccepted) groups.forEach((g: number) => next.add(g))
+      })
+    }
+    setRejectedGroups(next)
+  }, [change, hunksLayout])
 
   const interactive = editable && mode !== 'readonly' && tc.applied_status !== 'rolled_back'
   const applied = appliedStatusLabel(tc.applied_status)
 
-  function payloadFor(next: boolean[], all?: 'accept' | 'reject'): ApplyHunkRequest {
+  function payloadFor(next: Set<number>, all?: 'accept' | 'reject'): ApplyHunkRequest {
     if (change.binary || all) {
-      return { path: change.path, all: all ?? (next.every(Boolean) ? 'accept' : 'reject') }
+      return { path: change.path, all: all ?? 'accept' }
     }
-    return { path: change.path, decisions: decisionsFromAccepts(next) }
+    const decisions: boolean[] = []
+    for (let g = 0; g < groupCount; g++) decisions.push(!next.has(g))
+    return { path: change.path, group_decisions: decisions }
+  }
+
+  async function chooseGroup(group: number, accept: boolean) {
+    const next = new Set(rejectedGroups)
+    if (accept) next.delete(group)
+    else next.add(group)
+    setRejectedGroups(next)
+    const payload = payloadFor(next)
+    onLocalChange?.(change.path, payload)
+    if (mode === 'apply') await onApply?.(payload)
   }
 
   async function choose(index: number, accept: boolean) {
-    const next = accepts.map((v, i) => (i === index ? accept : v))
-    setAccepts(next)
+    const next = new Set(rejectedGroups)
+    for (const g of hunksLayout[index]?.groups ?? []) {
+      if (accept) next.delete(g)
+      else next.add(g)
+    }
+    setRejectedGroups(next)
     const payload = payloadFor(next)
     onLocalChange?.(change.path, payload)
     if (mode === 'apply') await onApply?.(payload)
   }
 
   async function chooseAll(all: 'accept' | 'reject') {
-    const next = accepts.map(() => all === 'accept')
-    setAccepts(next)
+    const next = new Set<number>()
+    if (all === 'reject') {
+      for (let g = 0; g < groupCount; g++) next.add(g)
+    }
+    setRejectedGroups(next)
     const payload = payloadFor(next, all)
     onLocalChange?.(change.path, payload)
     if (mode === 'apply') await onApply?.(payload)
@@ -244,7 +339,9 @@ function FileDiff({
                 </p>
               )}
               {hunks.map((h, i) => {
-                const accepted = accepts[i] !== false
+                const hunkGroups = hunksLayout[i]?.groups ?? []
+                const lineAt = hunksLayout[i]?.offset ?? 0
+                const accepted = hunkGroups.every((g) => !rejectedGroups.has(g))
                 return (
                   <div key={h.index ?? i} className={i > 0 ? 'border-t border-line/60' : ''}>
                     {interactive && !change.binary && (
@@ -276,9 +373,20 @@ function FileDiff({
                         </button>
                       </div>
                     )}
-                    {h.lines.map((l, j) => (
-                      <DiffRow key={j} l={l} tokens={tokensFor(l)} />
-                    ))}
+                    {h.lines.map((l, j) => {
+                      const g = groupOf[lineAt + j] ?? -1
+                      const rejected = g >= 0 && rejectedGroups.has(g)
+                      return (
+                        <DiffRow
+                          key={j}
+                          l={l}
+                          tokens={tokensFor(l)}
+                          group={g}
+                          rejected={rejected}
+                          onToggle={interactive && g >= 0 ? (grp) => void chooseGroup(grp, rejected) : undefined}
+                        />
+                      )
+                    })}
                   </div>
                 )
               })}

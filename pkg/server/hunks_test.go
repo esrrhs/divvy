@@ -169,3 +169,53 @@ func TestViewApprovalChangesIncludesHunks(t *testing.T) {
 		t.Fatal("missing hunks")
 	}
 }
+
+// TestApplyGroupDecisions: two changes a few lines apart land in ONE hunk
+// (the context around them overlaps), so per-hunk decisions cannot keep one
+// and drop the other.
+func TestApplyGroupDecisions(t *testing.T) {
+	old := "a\nb\nc\nd\ne\nf\ng\nh\n"
+	// Two changes, five lines apart: same hunk, two groups.
+	updated := "a\nB\nc\nd\ne\nf\ng\nH\n"
+	lines, _ := computeDiffLines(old, updated)
+	groups := changeGroups(lines)
+	if len(groups) != 2 {
+		t.Fatalf("expected 2 change groups, got %d: %+v", len(groups), lines)
+	}
+
+	// Keep the first change, drop the second.
+	got, _, err := applyGroupDecisions(old, updated, []bool{true, false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "a\nB\nc\nd\ne\nf\ng\nh\n"
+	if got != want {
+		t.Fatalf("kept the first change only: got %q want %q", got, want)
+	}
+
+	// Drop the first, keep the second.
+	got, _, err = applyGroupDecisions(old, updated, []bool{false, true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = "a\nb\nc\nd\ne\nf\ng\nH\n"
+	if got != want {
+		t.Fatalf("kept the second change only: got %q want %q", got, want)
+	}
+
+	// A modification is ONE group: rejecting it keeps the old line.
+	old2 := "x\ny\n"
+	new2 := "x\nY\n"
+	got, _, err = applyGroupDecisions(old2, new2, []bool{false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != old2 {
+		t.Fatalf("a rejected modification must keep the original line: got %q want %q", got, old2)
+	}
+
+	// A mismatched count is a client bug, not something to guess about.
+	if _, _, err := applyGroupDecisions(old, updated, []bool{true}); err == nil {
+		t.Fatal("a wrong number of decisions must be refused")
+	}
+}

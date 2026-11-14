@@ -2,7 +2,7 @@
 
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { FileChange } from '../types'
 import { FileDiffList } from './FileDiffView'
 
@@ -65,6 +65,41 @@ describe('FileDiffList', () => {
     const keyword = host.querySelector('.text-sky-300')
     expect(keyword).toBeTruthy()
     expect(keyword?.textContent).toBe('func')
+  })
+
+  it('decides per change group, so one of two nearby changes can be dropped', async () => {
+    const change: FileChange = {
+      path: 'calc.go',
+      status: 'modified',
+      // Two changes three lines apart: they share ONE hunk (the context
+      // around them overlaps), but they are two changes.
+      old_content: 'a\nb\nc\nd\ne\n',
+      new_content: 'a\nB\nc\nd\nE\n',
+    }
+    const apply = vi.fn()
+    await act(async () => {
+      root.render(<FileDiffList changes={[change]} editable mode="apply" onApply={apply} />)
+      await Promise.resolve()
+    })
+    const header = host.querySelector('button')
+    await act(async () => {
+      ;(header as HTMLButtonElement).click()
+      await Promise.resolve()
+    })
+
+    // Click the line of the SECOND change: the first one must survive.
+    const span = Array.from(host.querySelectorAll('span')).find((s) => s.textContent === 'E')
+    expect(span).toBeTruthy()
+    const target = span?.closest('div')
+    expect(target).toBeTruthy()
+    await act(async () => {
+      ;(target as HTMLDivElement).click()
+      await Promise.resolve()
+    })
+
+    expect(apply).toHaveBeenCalledTimes(1)
+    const payload = apply.mock.calls[0][0] as { group_decisions?: boolean[] }
+    expect(payload.group_decisions).toEqual([true, false])
   })
 
   it('leaves an unknown language uncoloured', async () => {

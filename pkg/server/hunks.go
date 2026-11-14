@@ -199,6 +199,74 @@ func applyHunkDecisions(oldText, newText string, decisions []bool) (string, []di
 	return keepTrailingNL(oldText, newText, b.String()), hunks, nil
 }
 
+// changeGroups returns the groups of changed lines: each maximal run of
+// consecutive non-context lines is ONE change.
+//
+// A modification shows up as a remove line followed by an add line, so it is
+// one group, not two — otherwise rejecting "the new version of this line"
+// would leave the old line deleted and the file would lose the line entirely.
+func changeGroups(lines []diffLine) [][]int {
+	var groups [][]int
+	for i := 0; i < len(lines); i++ {
+		if lines[i].Type == "context" {
+			continue
+		}
+		start := i
+		for i < len(lines) && lines[i].Type != "context" {
+			i++
+		}
+		// The inner loop stops ON the first context line, so the group's last
+		// changed line is the one before it.
+		groups = append(groups, []int{start, i - 1})
+	}
+	return groups
+}
+
+// applyGroupDecisions applies one decision per change group, so the user can
+// keep one change and drop the next one even when both land in the same hunk.
+//
+// Per-hunk decisions are too coarse for that case: two changes a few lines
+// apart share a hunk (the context around them overlaps), so rejecting one
+// rejects both — and the only way to keep one was to edit the file by hand.
+//
+// The decisions are indexed by the groups, in the order the UI shows them.
+func applyGroupDecisions(oldText, newText string, decisions []bool) (string, []diffHunk, error) {
+	lines, _ := computeDiffLines(oldText, newText)
+	hunks := toDiffHunks(lines, hunkContextRadius)
+	groups := changeGroups(lines)
+	if len(decisions) != len(groups) {
+		return "", nil, fmt.Errorf("group decisions (%d) do not match the %d changes", len(decisions), len(groups))
+	}
+	groupOf := make(map[int]int, len(lines))
+	for gi, g := range groups {
+		for _, i := range g {
+			groupOf[i] = gi
+		}
+	}
+	var b strings.Builder
+	for i, l := range lines {
+		var keep bool
+		switch l.Type {
+		case "context":
+			keep = true
+		case "add":
+			keep = decisions[groupOf[i]]
+		case "remove":
+			keep = !decisions[groupOf[i]]
+		default:
+			return "", nil, fmt.Errorf("unknown diff line type %q", l.Type)
+		}
+		if !keep {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(l.Text)
+	}
+	return keepTrailingNL(oldText, newText, b.String()), hunks, nil
+}
+
 func parseHunkDecisions(n int, items []hunkDecision, all string) ([]bool, error) {
 	out := make([]bool, n)
 	for i := range out {

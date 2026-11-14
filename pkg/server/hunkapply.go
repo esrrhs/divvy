@@ -22,6 +22,11 @@ type applyHunkRequest struct {
 	Path      string         `json:"path"`
 	All       string         `json:"all"`
 	Decisions []hunkDecision `json:"decisions"`
+	// GroupDecisions decides per change group instead of per hunk: a group is
+	// a maximal run of changed lines, so a modification (a remove plus an add)
+	// is ONE decision and cannot be half-applied. The groups are indexed in
+	// the order the UI shows them. When it is present it wins over Decisions.
+	GroupDecisions []bool `json:"group_decisions,omitempty"`
 }
 
 func viewTurnChanges(changes []turnChange, editable bool, reason string) []turnChangeView {
@@ -141,18 +146,30 @@ func (s *Server) handleApplyTurnHunks(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
 		}
-		dec, err := parseHunkDecisions(len(hunks), req.Decisions, req.All)
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-			return
+		if len(req.GroupDecisions) > 0 {
+			// Per change group: the user kept one change of a hunk and
+			// dropped the next one.
+			result, _, err = applyGroupDecisions(ch.Old, ch.New, req.GroupDecisions)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				return
+			}
+			stored = storeDecisions(make([]bool, len(hunks)))
+			status = decisionSummary(make([]bool, len(hunks)))
+		} else {
+			dec, err := parseHunkDecisions(len(hunks), req.Decisions, req.All)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				return
+			}
+			result, _, err = applyHunkDecisions(ch.Old, ch.New, dec)
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+				return
+			}
+			stored = storeDecisions(dec)
+			status = decisionSummary(dec)
 		}
-		result, _, err = applyHunkDecisions(ch.Old, ch.New, dec)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-			return
-		}
-		stored = storeDecisions(dec)
-		status = decisionSummary(dec)
 	}
 	unlock, lerr := s.mgr.BeginWorkdirWrite(c.WorkDir, "hunk:"+c.ID+":"+sid)
 	if lerr != nil {

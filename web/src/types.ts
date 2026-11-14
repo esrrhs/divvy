@@ -120,6 +120,12 @@ export interface ApplyHunkRequest {
   path: string
   all?: 'accept' | 'reject' | string
   decisions?: HunkDecision[]
+  /**
+   * One decision per change group (a maximal run of changed lines), in the
+   * order the diff shows them. A modification is ONE group, so it cannot be
+   * half-applied. When present it wins over `decisions`.
+   */
+  group_decisions?: boolean[]
 }
 
 /** A persisted turn (or leaf-approval) file change, optionally with server hunks. */

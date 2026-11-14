@@ -169,13 +169,19 @@ func (o *Orchestrator) widenGateToAcceptance(leafID string, root *models.TaskNod
 	if root.DoD.TimeoutSec > timeout {
 		timeout = root.DoD.TimeoutSec
 	}
-	_ = o.tree.UpdateNode(leafID, func(n *models.TaskNode) error {
+	if err := o.tree.UpdateNode(leafID, func(n *models.TaskNode) error {
 		n.DoD.Commands = cmds
 		if n.DoD.TimeoutSec < timeout {
 			n.DoD.TimeoutSec = timeout
 		}
 		return nil
-	})
+	}); err != nil {
+		// A silently unwidened gate would let the turn finish with a broken
+		// project — the exact hole this gate closes.
+		o.log.Errorf("cannot widen the integration gate of %s: %v", leafID, err)
+		o.events.Record("project_gate_failed", leafID, map[string]any{"error": clip(err.Error(), evReasonChars)})
+		return
+	}
 	o.log.Warnf("integration leaf %s is now verified by the goal acceptance: %v", leafID, cmds)
 }
 
