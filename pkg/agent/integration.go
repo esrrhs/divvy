@@ -262,10 +262,25 @@ func (o *Orchestrator) ensureIntegrationLeaf(reason string) (string, error) {
 	return id, nil
 }
 
-// integrationOutputs picks the entry file the injected leaf must produce.
-// Preference order: the exact path the goal-level acceptance runs, then the
-// toolchain's conventional entry name.
+// integrationOutputs picks the entry file the injected leaf must produce, plus
+// the data files the acceptance reads that nothing else creates.
+//
+// The entry file is the deliverable the acceptance runs. The missing inputs
+// are the fixtures it feeds into that deliverable: without them the injected
+// leaf inherits a DoD it cannot pass either, and the gap would stay open on
+// every resume.
 func (o *Orchestrator) integrationOutputs(root *models.TaskNode) []string {
+	var out []string
+	seen := map[string]bool{}
+	add := func(p string) {
+		n := engine.NormalizeOutputPath(p)
+		if n == "" || seen[n] {
+			return
+		}
+		seen[n] = true
+		out = append(out, p)
+	}
+
 	proj := o.projectType()
 	for _, p := range goalCommandPaths(root.DoD.Commands) {
 		n := engine.NormalizeOutputPath(p)
@@ -274,24 +289,31 @@ func (o *Orchestrator) integrationOutputs(root *models.TaskNode) []string {
 		}
 		// Already names a file ("app.py", "cmd/demo.go")?
 		if base := n[strings.LastIndex(n, "/")+1:]; strings.Contains(base, ".") {
-			return []string{n}
+			add(n)
+			break
 		}
 		switch proj {
 		case tools.ProjectGo:
-			return []string{n + "/main.go"}
+			add(n + "/main.go")
 		case tools.ProjectRust:
-			return []string{n + "/main.rs"}
+			add(n + "/main.rs")
 		case tools.ProjectPython:
-			return []string{n + "/main.py"}
+			add(n + "/main.py")
 		case tools.ProjectNode:
-			return []string{n + "/main.js"}
+			add(n + "/main.js")
 		}
 	}
-	names := o.entryPointNames()
-	if len(names) == 0 {
-		return nil
+	if len(out) == 0 {
+		names := o.entryPointNames()
+		if len(names) == 0 {
+			return nil
+		}
+		add(names[0])
 	}
-	return []string{names[0]}
+	for _, p := range o.uncoveredGoalInputs(root) {
+		add(p)
+	}
+	return out
 }
 
 // healPlanStructure repairs a saved tree whose plan cannot assemble. It only

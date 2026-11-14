@@ -90,7 +90,9 @@ func (o *Orchestrator) decompose(ctx context.Context, node *models.TaskNode) err
 				Content: "Your plan is structurally incomplete:\n" + planErr.Error() +
 					"\n\nRe-issue the WHOLE plan with this fixed. Every path and command in the " +
 					"goal-level DoD must be produced by some subtask, and a runnable goal needs a " +
-					"subtask that creates its entry point. Return ONLY corrected JSON.",
+					"subtask that creates its entry point. If the DoD READS a file (a config, a " +
+					"fixture, a test input), either add a subtask that creates it or take it out " +
+					"of the command — nothing else will make it appear. Return ONLY corrected JSON.",
 			})
 		case lastErr != nil:
 			messages = append(messages, llm.Message{
@@ -154,7 +156,8 @@ func (o *Orchestrator) decomposeUserPrompt(node *models.TaskNode) string {
 		case strings.Contains(node.ErrorMsg, planStructureMarker):
 			fmt.Fprintf(&b, "\nPrevious plan was structurally incomplete — fix the SHAPE of the "+
 				"plan before splitting further (a subtask must produce the entry point and every "+
-				"path the goal-level DoD runs):\n%s\n",
+				"path the goal-level DoD runs, and a file the goal-level DoD reads must be created "+
+				"by some subtask or dropped from the command):\n%s\n",
 				truncate(node.ErrorMsg, 2500))
 		case strings.Contains(node.ErrorMsg, planRepairMarker):
 			fmt.Fprintf(&b, "\nPrevious failure — DIAGNOSE THE PLAN FIRST (DoD/contract may be wrong; "+

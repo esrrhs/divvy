@@ -489,3 +489,203 @@ func TestHealPlanStructure_ResumeCompletesTheGoal(t *testing.T) {
 		t.Fatalf("entry point was not created: %v", err)
 	}
 }
+
+// --- input side of the plan check ------------------------------------------
+
+// The observed failure: `go build -o /tmp/app . && /tmp/app test.json`, where
+// no task produces test.json and nothing in the workspace provides it. Perfect
+// work still cannot pass that acceptance.
+func TestPlanBlockers_CatchesDanglingGoalInput(t *testing.T) {
+	o := structureFixture(t, "写一个读配置的 CLI",
+		[]string{"go build -o /tmp/app . && /tmp/app test.json"},
+		map[string][]string{"impl": {"main.go"}})
+
+	blockers := o.planBlockers()
+	if len(blockers) != 1 || !strings.Contains(blockers[0], "test.json") {
+		t.Fatalf("want 1 blocker naming test.json, got %v", blockers)
+	}
+	if !strings.Contains(blockers[0], "reads") {
+		t.Fatalf("blocker should say the path is read, not produced: %s", blockers[0])
+	}
+}
+
+func TestPlanBlockers_GoalInputProducedByLeaf(t *testing.T) {
+	o := structureFixture(t, "写一个读配置的 CLI",
+		[]string{"go build -o app . && ./app test.json"},
+		map[string][]string{"impl": {"main.go"}, "fixture": {"test.json"}})
+	if got := o.planBlockers(); len(got) != 0 {
+		t.Fatalf("a produced input must not block, got %v", got)
+	}
+}
+
+func TestPlanBlockers_GoalInputPresentInWorkspace(t *testing.T) {
+	o := structureFixture(t, "写一个读配置的 CLI",
+		[]string{"go build -o app . && ./app test.json"},
+		map[string][]string{"impl": {"main.go"}})
+	if err := os.WriteFile(filepath.Join(o.sandbox.Root, "test.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := o.planBlockers(); len(got) != 0 {
+		t.Fatalf("a seeded input must not block, got %v", got)
+	}
+}
+
+// A DoD that writes the file first is self-contained: the path is an output of
+// the acceptance run, not a missing input.
+func TestPlanBlockers_GoalInputCreatedByTheCommandItself(t *testing.T) {
+	o := structureFixture(t, "写一个读配置的 CLI",
+		[]string{`printf '{"name":"x"}' > test.json && go run . test.json`},
+		map[string][]string{"impl": {"main.go"}})
+	if got := o.planBlockers(); len(got) != 0 {
+		t.Fatalf("a path the command writes must not block, got %v", got)
+	}
+}
+
+// The repair loop, end to end: a plan whose goal acceptance reads a file
+// nobody creates is rejected at plan time, and the planner is told exactly
+// which file is missing so it can add a subtask for it.
+func TestDecompose_ReplansWhenAcceptanceReadsAMissingFile(t *testing.T) {
+	work := t.TempDir()
+	if err := os.WriteFile(filepath.Join(work, "go.mod"), []byte("module myapp\n\ngo 1.21\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	calls := 0
+	var seen []llm.Request
+	client := &llm.ScriptedClient{
+		Handle: func(ctx context.Context, req llm.Request) (*llm.Response, error) {
+			calls++
+			seen = append(seen, req)
+			if calls == 1 {
+				return &llm.Response{Content: planReadingMissingFixture}, nil
+			}
+			return &llm.Response{Content: planProducingFixture}, nil
+		},
+	}
+	cfg := DefaultConfig()
+	cfg.WorkDir = work
+	cfg.DataDir = t.TempDir()
+	cfg.SessionID = "test_missing_fixture"
+	cfg.Goal = "写一个读配置的 CLI"
+	cfg.Stream = false
+
+	o, err := NewFromGoal(cfg, client, SilentLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := o.RunPlan(context.Background()); err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+
+	if calls != 2 {
+		t.Fatalf("planner calls = %d, want 2 (rejected + repaired)", calls)
+	}
+	// The repair prompt has to name the file, or the planner cannot fix it.
+	told := false
+	for _, m := range seen[1].Messages {
+		if strings.Contains(m.Content, "test.json") {
+			told = true
+		}
+	}
+	if !told {
+		t.Fatal("the planner was never told which file is missing")
+	}
+	if injected := injectedAssemblyLeaf(o); injected != "" {
+		t.Fatalf("a repairable plan must not need an injected assembly leaf, got %s", injected)
+	}
+	if got := o.planBlockers(); len(got) != 0 {
+		t.Fatalf("plan still blocked: %v", got)
+	}
+}
+
+// injectedAssemblyLeaf returns the id of an engine-injected assembly leaf, if
+// the tree has one. (hasIntegrationLeaf is looser: any leaf producing the
+// entry point counts, which is not what this test is about.)
+func injectedAssemblyLeaf(o *Orchestrator) string {
+	root, ok := o.tree.CloneNode(o.tree.RootID)
+	if !ok {
+		return ""
+	}
+	for _, cid := range root.ChildrenIDs {
+		if strings.HasPrefix(cid, "integrate_entry") {
+			return cid
+		}
+	}
+	return ""
+}
+
+const planReadingMissingFixture = `{
+  "is_atomic": false,
+  "reason": "split by responsibility",
+  "dod": {"commands": ["go build -o /tmp/app . && /tmp/app test.json"]},
+  "subtasks": [
+    {"id": "impl", "title": "Impl", "description": "the implementation", "type": "LEAF",
+     "contract": {"outputs": ["main.go"]}, "dod": {"commands": ["go build ./..."]}},
+    {"id": "tests", "title": "Tests", "description": "the tests", "type": "LEAF",
+     "contract": {"outputs": ["impl_test.go"]}, "dod": {"commands": ["go test ./..."]}}
+  ]
+}`
+
+const planProducingFixture = `{
+  "is_atomic": false,
+  "reason": "split by responsibility",
+  "dod": {"commands": ["go build -o /tmp/app . && /tmp/app test.json"]},
+  "subtasks": [
+    {"id": "impl", "title": "Impl", "description": "the implementation", "type": "LEAF",
+     "contract": {"outputs": ["main.go"]}, "dod": {"commands": ["go build ./..."]}},
+    {"id": "fixture", "title": "Fixture", "description": "the config fixture the CLI reads", "type": "LEAF",
+     "contract": {"outputs": ["test.json"]}, "dod": {"commands": ["test -f test.json"]}}
+  ]
+}`
+
+// The acceptance is a chain: the binary it runs is produced by the chain
+// itself, so only the fixture it reads is missing. One blocker, and it names
+// the fixture — not "&&", not "/tmp/app".
+func TestPlanBlockers_ChainAcceptanceNamesOnlyTheRealGap(t *testing.T) {
+	o := structureFixture(t, "写一个读配置的 CLI",
+		[]string{"go build -o /tmp/app . && /tmp/app test.json"},
+		map[string][]string{"impl": {"main.go"}})
+
+	blockers := o.planBlockers()
+	if len(blockers) != 1 {
+		t.Fatalf("want exactly 1 blocker, got %d: %v", len(blockers), blockers)
+	}
+	if !strings.Contains(blockers[0], "test.json") {
+		t.Fatalf("blocker should name the missing fixture: %s", blockers[0])
+	}
+}
+
+// The fallback path: when the planner cannot be talked into producing the
+// fixture, the injected assembly leaf owns it — otherwise the gap stays open
+// on every resume and each resume appends another assembly leaf.
+func TestEnsureIntegrationLeaf_ClosesDanglingInput(t *testing.T) {
+	o := structureFixture(t, "写一个读配置的 CLI",
+		[]string{"go build -o /tmp/app . && /tmp/app test.json"},
+		map[string][]string{"impl": {"main.go"}})
+
+	if got := o.planBlockers(); len(got) != 1 {
+		t.Fatalf("want 1 blocker before healing, got %v", got)
+	}
+
+	first, err := o.ensureIntegrationLeaf("missing fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == "" {
+		t.Fatal("no leaf id returned")
+	}
+	if got := o.planBlockers(); len(got) != 0 {
+		t.Fatalf("the injected leaf must close the gap, got %v", got)
+	}
+	// Healing again must not grow the tree: a resume that appends another
+	// assembly leaf every time is how a run turns into a pile of duplicates.
+	root, _ := o.tree.CloneNode(o.tree.RootID)
+	before := len(root.ChildrenIDs)
+	if _, err := o.ensureIntegrationLeaf("missing fixture"); err != nil {
+		t.Fatal(err)
+	}
+	root, _ = o.tree.CloneNode(o.tree.RootID)
+	if len(root.ChildrenIDs) != before {
+		t.Fatalf("heal appended another leaf: %d -> %d", before, len(root.ChildrenIDs))
+	}
+}
