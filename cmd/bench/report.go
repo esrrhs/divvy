@@ -17,9 +17,21 @@ type reportMeta struct {
 	// Loop names the engine loop the numbers describe. Two reports with
 	// different loops are not comparable row-for-row, only aggregate-to-
 	// aggregate, so the field is part of the report identity.
-	Loop     string    `json:"loop,omitempty"`
+	Loop string `json:"loop,omitempty"`
+	// Protocol names how the agent was driven: the JSON action protocol or
+	// OpenAI tool_calls. A weak model fails the JSON protocol long before it
+	// fails the task, so this belongs in the report's identity too.
+	Protocol string    `json:"protocol,omitempty"`
 	Started  time.Time `json:"started_at"`
 	Finished time.Time `json:"finished_at"`
+}
+
+// protocolName labels the agent protocol a report was produced with.
+func protocolName(native bool) string {
+	if native {
+		return "tool_calls"
+	}
+	return "json-actions"
 }
 
 // benchReport is the on-disk JSON schema: stable fields only, so reports

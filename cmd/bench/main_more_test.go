@@ -228,3 +228,15 @@ func TestBench_AggregateEmptyAndCost(t *testing.T) {
 		t.Fatal("unknown model should have no price")
 	}
 }
+
+// The protocol is part of a report's identity: the same model and goal behave
+// differently over tool_calls than over the JSON action protocol, so two
+// reports are only comparable row-for-row when the protocol matches.
+func TestProtocolName(t *testing.T) {
+	if got := protocolName(false); got != "json-actions" {
+		t.Errorf("protocolName(false) = %q", got)
+	}
+	if got := protocolName(true); got != "tool_calls" {
+		t.Errorf("protocolName(true) = %q", got)
+	}
+}

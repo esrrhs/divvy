@@ -59,6 +59,13 @@ type benchConfig struct {
 	GitCommit  bool
 	Timeout    time.Duration
 
+	// NativeTools runs the agent over OpenAI tool_calls instead of the JSON
+	// action protocol. The two are not interchangeable for a weak model: the
+	// JSON protocol asks it to emit a well-formed object every step, and a
+	// model that cannot do that fails before the task even starts. Measuring
+	// one without the other hides the difference.
+	NativeTools bool
+
 	// Root is the directory that holds one subdirectory per goal run (the
 	// seeded workspace plus the run's own .divvy session data). Workspaces
 	// are kept after the run for post-mortem inspection.

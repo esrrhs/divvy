@@ -45,6 +45,7 @@ func run(args []string) error {
 	isolate := fs.Bool("isolate", true, "run leaves in isolated mirrors, merge on success")
 	gitCommit := fs.Bool("git-commit", true, "commit each leaf's changes (requires git)")
 	loop := fs.String("loop", loopTree, "engine loop to measure: tree (plan + verify) or direct (persistent tool loop)")
+	nativeTools := fs.Bool("native-tools", false, "run the agent over OpenAI tool_calls instead of the JSON action protocol")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -93,19 +94,20 @@ func run(args []string) error {
 	defer stop()
 
 	bc := benchConfig{
-		BaseURL:    *baseURL,
-		Model:      *model,
-		APIKey:     *apiKey,
-		ExtraJSON:  *extra,
-		MaxSteps:   *maxSteps,
-		MaxRetries: *maxRetries,
-		Parallel:   *parallel,
-		Isolate:    *isolate,
-		GitCommit:  *gitCommit,
-		Timeout:    *timeout,
-		Root:       rootDir,
-		Loop:       loopName,
-		Pricing:    cost.DefaultPricing(),
+		BaseURL:     *baseURL,
+		Model:       *model,
+		APIKey:      *apiKey,
+		ExtraJSON:   *extra,
+		MaxSteps:    *maxSteps,
+		MaxRetries:  *maxRetries,
+		Parallel:    *parallel,
+		Isolate:     *isolate,
+		GitCommit:   *gitCommit,
+		Timeout:     *timeout,
+		Root:        rootDir,
+		Loop:        loopName,
+		NativeTools: *nativeTools,
+		Pricing:     cost.DefaultPricing(),
 	}
 
 	meta := reportMeta{
@@ -113,10 +115,15 @@ func run(args []string) error {
 		BaseURL: *baseURL,
 		Extra:   *extra,
 		Loop:    loopName,
-		Started: time.Now(),
+		// The protocol is part of the report's identity: the same model and
+		// goal behave differently over tool_calls than over the JSON action
+		// protocol, so two reports are only comparable row-for-row when the
+		// protocol matches.
+		Protocol: protocolName(*nativeTools),
+		Started:  time.Now(),
 	}
-	fmt.Printf("divvy-bench: model=%s endpoint=%s loop=%s goals=%d repeat=%d root=%s\n",
-		*model, *baseURL, loopName, len(selected), *repeat, rootDir)
+	fmt.Printf("divvy-bench: model=%s endpoint=%s loop=%s protocol=%s goals=%d repeat=%d root=%s\n",
+		*model, *baseURL, loopName, protocolName(*nativeTools), len(selected), *repeat, rootDir)
 
 	var results []RunResult
 	for rep := 1; rep <= *repeat; rep++ {
