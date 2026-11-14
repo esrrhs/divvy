@@ -468,43 +468,47 @@ func (s *server) httpPost(ctx context.Context, msg map[string]any, wantID int64)
 func readSSE(r io.Reader, wantID int64) (json.RawMessage, error) {
 	reader := bufio.NewReaderSize(r, 64<<10)
 	var data strings.Builder
-	flush := func() (json.RawMessage, bool) {
+	// flush returns the payload of the response we are waiting for. A
+	// JSON-RPC error must come back as an ERROR: fabricating a result for it
+	// (the old behaviour) made the caller decode it as "the tool returned no
+	// text content", and the real reason for the failure was lost.
+	flush := func() (json.RawMessage, bool, error) {
 		payload := strings.TrimSpace(data.String())
 		data.Reset()
 		if payload == "" {
-			return nil, false
+			return nil, false, nil
 		}
 		var msg rpcMessage
 		if err := json.Unmarshal([]byte(payload), &msg); err != nil {
-			return nil, false
+			return nil, false, nil
 		}
 		if len(msg.ID) == 0 {
-			return nil, false
+			return nil, false, nil
 		}
 		id, err := strconv.ParseInt(strings.Trim(string(msg.ID), `"`), 10, 64)
 		if err != nil || id != wantID {
-			return nil, false
+			return nil, false, nil
 		}
 		if msg.Error != nil {
-			return json.RawMessage(`{"error":"` + msg.Error.Message + `"}`), true
+			return nil, true, fmt.Errorf("MCP error: %s", msg.Error.Message)
 		}
-		return msg.Result, true
+		return msg.Result, true, nil
 	}
 	for {
 		line, err := reader.ReadString('\n')
 		trimmed := strings.TrimRight(line, "\r\n")
 		switch {
 		case trimmed == "":
-			if result, ok := flush(); ok {
-				return result, nil
+			if result, ok, ferr := flush(); ok {
+				return result, ferr
 			}
 		case strings.HasPrefix(trimmed, "data:"):
 			data.WriteString(strings.TrimSpace(strings.TrimPrefix(trimmed, "data:")))
 			data.WriteByte('\n')
 		}
 		if err != nil {
-			if result, ok := flush(); ok {
-				return result, nil
+			if result, ok, ferr := flush(); ok {
+				return result, ferr
 			}
 			if errors.Is(err, io.EOF) {
 				return nil, fmt.Errorf("MCP SSE stream ended before the response")

@@ -112,3 +112,65 @@ func TestLoadConfigTransportValidation(t *testing.T) {
 		t.Fatalf("remote config should load: %+v err=%v", cfg, err)
 	}
 }
+
+// TestRemoteSSEToolErrorIsSurfaced: a remote MCP server that answers a tool
+// call with a JSON-RPC error must reach the caller as an error.
+//
+// The SSE path used to fabricate a result for it, and the caller decoded that
+// as "the tool returned no text content" — the actual reason for the failure
+// was lost, and the model was told the tool had nothing to say.
+func TestRemoteSSEToolErrorIsSurfaced(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var msg map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		id := msg["id"]
+		method, _ := msg["method"].(string)
+		switch method {
+		case "initialize":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0", "id": id,
+				"result": map[string]any{
+					"protocolVersion": "2024-11-05",
+					"capabilities":    map[string]any{"tools": map[string]any{}},
+					"serverInfo":      map[string]any{"name": "remote", "version": "1"},
+				},
+			})
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
+		case "tools/list":
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(
+				`{"jsonrpc":"2.0","id":%v,"result":{"tools":[{"name":"remote_fail","inputSchema":{"type":"object","properties":{}}}]}}`,
+				id))
+		case "tools/call":
+			// The tool fails, over SSE.
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(
+				`{"jsonrpc":"2.0","id":%v,"error":{"code":-32000,"message":"tool exploded"}}`,
+				id))
+		default:
+			http.Error(w, "unknown method", http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	rt, err := Start(context.Background(), map[string]ServerConfig{
+		"remote": {URL: srv.URL},
+	}, t.TempDir(), t.Logf)
+	if err != nil {
+		t.Fatalf("start remote: %v", err)
+	}
+	defer rt.Close()
+
+	_, err = rt.Call(context.Background(), "mcp__remote__remote_fail", map[string]any{})
+	if err == nil {
+		t.Fatal("a failing remote tool must return an error")
+	}
+	if !strings.Contains(err.Error(), "tool exploded") {
+		t.Fatalf("the error message was lost: %v", err)
+	}
+}
