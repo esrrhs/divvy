@@ -374,3 +374,31 @@ func TestEnsureDoD_CTestTimeoutBumpAndNormalize(t *testing.T) {
 		t.Fatalf("expected --timeout injected, got %v", dod.Commands)
 	}
 }
+
+// A DoD command refused a write outside the workspace must say so. The raw
+// kernel text is what taught a model to go hunting for a git/VCS bug: the
+// failure it saw looked like the project was broken, not like a policy.
+func TestVerify_SandboxWriteRefusalExplainsItself(t *testing.T) {
+	root := t.TempDir()
+	if ok, reason := tools.ProbeShellIsolation(root); !ok {
+		t.Skipf("no execution backend here: %s", reason)
+	}
+	sb, err := tools.NewSandbox(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	o := &Orchestrator{log: SilentLogger()}
+	node := &models.TaskNode{
+		DoD: models.DoD{
+			Commands:   []string{"printf x > /etc/divvy-hint-probe"},
+			TimeoutSec: 10,
+		},
+	}
+	vr := o.verify(context.Background(), sb, node)
+	if vr.OK {
+		t.Fatal("writing outside the workspace must fail")
+	}
+	if !strings.Contains(vr.Output, "[sandbox]") || !strings.Contains(vr.Output, "$TMPDIR") {
+		t.Fatalf("verify output does not explain the refusal:\n%s", vr.Output)
+	}
+}

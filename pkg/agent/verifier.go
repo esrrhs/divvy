@@ -129,7 +129,14 @@ func (o *Orchestrator) verifyAs(ctx context.Context, sb *tools.Sandbox, node *mo
 				"duration_ms": duration,
 				"output_tail": tailClip(combined.String(), evVerifyTail),
 			})
-			return VerifyResult{OK: false, Command: cmd, Output: o.withDiagnostics(sb, combined.String()), ExitCode: res.ExitCode}
+			raw := combined.String()
+			// Same reason as run_bash: a DoD command refused a write outside
+			// the workspace otherwise reaches the retry prompt as if the code
+			// were broken.
+			if hint := tools.SandboxDenialHint(res.Stdout, res.Stderr); hint != "" {
+				raw += hint + "\n"
+			}
+			return VerifyResult{OK: false, Command: cmd, Output: o.withDiagnostics(sb, raw), ExitCode: res.ExitCode}
 		}
 		o.log.Okf("verify passed: %s", cmd)
 		o.events.Record(kind, node.ID, map[string]any{

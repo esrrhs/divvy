@@ -143,6 +143,9 @@ export OPENAI_MODEL=qwen2.5-coder:14b
 
 macOS 后端认两个环境变量：`DIVVY_EXEC_BACKEND=none` 显式关掉 `run_bash`（其它取值一律忽略，免得拼写错误静默关掉隔离）；`DIVVY_EXEC_READ_PATHS=/opt/sdk:~/venv`（冒号分隔）补上探测不到的**只读**根，用于自建 SDK、虚拟环境这类工具链。写权限不受它影响，仍然只有工作区与临时目录。
 
+写不进工作区外的报错会**自己解释自己**。内核原文（`mkdir: /tmp/app: operation not permitted`）在模型眼里像代码 bug——实测有一次它为此连查 git、`xcode-select`、`sudo`，被自己正在对抗的沙箱挡在十步之外。所以这类拒绝在 `run_bash` 与验收输出里都会追加一行 `[sandbox]` 说明：可写的只有工作区和 `$TMPDIR`，裸 `/tmp` 未必是那个目录（macOS 上根本不是），改成 `$TMPDIR/...` 重试。提示词里也事先写明了这一点——能预防就不靠事后解释。判定只看两种无歧义的拒绝（`Operation not permitted` / `Read-only file system`），**不认** `Permission denied`：那是项目自己也能产生的普通 EACCES，在那儿塞沙箱建议等于把模型引向错误方向。
+
+
 并发写同一个文件会互相覆盖，因此有两道防线：
 
 - **调度层（预防）**：声明了相同产出文件的叶子被互斥调度（`-parallel N` 也不会同时跑），路径按 `./a.go`、`a//go` 等价归一。

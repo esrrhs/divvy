@@ -1374,6 +1374,11 @@ func directSystemGuide(sb *tools.Sandbox, dataDir string) string {
 			// model that reads "auto-verify OK" as "the build works" will report
 			// success it cannot back up.
 			b.WriteString("This environment cannot run shell commands (" + reason + "). The [auto-verify] block is then only a syntax parse — it says nothing about types, imports, or tests, and you cannot run a build or a test suite at all. Never claim that a build or a test passed; say what you could and could not verify.\n")
+		} else {
+			// Only worth saying where commands actually run: a write refusal is
+			// otherwise indistinguishable from a build error ("operation not
+			// permitted" on a /tmp path reads like a bug in the project).
+			b.WriteString("Scratch files (build output, temp fixtures) go inside the workspace or under \"$TMPDIR\" — commands run sandboxed and any write elsewhere is refused, so a bare /tmp path that looks normal will fail.\n")
 		}
 	}
 	b.WriteString("search_files and find_files are literal regex/glob matching, not a semantic index.\n")

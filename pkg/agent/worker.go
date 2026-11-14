@@ -595,6 +595,10 @@ func (o *Orchestrator) projectContext(sb *tools.Sandbox, node *models.TaskNode, 
 	b.WriteString("\nLayout reminder: write outputs at the contract paths relative to the workspace root; ")
 	b.WriteString("do not nest packages under a directory named after the Go module path; ")
 	b.WriteString("put go.mod only at the workspace root unless this task explicitly requires a nested module.\n")
+	if _, off := sb.ToolDisabled(tools.ToolRunBash); !off {
+		b.WriteString("Scratch files (build output, temp fixtures) go inside the workspace or under \"$TMPDIR\" — ")
+		b.WriteString("commands run sandboxed and any write elsewhere is refused, so a bare /tmp path that looks normal will fail.\n")
+	}
 	b.WriteString("\nStart by listing or reading only what you need, then implement the task.")
 	return b.String()
 }

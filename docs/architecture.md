@@ -123,6 +123,19 @@ macOS 后端有两个只能靠实测发现的坑，值得记下来：
 
 SBPL 是权限黑名单式封锁，不是命名空间隔离：`/usr`、`/Library` 这类系统前缀在沙箱内可读，可写面仍只有工作区与临时目录，网络出口被 deny。够用来跑构建和测试，不等价于"只读整个磁盘"——家目录的私有文件靠"不 allow"挡住，而不是靠"看不见"。
 
+### 拒绝写的时候要说明白（`sandbox_hint.go`）
+
+沙箱拒绝一次写，内核给的原文是 `mkdir: /tmp/app: operation not permitted`。这行字对模型来说是**误导性的**：它读起来像项目里的 bug，而不是一条策略。实测过一次完整代价——`go build -o /tmp/app` 被拒后，模型去查 git（怀疑 VCS stamping）、试 `xcode-select`、最后 `sudo`，十步之后开始吐截断的 JSON。它一直在对抗的正是那个沙箱，而没有任何东西告诉它"换个目录就行"。
+
+所以拒绝写这件事要在两个层面各说一次：
+
+- **事前**：叶子提示词与直接模式的系统提示都写明"临时文件放工作区或 `$TMPDIR`，裸 `/tmp` 可能不成立"。能预防就不靠事后解释；`run_bash` 不可用的宿主上这句不出现（那里根本没有命令会失败到这个原因）。
+- **事后**：`run_bash` 与验收命令的输出末尾追加一行 `[sandbox]`，指出可写的位置和改法。两处共用 `tools.SandboxDenialHint`，因为它判断的是同一件事，分开写迟早会漂移。
+
+判定只认两种无歧义标记：`Operation not permitted`（seatbelt / EPERM）和 `Read-only file system`（bwrap 的 `--ro-bind`）。**`Permission denied`（EACCES）故意不认**——项目自己也会产生它（`chmod`、读不了的 fixture），在那儿加沙箱建议等于把模型引向错误的排查方向，和"把应该成立写成已经验证"是同一类错误。这条边界有测试守着（`TestSandboxDenialHint_Markers`），集成侧另有 `TestRunBash_ExplainsSandboxWriteRefusal` / `TestVerify_SandboxWriteRefusalExplainsItself` 证明它真的接在两条输出路径上。
+
+注意这**不是**给沙箱开 `/tmp`。策略一个字没改：可写的仍然只有工作区与重定向后的 `$TMPDIR`（macOS 上是 `$TMPDIR/divvy-exec`，Linux 上是每次执行新挂的 tmpfs）。改的是"失败能不能被读懂"。
+
 ## 失败与恢复
 
 | 情况 | 行为 |
