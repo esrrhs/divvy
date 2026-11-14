@@ -95,18 +95,20 @@ func secretLooksReal(match string) bool {
 	return true
 }
 
-// secretValue pulls the quoted value out of a secret-pattern match.
+// secretValue pulls the value out of a secret-pattern match. Some patterns
+// (an AWS key id, for example) match the value itself, without the quotes.
 func secretValue(match string) string {
-	i := strings.IndexAny(match, `"'`)
+	value := strings.TrimSpace(match)
+	i := strings.IndexAny(value, `"'`)
 	if i < 0 {
-		return ""
+		return value
 	}
-	quote := match[i]
-	j := strings.IndexByte(match[i+1:], quote)
+	quote := value[i]
+	j := strings.IndexByte(value[i+1:], quote)
 	if j < 0 {
 		return ""
 	}
-	return match[i+1 : i+1+j]
+	return value[i+1 : i+1+j]
 }
 
 // reviewFinding is one deterministic issue reported by the review.
@@ -161,7 +163,9 @@ func (r *reviewResult) scanTextLine(file, content string, line int) {
 			// to rewrite the user's own example — work nobody asked for. The
 			// gate is here to catch a pasted real key.
 			if !secretLooksReal(m) {
-				break
+				// A placeholder: keep looking. A later pattern may still
+				// match a real key in the same file.
+				continue
 			}
 			r.add(reviewFinding{"secret", where, "possible hard-coded secret: " + clipReviewText(m)})
 			break

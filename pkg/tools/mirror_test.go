@@ -401,8 +401,10 @@ func TestMirror_WorktreeFinishGateActive(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// New untracked file with a hard-coded AWS key.
-	if err := msb.WriteFile("leak.go", "package main\n\nvar awsKey = \"AKIAIOSFODNN7EXAMPLE\"\n"); err != nil {
+	// New untracked file with a hard-coded AWS key. The key is a realistic
+	// one on purpose: AWS's documented example key contains the word
+	// "example", and a placeholder is not a leaked credential.
+	if err := msb.WriteFile("leak.go", "package main\n\nvar awsKey = \"AKIAQ7ZR3MPL2WQK9XYZ\"\n"); err != nil {
 		t.Fatal(err)
 	}
 	// Tracked file with an unresolved conflict marker.
