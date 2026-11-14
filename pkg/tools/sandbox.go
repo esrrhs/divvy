@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 )
@@ -97,6 +98,13 @@ type Sandbox struct {
 	// gets persisted to the event file. Empty makes subprocesses inherit the
 	// full environment (CLI behavior; RunManager never runs in CLI mode).
 	hiddenEnv []string
+
+	// observed maps workspace-relative paths to the digest of the content
+	// the model has seen; the stale-read gate compares against it before a
+	// patch (see stale.go). A mirror sandbox owns its own map, and the
+	// direct loop persists it so the guard survives a turn boundary.
+	observedMu sync.Mutex
+	observed   map[string]string
 }
 
 // HideEnv withholds the named environment variables from tool subprocesses.
@@ -254,6 +262,10 @@ func (s *Sandbox) ReadFile(path string) (string, error) {
 	if truncated {
 		out += fmt.Sprintf("\n\n[truncated to %d bytes]", max)
 	}
+	// Record what the model now knows about this file, even when the read
+	// was truncated: the digest is of the whole file, so any later change
+	// invalidates the anchor regardless of where it landed.
+	s.observeFile(abs, s.Rel(abs))
 	return out, nil
 }
 
@@ -323,6 +335,7 @@ func (s *Sandbox) ReadFileLines(path string, start, end int) (string, error) {
 	if truncated {
 		out += fmt.Sprintf("[truncated to %d bytes; narrow the line range]\n", max)
 	}
+	s.observeFile(abs, s.Rel(abs))
 	return out, nil
 }
 
@@ -345,6 +358,10 @@ func (s *Sandbox) WriteFile(path, content string) error {
 	if err := os.WriteFile(abs, []byte(content), 0644); err != nil {
 		return err
 	}
+	// The model stated the whole result, so it now knows this content.
+	// A write also clears a stale record: patching the file afterwards is
+	// no longer an edit against something the model has not seen.
+	s.rememberObserved(s.Rel(abs), digestBytes([]byte(content)))
 	return s.verifyStillConfined(abs)
 }
 
@@ -356,6 +373,10 @@ func (s *Sandbox) ReplaceLines(path string, start, end int, content string) erro
 	}
 	raw, err := os.ReadFile(abs)
 	if err != nil {
+		return err
+	}
+	rel := s.Rel(abs)
+	if err := s.checkStaleEdit(rel, digestBytes(raw)); err != nil {
 		return err
 	}
 	text := string(raw)
@@ -384,7 +405,11 @@ func (s *Sandbox) ReplaceLines(path string, start, end int, content string) erro
 	if strings.HasSuffix(string(raw), "\n") && !strings.HasSuffix(out, nl) {
 		out += nl
 	}
-	return os.WriteFile(abs, []byte(out), 0644)
+	if err := os.WriteFile(abs, []byte(out), 0644); err != nil {
+		return err
+	}
+	s.rememberObserved(rel, digestBytes([]byte(out)))
+	return nil
 }
 
 // ReplaceText replaces old with new. If replaceAll is false, old must occur exactly once.
@@ -409,14 +434,20 @@ func (s *Sandbox) ReplaceTextDetail(path, old, new string, replaceAll bool) (str
 	if err != nil {
 		return "", err
 	}
+	rel := s.Rel(abs)
+	if err := s.checkStaleEdit(rel, digestBytes(raw)); err != nil {
+		return "", err
+	}
 	text, eol := normalizeEOL(string(raw))
 	out, note, err := applyAnchorEdit(text, alignToEOL(old, eol), alignToEOL(new, eol), replaceAll, path)
 	if err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(abs, []byte(restoreEOL(out, eol)), 0644); err != nil {
+	final := restoreEOL(out, eol)
+	if err := os.WriteFile(abs, []byte(final), 0644); err != nil {
 		return "", err
 	}
+	s.rememberObserved(rel, digestBytes([]byte(final)))
 	return note, nil
 }
 
@@ -449,6 +480,10 @@ func (s *Sandbox) ReplaceTextsDetail(path string, edits []TextEdit, replaceAll b
 	if err != nil {
 		return "", err
 	}
+	rel := s.Rel(abs)
+	if err := s.checkStaleEdit(rel, digestBytes(raw)); err != nil {
+		return "", err
+	}
 	text, eol := normalizeEOL(string(raw))
 	var notes []string
 	for i, ed := range edits {
@@ -464,9 +499,11 @@ func (s *Sandbox) ReplaceTextsDetail(path string, edits []TextEdit, replaceAll b
 			notes = append(notes, fmt.Sprintf("edits[%d] %s", i, note))
 		}
 	}
-	if err := os.WriteFile(abs, []byte(restoreEOL(text, eol)), 0644); err != nil {
+	final := restoreEOL(text, eol)
+	if err := os.WriteFile(abs, []byte(final), 0644); err != nil {
 		return "", err
 	}
+	s.rememberObserved(rel, digestBytes([]byte(final)))
 	return strings.Join(notes, "; "), nil
 }
 
@@ -488,9 +525,15 @@ func (s *Sandbox) DeletePath(path string, recursive bool) error {
 		return fmt.Errorf("%s is a directory; set recursive true to delete it", path)
 	}
 	if recursive {
-		return os.RemoveAll(abs)
+		err = os.RemoveAll(abs)
+	} else {
+		err = os.Remove(abs)
 	}
-	return os.Remove(abs)
+	if err != nil {
+		return err
+	}
+	s.forgetObserved(s.Rel(abs))
+	return nil
 }
 
 // MovePath renames a file or directory inside the workspace. Replacing an
@@ -527,7 +570,11 @@ func (s *Sandbox) MovePath(from, to string) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
 		return err
 	}
-	return os.Rename(src, dst)
+	if err := os.Rename(src, dst); err != nil {
+		return err
+	}
+	s.renameObserved(s.Rel(src), s.Rel(dst))
+	return nil
 }
 
 // ListDir lists files under path.

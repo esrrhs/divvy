@@ -257,7 +257,7 @@ func NativeTools() []map[string]any {
 			"path":    str("Relative file path"),
 			"content": str("Full file contents"),
 		}, []string{"path", "content"})),
-		fn(ToolReplaceLines, "Replace a line range, an exact string, or atomically apply several exact-string edits (all must match or the file is untouched). old_string may be copied from read_file output: line-number prefixes, indentation and trailing whitespace are tolerated, but the anchor must still match exactly one place.", obj(map[string]any{
+		fn(ToolReplaceLines, "Replace a line range, an exact string, or atomically apply several exact-string edits (all must match or the file is untouched). old_string may be copied from read_file output: line-number prefixes, indentation and trailing whitespace are tolerated, but the anchor must still match exactly one place. Refused with [stale-read] when the file changed after you last read it.", obj(map[string]any{
 			"path":        str("Relative file path"),
 			"start_line":  map[string]any{"type": "integer"},
 			"end_line":    map[string]any{"type": "integer"},
