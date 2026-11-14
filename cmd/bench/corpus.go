@@ -113,6 +113,229 @@ func TestAverage(t *testing.T) {
 		},
 	},
 	{
+		// The multi-rule goal. merge-intervals showed the limit of a classic
+		// off-by-one: a clear spec plus a clear test output is something a
+		// strong model fixes in one shot (VFAIL=0). The recovery machinery only
+		// runs when the first attempt misses something, so this goal has
+		// SEVERAL rules that are each simple but interact: an empty value, an
+		// unparsable value and the name of an environment variable all decide
+		// whether a lower layer survives. Three seeded defects sit in two
+		// files, so a fix that covers only one of them still fails the leaf's
+		// DoD — which is the round trip the engine's recovery path exists for.
+		//
+		// The prompt states the goal, not the defects. The contract lives in
+		// the test, and the test is guarded.
+		Name:   "layered-config",
+		Module: "cfg",
+		Prompt: "workspace 里是一个分层配置加载器：默认值、JSON 配置文件、环境变量三层，" +
+			"每层盖住下一层。它现在有 bug：跑 go test ./... 会失败。读 config_test.go（它定义了契约），" +
+			"修好实现，让 go test ./... 通过。不要修改 config_test.go。",
+		Accept: "go build ./... && go test ./...",
+		Guard:  []string{"config_test.go"},
+		Seed: map[string]string{
+			"config.go": `package config
+
+import (
+	"encoding/json"
+	"os"
+)
+
+// Config is the application configuration.
+type Config struct {
+	Host       string
+	Port       int
+	Verbose    bool
+	MaxRetries int
+	TimeoutSec int
+}
+
+// Defaults returns the built-in configuration: the lowest layer.
+func Defaults() Config {
+	return Config{
+		Host:       "127.0.0.1",
+		Port:       8080,
+		Verbose:    false,
+		MaxRetries: 3,
+		TimeoutSec: 30,
+	}
+}
+
+// Load builds the configuration from three layers, lowest priority first:
+//
+//  1. the built-in defaults
+//  2. the JSON file at path, when it exists; unknown keys are ignored
+//  3. the environment
+//
+// The environment names a field by APP_ plus the Go field name in upper case
+// with underscores between the words: APP_HOST, APP_PORT, APP_VERBOSE,
+// APP_MAX_RETRIES, APP_TIMEOUT_SEC.
+//
+// An environment variable that is empty, or whose value does not parse as the
+// field's type, counts as unset: the value of the layer below stays.
+func Load(path string, env func(string) (string, bool)) Config {
+	cfg := Defaults()
+	if path != "" {
+		if data, err := os.ReadFile(path); err == nil {
+			_ = json.Unmarshal(data, &cfg)
+		}
+	}
+	return applyEnv(cfg, env)
+}
+`,
+			"env.go": `package config
+
+import (
+	"strconv"
+	"strings"
+)
+
+// envNames maps a configuration field to the environment variable that
+// overrides it.
+var envNames = map[string]string{
+	"Host":       "APP_HOST",
+	"Port":       "APP_PORT",
+	"Verbose":    "APP_VERBOSE",
+	"MaxRetries": "APP_MAXRETRIES",
+	"TimeoutSec": "APP_TIMEOUT_SEC",
+}
+
+// applyEnv overlays the environment onto cfg.
+func applyEnv(cfg Config, env func(string) (string, bool)) Config {
+	if env == nil {
+		return cfg
+	}
+	if v, set := env(envNames["Host"]); set {
+		cfg.Host = v
+	}
+	if v, set := env(envNames["Port"]); set {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			n = 0
+		}
+		cfg.Port = n
+	}
+	if v, set := env(envNames["Verbose"]); set {
+		cfg.Verbose = parseBool(v)
+	}
+	if v, set := env(envNames["MaxRetries"]); set {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			n = 0
+		}
+		cfg.MaxRetries = n
+	}
+	if v, set := env(envNames["TimeoutSec"]); set {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			n = 0
+		}
+		cfg.TimeoutSec = n
+	}
+	return cfg
+}
+
+// parseBool reads a boolean the way operators write it.
+func parseBool(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+`,
+			"config_test.go": `package config
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func envOf(m map[string]string) func(string) (string, bool) {
+	return func(k string) (string, bool) {
+		v, ok := m[k]
+		return v, ok
+	}
+}
+
+func writeConfig(t *testing.T, body string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestLoadDefaults(t *testing.T) {
+	got := Load("", envOf(nil))
+	if got != Defaults() {
+		t.Fatalf("Load = %+v, want the defaults %+v", got, Defaults())
+	}
+}
+
+func TestLoadFileLayer(t *testing.T) {
+	p := writeConfig(t, "{\"Port\": 9090, \"Unknown\": 1}")
+	got := Load(p, envOf(nil))
+	if got.Port != 9090 {
+		t.Fatalf("the file layer must override the default port: %+v", got)
+	}
+	if got.Host != Defaults().Host {
+		t.Fatalf("a key the file omits must keep its default: %+v", got)
+	}
+}
+
+func TestLoadEnvOverridesFile(t *testing.T) {
+	p := writeConfig(t, "{\"Port\": 9090}")
+	got := Load(p, envOf(map[string]string{"APP_PORT": "7000"}))
+	if got.Port != 7000 {
+		t.Fatalf("the environment must override the file: %+v", got)
+	}
+}
+
+func TestLoadEmptyEnvCountsAsUnset(t *testing.T) {
+	got := Load("", envOf(map[string]string{"APP_HOST": ""}))
+	if got.Host != Defaults().Host {
+		t.Fatalf("an empty environment value must not wipe the layer below: %+v", got)
+	}
+}
+
+func TestLoadUnparsableEnvCountsAsUnset(t *testing.T) {
+	got := Load("", envOf(map[string]string{"APP_PORT": "not-a-number"}))
+	if got.Port != Defaults().Port {
+		t.Fatalf("an unparsable environment value must not zero the field: %+v", got)
+	}
+}
+
+func TestLoadEnvNames(t *testing.T) {
+	got := Load("", envOf(map[string]string{
+		"APP_MAX_RETRIES": "9",
+		"APP_TIMEOUT_SEC": "45",
+	}))
+	if got.MaxRetries != 9 {
+		t.Fatalf("APP_MAX_RETRIES must override MaxRetries: %+v", got)
+	}
+	if got.TimeoutSec != 45 {
+		t.Fatalf("APP_TIMEOUT_SEC must override TimeoutSec: %+v", got)
+	}
+}
+
+func TestLoadBoolEnv(t *testing.T) {
+	for _, v := range []string{"1", "true", "TRUE", "yes", "on"} {
+		got := Load("", envOf(map[string]string{"APP_VERBOSE": v}))
+		if !got.Verbose {
+			t.Fatalf("%q must read as true: %+v", v, got)
+		}
+	}
+	got := Load("", envOf(map[string]string{"APP_VERBOSE": "0"}))
+	if got.Verbose {
+		t.Fatalf("0 must read as false: %+v", got)
+	}
+}
+`,
+		},
+	},
+	{
 		// The recovery goal: the other corpus entries are tasks a weak model
 		// gets right on the first try, so the engine's recovery machinery never
 		// runs and the project's thesis ("engineering constraints, not model

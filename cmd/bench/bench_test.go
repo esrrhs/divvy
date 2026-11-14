@@ -524,6 +524,34 @@ func TestBench_MergeIntervalsSeedFailsFirst(t *testing.T) {
 	}
 }
 
+// TestBench_LayeredConfigSeedFailsFirst keeps the multi-rule goal honest: the
+// seeded workspace must fail before the model changes anything, and it must
+// fail on the rules the goal exists for. A goal the model passes on the first
+// try teaches nothing about recovery.
+func TestBench_LayeredConfigSeedFailsFirst(t *testing.T) {
+	g, ok := goalByName("layered-config")
+	if !ok {
+		t.Fatal("corpus is missing the layered-config goal")
+	}
+	dir := t.TempDir()
+	if err := g.seedWorkspace(dir); err != nil {
+		t.Fatal(err)
+	}
+	out, err := runCmd(dir, "go", "test", "./...")
+	if err == nil {
+		t.Fatalf("the seeded workspace must fail before the model touches it:\n%s", out)
+	}
+	for _, want := range []string{
+		"TestLoadEmptyEnvCountsAsUnset",
+		"TestLoadUnparsableEnvCountsAsUnset",
+		"TestLoadEnvNames",
+	} {
+		if !strings.Contains(string(out), want) {
+			t.Fatalf("the seeded failure must include %s, got:\n%s", want, out)
+		}
+	}
+}
+
 // TestBench_GuardCatchesEditedTaskFile: the contract test is the verdict, so
 // editing it must not count as success.
 func TestBench_GuardCatchesEditedTaskFile(t *testing.T) {
