@@ -3,6 +3,8 @@ package tools
 import (
 	"context"
 	"fmt"
+	"go/parser"
+	"go/token"
 	"os"
 	"path"
 	"path/filepath"
@@ -22,12 +24,35 @@ import (
 // feedback (syntax/type/compile), not acceptance. Acceptance stays with the
 // verifier (tree mode DoD) and with explicit run_bash calls.
 
+// editCheckDuration renders a check's duration. In-process parses finish in
+// microseconds, and "0s" reads like the check did not run.
+func editCheckDuration(d time.Duration) string {
+	if d < time.Millisecond {
+		return "<1ms"
+	}
+	return d.Round(time.Millisecond).String()
+}
+
 // maxEditCheckCommands bounds how many separate checks one edit may trigger, so
 // a multi-file replace cannot turn into a build sweep.
 const maxEditCheckCommands = 3
 
 // editCheckOutputCap bounds the diagnostics block appended to a tool result.
 const editCheckOutputCap = 4000
+
+// builtinGoSyntaxPrefix marks a check that runs in-process instead of through
+// the shell.
+//
+// Why a string prefix instead of a type: the finish gate remembers "what to
+// re-run" as a []string and replays it through the same entry point, so the
+// command list has to survive a round trip. "go syntax <file>" is not a real go
+// subcommand, so if interception ever regressed the worst case is a loud error,
+// never a stray command doing something.
+const builtinGoSyntaxPrefix = "go syntax "
+
+// maxSyntaxCheckBytes skips files too large to parse cheaply; the editor would
+// have truncated them anyway.
+const maxSyntaxCheckBytes = 2 << 20
 
 // EditCheck is the outcome of a post-edit verification.
 type EditCheck struct {
@@ -45,6 +70,21 @@ type EditCheck struct {
 // Ran reports whether at least one command was executed.
 func (c EditCheck) Ran() bool { return len(c.Commands) > 0 }
 
+// SyntaxOnly reports whether every check that ran was an in-process syntax
+// parse rather than a real build. The block wording differs: claiming "no
+// compile errors" from a parse-only check would be a lie.
+func (c EditCheck) SyntaxOnly() bool {
+	if len(c.Commands) == 0 {
+		return false
+	}
+	for _, cmd := range c.Commands {
+		if !strings.HasPrefix(cmd, builtinGoSyntaxPrefix) {
+			return false
+		}
+	}
+	return true
+}
+
 // Block renders the check as the text appended to a tool result. It is written
 // for the model: short, first line states verdict + command.
 func (c EditCheck) Block() string {
@@ -61,13 +101,19 @@ func (c EditCheck) Block() string {
 		verdict = "FAILED"
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "[auto-verify] %s: %s (%s)\n", strings.Join(c.Commands, " && "), verdict, c.Duration.Round(time.Millisecond))
+	fmt.Fprintf(&b, "[auto-verify] %s: %s (%s)\n", strings.Join(c.Commands, " && "), verdict, editCheckDuration(c.Duration))
 	if c.Failed || c.TimedOut {
 		b.WriteString(c.Output)
 		if !strings.HasSuffix(c.Output, "\n") {
 			b.WriteString("\n")
 		}
 		b.WriteString("Fix these before continuing. Do not call finish while the check above fails.")
+		return b.String()
+	}
+	if c.SyntaxOnly() {
+		// Be explicit about how shallow this is: a parse pass says nothing about
+		// types, imports, or whether the tests pass.
+		b.WriteString("Syntax parses; this environment could not run a real build, so type and test errors are still unknown.")
 	} else {
 		b.WriteString("No compile/type errors reported for the edited files.")
 	}
@@ -78,14 +124,24 @@ func (c EditCheck) Block() string {
 // paths. Paths that are not source files, or that no longer exist, are ignored.
 func (s *Sandbox) VerifyEditedFiles(ctx context.Context, paths []string, timeout time.Duration) EditCheck {
 	project, cmds, skip := planEditCheck(s.Root, paths)
-	check := EditCheck{Project: project, Commands: cmds, Skipped: skip}
-	if len(cmds) == 0 {
-		return check
+	if reason, noShell := s.ToolDisabled(ToolRunBash); noShell {
+		// The planned build commands cannot run. Fall back to the in-process
+		// syntax pass, which needs no isolation backend and is the only
+		// observation available on this host. Calling that a "build" would be a
+		// lie, so it is labelled as a parse (see EditCheck.SyntaxOnly) — and it
+		// applies even when the project type is not Go, because a Go file in a
+		// C++ repo still has to parse.
+		if syntax := goSyntaxCommands(s.Root, paths); len(syntax) > 0 {
+			cmds, skip = syntax, ""
+		} else {
+			if skip == "" {
+				skip = "no in-process check applies to these files"
+			}
+			return EditCheck{Project: project, Skipped: skip + "; shell execution unavailable (" + reason + ")"}
+		}
 	}
-	if reason, ok := s.ToolDisabled(ToolRunBash); ok {
-		check.Commands = nil
-		check.Skipped = "shell execution unavailable in this environment (" + reason + ")"
-		return check
+	if len(cmds) == 0 {
+		return EditCheck{Project: project, Skipped: skip}
 	}
 	if timeout <= 0 {
 		timeout = 20 * time.Second
@@ -96,8 +152,14 @@ func (s *Sandbox) VerifyEditedFiles(ctx context.Context, paths []string, timeout
 // RunEditCheckCommands executes planned checks, stopping at the first failure.
 // It is exported separately so the finish gate can re-run a previously failing
 // check without re-planning from file names.
+//
+// Builtin entries (see builtinGoSyntaxPrefix) run in-process; everything else
+// goes through the shell.
 func (s *Sandbox) RunEditCheckCommands(ctx context.Context, project ProjectType, cmds []string, timeout time.Duration) EditCheck {
 	return runEditChecks(func(cmd string, timeout time.Duration) (*ExecResult, error) {
+		if file, ok := goSyntaxTarget(cmd); ok {
+			return s.checkGoSyntax(file), nil
+		}
 		return s.RunBash(ctx, cmd, timeout)
 	}, project, cmds, timeout)
 }
@@ -279,6 +341,69 @@ func underAnyDir(rel string, dirs ...string) bool {
 		}
 	}
 	return false
+}
+
+// goSyntaxCommands lists the in-process parse checks for the edited Go files.
+// Only Go is covered: go/parser ships with the toolchain we already link, while
+// Python/Node/Rust would need an interpreter or compiler (i.e. the shell we do
+// not have). Returning nothing is honest — the caller reports a skip.
+func goSyntaxCommands(root string, paths []string) []string {
+	var cmds []string
+	seen := map[string]bool{}
+	for _, p := range paths {
+		rel := filepath.ToSlash(strings.TrimSpace(p))
+		rel = strings.TrimPrefix(rel, "./")
+		if rel == "" || strings.HasPrefix(rel, "../") || !strings.HasSuffix(strings.ToLower(rel), ".go") {
+			continue
+		}
+		if underAnyDir(rel, "vendor", "testdata", "node_modules") || seen[rel] {
+			continue
+		}
+		info, err := os.Stat(filepath.Join(root, rel))
+		if err != nil || !info.Mode().IsRegular() || info.Size() > maxSyntaxCheckBytes {
+			continue
+		}
+		seen[rel] = true
+		cmds = append(cmds, builtinGoSyntaxPrefix+rel)
+		if len(cmds) >= maxEditCheckCommands {
+			break
+		}
+	}
+	return cmds
+}
+
+// goSyntaxTarget unwraps a builtin parse entry into the file it checks.
+func goSyntaxTarget(cmd string) (string, bool) {
+	if !strings.HasPrefix(cmd, builtinGoSyntaxPrefix) {
+		return "", false
+	}
+	file := strings.TrimSpace(strings.TrimPrefix(cmd, builtinGoSyntaxPrefix))
+	if file == "" {
+		return "", false
+	}
+	return file, true
+}
+
+// checkGoSyntax parses one file and reports failures in the same file:line:col
+// shape a compiler would, so the existing diagnosis compaction picks them up.
+// It never touches the shell, so it is the one check available on a host
+// without an isolation backend.
+func (s *Sandbox) checkGoSyntax(rel string) *ExecResult {
+	abs, err := s.Resolve(rel)
+	if err != nil {
+		return &ExecResult{ExitCode: 1, Stderr: err.Error()}
+	}
+	src, err := os.ReadFile(abs)
+	if err != nil {
+		return &ExecResult{ExitCode: 1, Stderr: err.Error()}
+	}
+	if len(src) > maxSyntaxCheckBytes {
+		return &ExecResult{}
+	}
+	if _, err := parser.ParseFile(token.NewFileSet(), rel, src, parser.AllErrors); err != nil {
+		return &ExecResult{ExitCode: 1, Stderr: err.Error() + "\n"}
+	}
+	return &ExecResult{}
 }
 
 // shellQuote single-quotes a path for sh. Paths come from the model's tool

@@ -1343,6 +1343,14 @@ func directSystemGuide(sb *tools.Sandbox, dataDir string) string {
 	b.WriteString("\n\n")
 	b.WriteString("You work in one growing tool transcript for this project. Use tools to actually read, search, edit, and verify. Do not claim success without checking real tool results. Do not invent file contents.\n")
 	b.WriteString("After write_file/replace_lines, a compile/type check for the edited package runs automatically and its result is appended to that tool output as [auto-verify]. Do not re-run the same build only to confirm it; fix the reported errors instead. finish is refused while that check still fails.\n")
+	if sb != nil {
+		if reason, off := sb.ToolDisabled(tools.ToolRunBash); off {
+			// Be blunt: on this host the only observation is a parse pass, and a
+			// model that reads "auto-verify OK" as "the build works" will report
+			// success it cannot back up.
+			b.WriteString("This environment cannot run shell commands (" + reason + "). The [auto-verify] block is then only a syntax parse — it says nothing about types, imports, or tests, and you cannot run a build or a test suite at all. Never claim that a build or a test passed; say what you could and could not verify.\n")
+		}
+	}
 	b.WriteString("search_files and find_files are literal regex/glob matching, not a semantic index.\n")
 	b.WriteString("Prefer replace_lines over write_file for edits: give one unique old_string anchor and the replacement. Indentation, trailing whitespace and read_file line numbers in the anchor are tolerated, but it must still match exactly one place; when it does not, the error quotes the closest lines — fix the anchor from that, do not resend the same one.\n")
 	b.WriteString("If a user follow-up arrives mid-loop, honor it from the next step; do not restart the whole task from scratch.\n")

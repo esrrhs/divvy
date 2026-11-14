@@ -242,9 +242,11 @@ func TestRenderEditCheckOutput_Caps(t *testing.T) {
 	}
 }
 
-// On a host without filesystem isolation the check must degrade to a skip, not
-// to a failure (which would block every finish) and not to an unsandboxed run.
-func TestVerifyEditedFiles_SkipsWhenShellUnavailable(t *testing.T) {
+// On a host without filesystem isolation the planned build commands cannot run.
+// For Go files the check degrades to the in-process parser (labelled as a syntax
+// parse, never as a build); for anything else it degrades to a skip and never to
+// an unsandboxed run.
+func TestVerifyEditedFiles_FallsBackToSyntaxWhenShellUnavailable(t *testing.T) {
 	root := t.TempDir()
 	if ok, _ := ProbeShellIsolation(root); ok {
 		t.Skip("host supports isolated execution; this asserts the fallback path")
@@ -252,7 +254,7 @@ func TestVerifyEditedFiles_SkipsWhenShellUnavailable(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module m\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(root, "a.go"), []byte("package m\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "a.go"), []byte("package m\n\nfunc Broken( {\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	sb, err := NewSandbox(root)
@@ -261,10 +263,150 @@ func TestVerifyEditedFiles_SkipsWhenShellUnavailable(t *testing.T) {
 	}
 	ApplyRuntimePolicy(sb)
 	check := sb.VerifyEditedFiles(context.Background(), []string{"a.go"}, time.Second)
-	if check.Ran() || check.Failed {
-		t.Fatalf("expected a skip, got %+v", check)
+	if !check.Ran() {
+		t.Fatalf("expected the syntax fallback to run, got %+v", check)
 	}
-	if !strings.Contains(check.Skipped, "unavailable") {
-		t.Fatalf("skip reason should say execution is unavailable: %q", check.Skipped)
+	if !check.SyntaxOnly() {
+		t.Fatalf("fallback must be labelled as a parse, got %v", check.Commands)
+	}
+	if !check.Failed {
+		t.Fatalf("broken Go source must fail the parse check: %+v", check)
+	}
+	if !strings.Contains(check.Output, "a.go:3") {
+		t.Fatalf("diagnostics should point at the bad line: %q", check.Output)
+	}
+
+	// A non-Go edit has no in-process checker, so it must skip with a reason
+	// rather than silently reporting success.
+	if err := os.WriteFile(filepath.Join(root, "b.txt"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	skip := sb.VerifyEditedFiles(context.Background(), []string{"b.txt"}, time.Second)
+	if skip.Ran() || skip.Failed {
+		t.Fatalf("expected a skip for a non-Go edit, got %+v", skip)
+	}
+	if skip.Skipped == "" {
+		t.Fatalf("a skip must carry a reason, got %+v", skip)
+	}
+}
+
+// TestGoSyntaxCommands_FiltersAndCaps locks what the no-shell fallback will and
+// will not parse: Go files only, never vendor/testdata, never missing paths, and
+// never more than the edit-check budget.
+func TestGoSyntaxCommands_FiltersAndCaps(t *testing.T) {
+	root := t.TempDir()
+	for _, rel := range []string{"a.go", "b.go", "c.go", "d.go", "vendor/v/x.go", "testdata/y.go", "notes.txt"} {
+		p := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("package m\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cmds := goSyntaxCommands(root, []string{
+		"a.go", "./b.go", "a.go", "vendor/v/x.go", "testdata/y.go", "notes.txt", "gone.go", "../escape.go", "c.go", "d.go",
+	})
+	if len(cmds) != maxEditCheckCommands {
+		t.Fatalf("want %d capped commands, got %v", maxEditCheckCommands, cmds)
+	}
+	want := []string{builtinGoSyntaxPrefix + "a.go", builtinGoSyntaxPrefix + "b.go", builtinGoSyntaxPrefix + "c.go"}
+	for i, w := range want {
+		if cmds[i] != w {
+			t.Fatalf("cmds = %v, want prefix %v", cmds, want)
+		}
+	}
+}
+
+// TestGoSyntaxTarget round-trips the label used in the recheck list.
+func TestGoSyntaxTarget(t *testing.T) {
+	if f, ok := goSyntaxTarget("go syntax pkg/a.go"); !ok || f != "pkg/a.go" {
+		t.Fatalf("goSyntaxTarget = %q,%v", f, ok)
+	}
+	for _, cmd := range []string{"go build ./...", "go syntax ", "", "node --check a.js"} {
+		if _, ok := goSyntaxTarget(cmd); ok {
+			t.Fatalf("%q must not be treated as a builtin", cmd)
+		}
+	}
+}
+
+// TestCheckGoSyntax_ReportsPosition: the output has to look like a compiler's,
+// otherwise the diagnosis compaction (which keys off file:line:col) is useless.
+func TestCheckGoSyntax_ReportsPosition(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "ok.go"), []byte("package m\n\nfunc F() int { return 1 }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "bad.go"), []byte("package m\n\nfunc Broken( {\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sb, err := NewSandbox(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res := sb.checkGoSyntax("ok.go"); res.ExitCode != 0 || res.Stderr != "" {
+		t.Fatalf("valid file reported %+v", res)
+	}
+	res := sb.checkGoSyntax("bad.go")
+	if res.ExitCode == 0 {
+		t.Fatal("broken file must exit non-zero")
+	}
+	if !strings.Contains(res.Stderr, "bad.go:3:") {
+		t.Fatalf("diagnostics should carry file:line:col, got %q", res.Stderr)
+	}
+	if res := sb.checkGoSyntax("missing.go"); res.ExitCode == 0 {
+		t.Fatal("missing file must exit non-zero")
+	}
+}
+
+// TestRunEditCheckCommands_DispatchesBuiltin is the point of the fallback: a
+// parse check runs with the shell disabled, and a mixed list does not need the
+// shell for its builtin entries.
+func TestRunEditCheckCommands_DispatchesBuiltin(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module m\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "bad.go"), []byte("package m\n\nfunc Broken( {\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sb, err := NewSandbox(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sb.DisableTool(ToolRunBash, "test: no shell")
+
+	ok := sb.RunEditCheckCommands(context.Background(), ProjectGo, []string{builtinGoSyntaxPrefix + "bad.go"}, time.Second)
+	if ok.Skipped != "" {
+		t.Fatalf("builtin must not be skipped for lack of a shell: %+v", ok)
+	}
+	if !ok.Ran() || !ok.Failed || !ok.SyntaxOnly() {
+		t.Fatalf("builtin check result = %+v", ok)
+	}
+	if !strings.Contains(ok.Block(), "FAILED") || !strings.Contains(ok.Block(), "bad.go:3") {
+		t.Fatalf("block should carry the failure:\n%s", ok.Block())
+	}
+}
+
+// TestEditCheck_SyntaxOnlyWording keeps the pass message honest: a parse is not
+// a build, and the model must not read it as one.
+func TestEditCheck_SyntaxOnlyWording(t *testing.T) {
+	parse := EditCheck{Commands: []string{builtinGoSyntaxPrefix + "a.go"}}
+	if !parse.SyntaxOnly() {
+		t.Fatal("parse-only check should report SyntaxOnly")
+	}
+	if block := parse.Block(); !strings.Contains(block, "Syntax parses") || strings.Contains(block, "compile/type errors") {
+		t.Fatalf("parse-only block must not claim a build: %q", block)
+	}
+	build := EditCheck{Commands: []string{"go build ."}}
+	if build.SyntaxOnly() {
+		t.Fatal("a shell build is not syntax-only")
+	}
+	if block := build.Block(); !strings.Contains(block, "No compile/type errors") {
+		t.Fatalf("build block wording changed: %q", block)
+	}
+	mixed := EditCheck{Commands: []string{builtinGoSyntaxPrefix + "a.go", "go build ."}}
+	if mixed.SyntaxOnly() {
+		t.Fatal("a mixed list includes a real build")
 	}
 }
