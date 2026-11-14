@@ -491,7 +491,14 @@ func (s *Sandbox) callTool(ctx context.Context, name string, args map[string]any
 		if err != nil {
 			return "", err
 		}
-		return formatExec(res), nil
+		out := formatExec(res)
+		// A refused write must not read like a build error. The sandbox layer
+		// only knows the syscall text; naming the writable alternative is what
+		// turns "operation not permitted" into an actionable next step.
+		if hint := SandboxDenialHint(res.Stdout, res.Stderr); hint != "" {
+			out += "\n" + hint
+		}
+		return out, nil
 
 	case ToolSearchFiles:
 		pattern, err := requireString(args, "pattern")
