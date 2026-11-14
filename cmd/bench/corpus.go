@@ -19,11 +19,18 @@ import "strings"
 // Goal is one benchmark task. Seed files land in a fresh workspace before the
 // run; the prompt is the goal divvy receives; Module is the go module name
 // seeded via `go mod init` (empty means the goal runs in a generic workspace).
+//
+// Accept is the command that decides the goal objectively. Tree mode gets its
+// acceptance from the plan's DoD, so Accept is unused there; direct mode has no
+// task contract, so the harness runs this itself once the loop returns. That is
+// the only fair way to compare the two loops: same goal, same command, same
+// workspace state.
 type Goal struct {
 	Name   string
 	Module string
 	Prompt string
 	Seed   map[string]string
+	Accept string
 }
 
 // Corpus is the fixed goal set. Keep it small: a full bench pass costs real
@@ -41,6 +48,7 @@ var Corpus = []Goal{
 			"WordCount(s string) int 统计英文单词数。" +
 			"为每个函数写表驱动单元测试，覆盖空字符串、大小写混合、含标点的输入。" +
 			"只用标准库。",
+		Accept: "go build ./... && go test ./...",
 	},
 	{
 		Name:   "fix-average",
@@ -48,6 +56,7 @@ var Corpus = []Goal{
 		Prompt: "workspace 里的 calc 包有 bug：Average 的除数是差一错误，且对空切片会得到 NaN。" +
 			"修复它，使 Average 对空切片返回 0、对非空切片返回正确平均值，" +
 			"并让 go test ./... 全部通过。不要改动测试文件。",
+		Accept: "go test ./...",
 		Seed: map[string]string{
 			"calc.go": `package calc
 
@@ -89,12 +98,14 @@ func TestAverage(t *testing.T) {
 		Module: "healthsrv",
 		Prompt: "用 Go 写一个 HTTP 服务：监听 :18080，GET /health 返回 200 和字符串 ok，" +
 			"其它方法返回 405；并写单元测试。只用标准库。",
+		Accept: "go build ./... && go test ./...",
 	},
 	{
 		Name: "cmake-add",
 		Prompt: "用 CMake/C++ 实现 add(int,int)，写 CMakeLists.txt、src/add.cpp、src/add.h、tests/test_add.cpp；" +
 			"用 ctest 跑通（ctest --test-dir build --output-on-failure -R add）。" +
 			"不要依赖网络；构建目录必须是 build/。",
+		Accept: "ctest --test-dir build --output-on-failure -R add",
 		Seed: map[string]string{
 			"CMakeLists.txt": "cmake_minimum_required(VERSION 3.14)\n" +
 				"project(addlib LANGUAGES CXX)\n" +

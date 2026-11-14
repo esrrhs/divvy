@@ -22,17 +22,31 @@ go run ./cmd/bench -base-url https://api.example.com/v1 -model small-model -api-
 
 ## 语料库
 
-固定、版本化在 `cmd/bench/corpus.go` 里——基准的目标集一旦漂移，跨运行的比较就失去意义。三个目标覆盖三种任务形态：
+固定、版本化在 `cmd/bench/corpus.go` 里——基准的目标集一旦漂移，跨运行的比较就失去意义。四个目标覆盖四种任务形态：
 
-| 目标 | 形态 | 验收方式 |
+| 目标 | 形态 | 验收命令（`Goal.Accept`） |
 |---|---|---|
-| `string-utils` | 从零创建包（3 个函数 + 表驱动测试） | `go build` + `go test` |
-| `fix-average` | 修复 seeded 差一 bug（含空切片 NaN） | 修复后 `go test` 通过 |
-| `http-health` | 构建可运行 HTTP 服务 + 单测 | 构建 + 测试通过 |
+| `string-utils` | 从零创建包（3 个函数 + 表驱动测试） | `go build ./... && go test ./...` |
+| `fix-average` | 修复 seeded 差一 bug（含空切片 NaN） | `go test ./...` |
+| `http-health` | 构建可运行 HTTP 服务 + 单测 | `go build ./... && go test ./...` |
+| `cmake-add` | CMake/C++ 目标 + ctest | `ctest --test-dir build --output-on-failure -R add` |
 
 选 Go 是因为它是唯一能**完全离线自验收**的栈（`go build`/`go test` 不需要网络），基准因此是 hermetic 的：结果差异只来自模型和引擎，不来自外部服务抖动。
 
 `fix-average` 的 workspace 自带一个**会失败**的测试——harness 测试（`TestBench_SeedWorkspaceIsolomorphic`）守着这条不变量：如果语料本身不失败，这个目标就退化成了"从零创建"，基准失去区分度。它同时考察引擎最核心的弱模型能力：读失败输出 → 定位 → 最小修复。
+
+## 测哪个循环（`-loop tree|direct`）
+
+```bash
+go run ./cmd/bench -loop direct -goals fix-average -repeat 3
+```
+
+- **tree**（默认）：拆解 → 叶子 → 叶子 DoD 验收 → 根目标集成验收。成败由计划里的 DoD 决定，是引擎自己判的。
+- **direct**：一段持久工具转录，没有计划、没有叶子、没有契约。`NewDirect(o, nil).Run(ctx)` 返回后，harness 自己跑 `Goal.Accept`——直接模式没有别的东西可以裁判它，靠模型自述完成度就是在测提示词而不是测能力。
+
+同一条验收命令、同一套种子工作区，所以两行数字可以直接比较；差别只在"谁来跑验收"。报告里带 `loop` 字段，混跑的报告不会互相冒充。
+
+非 Linux 宿主没有 bubblewrap/landlock，`run_bash` 直接不可用：直接模式的验收会标成 `skip` 并写明原因（`ACPT` 列），这一行**不算已验证**。测试 `TestBench_DirectLoopDrivesGoal` 特意做成不依赖 shell（脚本模型 + `write_file` + `finish`），这样 harness 本身在任何平台都能被验证，而验收只在能执行的地方发生。
 
 ## 采集的指标
 
