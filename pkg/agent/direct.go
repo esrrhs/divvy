@@ -646,6 +646,9 @@ func (d *DirectAgent) loop(ctx context.Context) error {
 		}
 
 		actions, incompleteHint := collectActions(resp)
+		canonicalizeToolNames(actions, func(name string) bool {
+			return d.mcp != nil && d.mcp.HasTool(name)
+		})
 		if incompleteHint != "" {
 			d.st.Messages = append(d.st.Messages,
 				llm.Message{Role: llm.RoleAssistant, Content: resp.Content},

@@ -242,7 +242,10 @@ func (o *Orchestrator) baselineAggregate(ctx context.Context) error {
 	node := &models.TaskNode{ID: waveAggregateNodeID, DoD: models.DoD{
 		Commands: cmds, TimeoutSec: waveAggregateTimeout,
 	}}
-	vr := o.verify(ctx, o.sandbox, node)
+	// Recorded as a baseline probe, not as a verification of anyone's work:
+	// a seeded-bug target fails here by design, and that must not show up as
+	// a verify failure in the run report.
+	vr := o.verifyAs(ctx, o.sandbox, node, "wave_baseline")
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}

@@ -590,6 +590,7 @@ func (s *soloSession) runRound(ctx context.Context, steps int) (summary string, 
 		o.log.Debugf("solo raw: %s", truncate(resp.Content, 400))
 
 		actions, incompleteHint := collectActions(resp)
+		canonicalizeToolNames(actions, nil)
 		if incompleteHint != "" {
 			s.msgs = append(s.msgs,
 				llm.Message{Role: llm.RoleAssistant, Content: resp.Content},
