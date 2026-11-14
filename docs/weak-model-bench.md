@@ -30,11 +30,14 @@ go run ./cmd/bench -base-url https://api.example.com/v1 -model small-model -api-
 | `fix-average` | 修复 seeded 差一 bug（含空切片 NaN） | `go test ./...` |
 | `http-health` | 构建可运行 HTTP 服务 + 单测 | `go build ./... && go test ./...` |
 | `config-cli` | **多文件**：契约测试 + 3 个职责不同的文件（config.go / run.go / main.go） | `go build ./... && go test ./...` |
+| `merge-intervals` | **恢复成本**：区间合并的经典相邻 off-by-one（契约在测试里，提示词不说 bug 在哪） | `go build ./... && go test ./...` |
 | `cmake-add` | CMake/C++ 目标 + ctest | `ctest --test-dir build --output-on-failure -R add` |
 
 选 Go 是因为它是唯一能**完全离线自验收**的栈（`go build`/`go test` 不需要网络），基准因此是 hermetic 的：结果差异只来自模型和引擎，不来自外部服务抖动。
 
 `fix-average` 的 workspace 自带一个**会失败**的测试——harness 测试（`TestBench_SeedWorkspaceIsolomorphic`）守着这条不变量：如果语料本身不失败，这个目标就退化成了"从零创建"，基准失去区分度。它同时考察引擎最核心的弱模型能力：读失败输出 → 定位 → 最小修复。
+
+`merge-intervals` 是**恢复成本**的专用目标。其它目标弱模型基本一次就做对，于是引擎的恢复机制（叶子重试 → 根验收回路由 → 验收门加宽）从不真正跑起来，"用工程约束而不是模型聪明程度把复杂目标做完"这个立论也就没被测过。这个目标的 seeded 实现带着一个经典 off-by-one：把"end + 1"当成重叠，于是 `[1,2]` 和 `[3,4]` 被合成 `[1,4]`。**提示词不说 bug 在哪**——契约写在测试里，模型得自己对上；而且把比较改错方向（`>=`）会弄坏"共享端点"那条用例，于是得再来一轮。`TestBench_MergeIntervalsSeedFailsFirst` 守住"seeded workspace 确实以相邻区间那条失败"。
 
 `config-cli` 是唯一**逼着拆**的目标：契约写在一个只有测试、没有实现的 workspace 里，提示词要求把实现分到 `config.go` / `run.go` / `main.go` 三个文件。它同时补上了另一个缺口——前面四个目标都是"单文件、可一次做完"，树模式的拆解成本在那里永远摊不开，`direct vs tree` 也就只能比较"最小修复"这一类。
 

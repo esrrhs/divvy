@@ -113,6 +113,94 @@ func TestAverage(t *testing.T) {
 		},
 	},
 	{
+		// The recovery goal: the other corpus entries are tasks a weak model
+		// gets right on the first try, so the engine's recovery machinery never
+		// runs and the project's thesis ("engineering constraints, not model
+		// cleverness, carry complex goals") is never actually exercised.
+		//
+		// The seeded bug is the classic adjacent-interval off-by-one: the
+		// implementation treats "end + 1" as overlapping, so [1,2] and [3,4]
+		// come back as [1,4]. The prompt does NOT say where the bug is — the
+		// test states the contract and the model has to reconcile the code
+		// with it. A model that "fixes" the comparison the wrong way breaks
+		// the sharing-an-endpoint case and has to go round again, which is
+		// exactly the cost worth measuring.
+		Name:   "merge-intervals",
+		Module: "ivmerge",
+		Prompt: "workspace 里的 merge.go 实现了区间合并 Merge，但它是错的：跑 go test ./... 会失败。" +
+			"读 merge_test.go（它定义了契约），修好 merge.go，让 go test ./... 通过。不要修改 merge_test.go。",
+		Accept: "go build ./... && go test ./...",
+		Guard:  []string{"merge_test.go"},
+		Seed: map[string]string{
+			"merge.go": `package ivmerge
+
+// Interval is a closed interval [Start, End].
+type Interval struct {
+	Start int
+	End   int
+}
+
+// Merge merges the overlapping intervals of in into disjoint intervals,
+// ordered by Start. The input is sorted by Start.
+//
+// Adjacent intervals — the end of one plus one is the start of the next — do
+// not overlap and stay separate.
+func Merge(in []Interval) []Interval {
+	out := make([]Interval, 0, len(in))
+	for _, iv := range in {
+		if len(out) == 0 {
+			out = append(out, iv)
+			continue
+		}
+		last := &out[len(out)-1]
+		if iv.Start > last.End+1 {
+			out = append(out, iv)
+			continue
+		}
+		if iv.End > last.End {
+			last.End = iv.End
+		}
+	}
+	return out
+}
+`,
+			"merge_test.go": `package ivmerge
+
+import "testing"
+
+func TestMerge(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []Interval
+		want []Interval
+	}{
+		{"empty", nil, nil},
+		{"single", []Interval{{1, 5}}, []Interval{{1, 5}}},
+		{"overlapping", []Interval{{1, 3}, {2, 6}}, []Interval{{1, 6}}},
+		{"sharing an endpoint", []Interval{{1, 3}, {3, 5}}, []Interval{{1, 5}}},
+		{"adjacent is not overlapping", []Interval{{1, 2}, {3, 4}}, []Interval{{1, 2}, {3, 4}}},
+		{"a gap", []Interval{{1, 2}, {5, 6}}, []Interval{{1, 2}, {5, 6}}},
+		{"nested", []Interval{{1, 10}, {2, 3}}, []Interval{{1, 10}}},
+		{"a run then a gap", []Interval{{1, 3}, {2, 4}, {6, 7}}, []Interval{{1, 4}, {6, 7}}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := Merge(c.in)
+			if len(got) != len(c.want) {
+				t.Fatalf("Merge(%v) = %v, want %v", c.in, got, c.want)
+			}
+			for i := range got {
+				if got[i] != c.want[i] {
+					t.Fatalf("Merge(%v) = %v, want %v", c.in, got, c.want)
+				}
+			}
+		})
+	}
+}
+`,
+		},
+	},
+	{
 		Name:   "http-health",
 		Module: "healthsrv",
 		Prompt: "用 Go 写一个 HTTP 服务：监听 :18080，GET /health 返回 200 和字符串 ok，" +

@@ -502,6 +502,28 @@ func TestBench_ConfigCLISeedFailsFirst(t *testing.T) {
 	}
 }
 
+// TestBench_MergeIntervalsSeedFailsFirst keeps the recovery goal honest: the
+// seeded workspace must fail before the model changes anything, and it must
+// fail for the reason the goal exists for. Otherwise a "pass" would say
+// nothing about recovery.
+func TestBench_MergeIntervalsSeedFailsFirst(t *testing.T) {
+	g, ok := goalByName("merge-intervals")
+	if !ok {
+		t.Fatal("corpus is missing the merge-intervals goal")
+	}
+	dir := t.TempDir()
+	if err := g.seedWorkspace(dir); err != nil {
+		t.Fatal(err)
+	}
+	out, err := runCmd(dir, "go", "test", "./...")
+	if err == nil {
+		t.Fatalf("the seeded workspace must fail before the model touches it:\n%s", out)
+	}
+	if !strings.Contains(string(out), "adjacent") {
+		t.Fatalf("the failure must name the adjacent-interval case, got:\n%s", out)
+	}
+}
+
 // TestBench_GuardCatchesEditedTaskFile: the contract test is the verdict, so
 // editing it must not count as success.
 func TestBench_GuardCatchesEditedTaskFile(t *testing.T) {
