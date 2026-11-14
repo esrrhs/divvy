@@ -410,6 +410,13 @@ func (d *DirectAgent) Run(ctx context.Context) (runErr error) {
 	if err := d.setupIsolation(); err != nil {
 		return err
 	}
+	// Seed the stale-read gate from the previous turn: a file the model read
+	// last turn is still "seen" even though the sandbox is new, and an edit
+	// written against a version that has since changed gets refused instead
+	// of landing in the wrong place.
+	if d.sb != nil && d.st != nil {
+		d.sb.RestoreObserved(d.st.Observed)
+	}
 	defer func() {
 		if d.keepMirror(runErr) {
 			return
@@ -1245,6 +1252,21 @@ func (d *DirectAgent) persist() error {
 	if d.st == nil {
 		return nil
 	}
+	if d.sb != nil {
+		// Keep the observed digests with the transcript so the next turn can
+		// still tell "the model has seen this file" from "the model has seen
+		// an older copy of it". Merging (not replacing) matters when a mirror
+		// is closed before this runs: the discarded sandbox is not the whole
+		// story, and losing the record would silently reopen the gate.
+		if obs := d.sb.ObservedFiles(); len(obs) > 0 {
+			if d.st.Observed == nil {
+				d.st.Observed = make(map[string]string, len(obs))
+			}
+			for k, v := range obs {
+				d.st.Observed[k] = v
+			}
+		}
+	}
 	return saveDirectState(d.transcriptPath(), d.st, d.secretValues()...)
 }
 
@@ -1353,6 +1375,7 @@ func directSystemGuide(sb *tools.Sandbox, dataDir string) string {
 	}
 	b.WriteString("search_files and find_files are literal regex/glob matching, not a semantic index.\n")
 	b.WriteString("Prefer replace_lines over write_file for edits: give one unique old_string anchor and the replacement. Indentation, trailing whitespace and read_file line numbers in the anchor are tolerated, but it must still match exactly one place; when it does not, the error quotes the closest lines — fix the anchor from that, do not resend the same one.\n")
+	b.WriteString("If an edit is refused with [stale-read], the file changed after you last read it — someone else edited it, or a command rewrote it. The same anchor may still match, which is exactly how an edit lands in the wrong place. Do not retry it: read the file again and edit against the content that is there now.\n")
 	b.WriteString("If a user follow-up arrives mid-loop, honor it from the next step; do not restart the whole task from scratch.\n")
 	b.WriteString("When the work for this turn is done, call finish with a concise, factual summary written for the user — that text is your reply. Do not call finish just to narrate a failed check; repair first.\n")
 	b.WriteString(directPlanGuide())
@@ -1379,6 +1402,7 @@ func directSystemFor(web bool, dynamicTools string) string {
 	b.WriteString("After write_file/replace_lines, a compile/type check for the edited package runs automatically and its result is appended to that tool output as [auto-verify]. Do not re-run the same build only to confirm it; fix the reported errors instead. finish is refused while that check still fails.\n")
 	b.WriteString("search_files and find_files are literal regex/glob matching, not a semantic index.\n")
 	b.WriteString("Prefer replace_lines over write_file for edits: give one unique old_string anchor and the replacement. Indentation, trailing whitespace and read_file line numbers in the anchor are tolerated, but it must still match exactly one place; when it does not, the error quotes the closest lines — fix the anchor from that, do not resend the same one.\n")
+	b.WriteString("If an edit is refused with [stale-read], the file changed after you last read it — someone else edited it, or a command rewrote it. The same anchor may still match, which is exactly how an edit lands in the wrong place. Do not retry it: read the file again and edit against the content that is there now.\n")
 	b.WriteString("If a user follow-up arrives mid-loop, honor it from the next step; do not restart the whole task from scratch.\n")
 	b.WriteString("When the work for this turn is done, call finish with a concise, factual summary written for the user — that text is your reply. Do not call finish just to narrate a failed check; repair first.\n")
 	b.WriteString(directPlanGuide())
@@ -1634,6 +1658,11 @@ type directState struct {
 	// Plan is the model-maintained task list for this turn. It survives
 	// resume, resets when a new follow-up starts, and gates finish.
 	Plan []directPlanItem `json:"plan,omitempty"`
+	// Observed maps workspace-relative paths to the sha256 of the content
+	// the model has seen, carried across turns so the stale-read gate still
+	// refuses an edit anchored on a version that has since changed. Keyed
+	// by relative path so it survives a mirror swap.
+	Observed map[string]string `json:"observed,omitempty"`
 }
 
 type directInFlight struct {
