@@ -20,3 +20,6 @@ ws_*/
 # Benchmark runs (divvy-bench): workspaces are kept on purpose so a failed
 # goal can be dissected with git diff, but they must not show up as untracked.
 bench-runs/
+
+# Benchmark binary built from cmd/bench (go build -o bench ./cmd/bench)
+/bench
