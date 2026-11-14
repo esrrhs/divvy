@@ -256,3 +256,132 @@ func TestBench_SelectGoalsFilters(t *testing.T) {
 		t.Errorf("unknown goal should select nothing, got %+v", got)
 	}
 }
+
+// scriptedDirectClient drives the direct loop without a model: two writes then
+// finish, the same shape the tree test's scripted worker uses. It never asks
+// for shell execution, so the harness itself can be exercised on hosts without
+// an isolation backend (the acceptance step then reports "not run").
+func scriptedDirectClient() llm.Client {
+	step := 0
+	return &llm.ScriptedClient{Handle: func(_ context.Context, req llm.Request) (*llm.Response, error) {
+		step++
+		var action map[string]any
+		switch step {
+		case 1:
+			action = map[string]any{
+				"thought": "create the package",
+				"action":  "write_file",
+				"args": map[string]any{
+					"path": "strutil.go",
+					"content": "package strutil\n\nimport \"strings\"\n\n" +
+						"// Reverse returns s with its runes reversed.\n" +
+						"func Reverse(s string) string {\n\tr := []rune(s)\n" +
+						"\tfor i, j := 0, len(r)-1; i < j; i, j = i+1, j-1 {\n\t\tr[i], r[j] = r[j], r[i]\n\t}\n\treturn string(r)\n}\n\n" +
+						"// WordCount counts whitespace-separated words.\nfunc WordCount(s string) int { return len(strings.Fields(s)) }\n",
+				},
+			}
+		case 2:
+			action = map[string]any{
+				"thought": "add tests",
+				"action":  "write_file",
+				"args": map[string]any{
+					"path": "strutil_test.go",
+					"content": "package strutil\n\nimport \"testing\"\n\n" +
+						"func TestReverse(t *testing.T) {\n\tif got := Reverse(\"ab\"); got != \"ba\" {\n\t\tt.Fatalf(\"got %q\", got)\n\t}\n}\n\n" +
+						"func TestWordCount(t *testing.T) {\n\tif got := WordCount(\"a b\"); got != 2 {\n\t\tt.Fatalf(\"got %d\", got)\n\t}\n}\n",
+				},
+			}
+		default:
+			action = map[string]any{
+				"thought": "package and tests are in place",
+				"action":  "finish",
+				"args":    map[string]any{"summary": "implemented strutil in direct mode"},
+			}
+		}
+		return &llm.Response{
+			Content: mustJSON(action),
+			Usage:   llm.Usage{PromptTokens: 300, CompletionTokens: 150},
+		}, nil
+	}}
+}
+
+// TestBench_DirectLoopDrivesGoal is the direct-mode counterpart of
+// TestBench_GoalRunEndToEnd: the harness must be able to run the persistent
+// tool loop against a seeded workspace and account for it. It deliberately
+// does not require shell execution — on hosts where run_bash is unavailable the
+// acceptance step reports ran=false, and the row must say so rather than claim
+// a verified success.
+func TestBench_DirectLoopDrivesGoal(t *testing.T) {
+	g, ok := goalByName("string-utils")
+	if !ok {
+		t.Fatal("corpus is missing the string-utils goal")
+	}
+	bc := benchConfig{
+		Model:      "scripted",
+		Loop:       loopDirect,
+		MaxSteps:   10,
+		MaxRetries: 1,
+		Timeout:    3 * time.Minute,
+		Root:       t.TempDir(),
+		Pricing:    cost.DefaultPricing(),
+		newClient:  func(agent.Config) llm.Client { return scriptedDirectClient() },
+	}
+
+	res := runGoal(context.Background(), g, 1, bc)
+	if res.Loop != loopDirect {
+		t.Fatalf("loop = %q, want %q", res.Loop, loopDirect)
+	}
+	if !res.OK {
+		t.Fatalf("direct run failed: ok=%v error=%q (workspace %s)", res.OK, res.Error, res.Workdir)
+	}
+	for _, f := range []string{"strutil.go", "strutil_test.go"} {
+		if _, err := os.Stat(filepath.Join(res.Workdir, f)); err != nil {
+			t.Fatalf("expected %s in the workspace: %v", f, err)
+		}
+	}
+	if res.LLMCalls < 3 {
+		t.Errorf("LLMCalls = %d, want >= 3 (2 writes + finish)", res.LLMCalls)
+	}
+	if res.TotalTokens <= 0 {
+		t.Errorf("token accounting missing: %+v", res)
+	}
+	// Acceptance must be either genuinely attempted or explicitly refused;
+	// silently reporting neither is the failure mode this guards.
+	if res.AcceptRan && !res.AcceptOK {
+		t.Errorf("acceptance ran and failed: %s", res.AcceptOut)
+	}
+	if !res.AcceptRan && res.AcceptOut == "" {
+		t.Error("skipped acceptance must carry the reason")
+	}
+}
+
+// TestBench_NormalizeLoop locks -loop parsing: unknown values must be an error,
+// not a silent fallback that measures the wrong loop.
+func TestBench_NormalizeLoop(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"", loopTree},
+		{"tree", loopTree},
+		{"guided", loopTree},
+		{"direct", loopDirect},
+		{" DIRECT ", loopDirect},
+	} {
+		got, err := normalizeLoop(tc.in)
+		if err != nil || got != tc.want {
+			t.Fatalf("normalizeLoop(%q) = %q,%v want %q", tc.in, got, err, tc.want)
+		}
+	}
+	if _, err := normalizeLoop("magic"); err == nil {
+		t.Fatal("unknown loop must be rejected")
+	}
+}
+
+// TestBench_CorpusDeclaresAcceptance keeps the direct-mode verdict honest:
+// every goal must carry the command that decides it, otherwise a direct run
+// could only be scored by the model's own claim.
+func TestBench_CorpusDeclaresAcceptance(t *testing.T) {
+	for _, g := range Corpus {
+		if strings.TrimSpace(g.Accept) == "" {
+			t.Errorf("goal %q declares no acceptance command", g.Name)
+		}
+	}
+}

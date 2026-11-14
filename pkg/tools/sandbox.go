@@ -389,32 +389,35 @@ func (s *Sandbox) ReplaceLines(path string, start, end int, content string) erro
 
 // ReplaceText replaces old with new. If replaceAll is false, old must occur exactly once.
 func (s *Sandbox) ReplaceText(path, old, new string, replaceAll bool) error {
+	_, err := s.ReplaceTextDetail(path, old, new, replaceAll)
+	return err
+}
+
+// ReplaceTextDetail is ReplaceText plus a note describing how the anchor
+// matched (empty when it matched byte-exactly). The note is surfaced in the
+// tool result so a model that keeps sending sloppy anchors can see that the
+// engine had to compensate for it.
+func (s *Sandbox) ReplaceTextDetail(path, old, new string, replaceAll bool) (string, error) {
 	if old == "" {
-		return fmt.Errorf("old_string must not be empty")
+		return "", fmt.Errorf("old_string must not be empty")
 	}
 	abs, err := s.Resolve(path)
 	if err != nil {
-		return err
+		return "", err
 	}
 	raw, err := os.ReadFile(abs)
 	if err != nil {
-		return err
+		return "", err
 	}
-	text := string(raw)
-	n := strings.Count(text, old)
-	if n == 0 {
-		return fmt.Errorf("old_string not found in %s", path)
+	text, eol := normalizeEOL(string(raw))
+	out, note, err := applyAnchorEdit(text, alignToEOL(old, eol), alignToEOL(new, eol), replaceAll, path)
+	if err != nil {
+		return "", err
 	}
-	if !replaceAll && n != 1 {
-		return fmt.Errorf("old_string occurs %d times in %s; make it unique or set replace_all", n, path)
+	if err := os.WriteFile(abs, []byte(restoreEOL(out, eol)), 0644); err != nil {
+		return "", err
 	}
-	var out string
-	if replaceAll {
-		out = strings.ReplaceAll(text, old, new)
-	} else {
-		out = strings.Replace(text, old, new, 1)
-	}
-	return os.WriteFile(abs, []byte(out), 0644)
+	return note, nil
 }
 
 // TextEdit is one exact-string replacement in a ReplaceTexts batch.
@@ -429,36 +432,42 @@ type TextEdit struct {
 // missing or ambiguous anchor in any edit therefore leaves the file
 // completely untouched, so a multi-edit call can never half-apply.
 func (s *Sandbox) ReplaceTexts(path string, edits []TextEdit, replaceAll bool) error {
+	_, err := s.ReplaceTextsDetail(path, edits, replaceAll)
+	return err
+}
+
+// ReplaceTextsDetail is ReplaceTexts plus a note about loose anchor matches.
+func (s *Sandbox) ReplaceTextsDetail(path string, edits []TextEdit, replaceAll bool) (string, error) {
 	if len(edits) == 0 {
-		return fmt.Errorf("edits must contain at least one edit")
+		return "", fmt.Errorf("edits must contain at least one edit")
 	}
 	abs, err := s.Resolve(path)
 	if err != nil {
-		return err
+		return "", err
 	}
 	raw, err := os.ReadFile(abs)
 	if err != nil {
-		return err
+		return "", err
 	}
-	text := string(raw)
+	text, eol := normalizeEOL(string(raw))
+	var notes []string
 	for i, ed := range edits {
 		if ed.Old == "" {
-			return fmt.Errorf("edits[%d]: old_string must not be empty", i)
+			return "", fmt.Errorf("edits[%d]: old_string must not be empty", i)
 		}
-		n := strings.Count(text, ed.Old)
-		if n == 0 {
-			return fmt.Errorf("edits[%d]: old_string not found in %s", i, path)
+		out, note, err := applyAnchorEdit(text, alignToEOL(ed.Old, eol), alignToEOL(ed.New, eol), replaceAll, path)
+		if err != nil {
+			return "", fmt.Errorf("edits[%d]: %w", i, err)
 		}
-		if !replaceAll && n != 1 {
-			return fmt.Errorf("edits[%d]: old_string occurs %d times in %s; make it unique or set replace_all", i, n, path)
-		}
-		if replaceAll {
-			text = strings.ReplaceAll(text, ed.Old, ed.New)
-		} else {
-			text = strings.Replace(text, ed.Old, ed.New, 1)
+		text = out
+		if note != "" {
+			notes = append(notes, fmt.Sprintf("edits[%d] %s", i, note))
 		}
 	}
-	return os.WriteFile(abs, []byte(text), 0644)
+	if err := os.WriteFile(abs, []byte(restoreEOL(text, eol)), 0644); err != nil {
+		return "", err
+	}
+	return strings.Join(notes, "; "), nil
 }
 
 // DeletePath removes a workspace file or directory. Directories require

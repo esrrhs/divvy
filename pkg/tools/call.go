@@ -257,7 +257,7 @@ func NativeTools() []map[string]any {
 			"path":    str("Relative file path"),
 			"content": str("Full file contents"),
 		}, []string{"path", "content"})),
-		fn(ToolReplaceLines, "Replace a line range, an exact string, or atomically apply several exact-string edits (all must match or the file is untouched).", obj(map[string]any{
+		fn(ToolReplaceLines, "Replace a line range, an exact string, or atomically apply several exact-string edits (all must match or the file is untouched). old_string may be copied from read_file output: line-number prefixes, indentation and trailing whitespace are tolerated, but the anchor must still match exactly one place.", obj(map[string]any{
 			"path":        str("Relative file path"),
 			"start_line":  map[string]any{"type": "integer"},
 			"end_line":    map[string]any{"type": "integer"},
@@ -404,16 +404,24 @@ func (s *Sandbox) Call(ctx context.Context, name string, args map[string]any) (s
 				return "", err
 			}
 			all := boolArg(args, "replace_all", false)
-			if err := s.ReplaceTexts(path, edits, all); err != nil {
+			note, err := s.ReplaceTextsDetail(path, edits, all)
+			if err != nil {
 				return "", err
+			}
+			if note != "" {
+				return fmt.Sprintf("applied %d edit(s) in %s (%s)", len(edits), path, note), nil
 			}
 			return fmt.Sprintf("applied %d edit(s) in %s", len(edits), path), nil
 		}
 		if old, ok := stringArg(args, "old_string"); ok && old != "" {
 			neu, _ := stringArg(args, "new_string")
 			all := boolArg(args, "replace_all", false)
-			if err := s.ReplaceText(path, old, neu, all); err != nil {
+			note, err := s.ReplaceTextDetail(path, old, neu, all)
+			if err != nil {
 				return "", err
+			}
+			if note != "" {
+				return fmt.Sprintf("replaced text in %s (%s)", path, note), nil
 			}
 			return fmt.Sprintf("replaced text in %s", path), nil
 		}

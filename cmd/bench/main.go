@@ -44,13 +44,14 @@ func run(args []string) error {
 	parallel := fs.Int("parallel", 1, "concurrent leaves per run")
 	isolate := fs.Bool("isolate", true, "run leaves in isolated mirrors, merge on success")
 	gitCommit := fs.Bool("git-commit", true, "commit each leaf's changes (requires git)")
+	loop := fs.String("loop", loopTree, "engine loop to measure: tree (plan + verify) or direct (persistent tool loop)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
 	if *list {
 		for _, g := range Corpus {
-			fmt.Printf("%-14s module=%-10s %s\n", g.Name, g.Module, firstLine(g.Prompt))
+			fmt.Printf("%-14s module=%-10s accept=%-22s %s\n", g.Name, g.Module, g.Accept, firstLine(g.Prompt))
 		}
 		return nil
 	}
@@ -64,6 +65,10 @@ func run(args []string) error {
 	}
 	if *maxSteps < 1 || *maxRetries < 1 {
 		return fmt.Errorf("-max-steps and -max-retries must be >= 1")
+	}
+	loopName, err := normalizeLoop(*loop)
+	if err != nil {
+		return err
 	}
 
 	rootDir := *root
@@ -95,6 +100,7 @@ func run(args []string) error {
 		GitCommit:  *gitCommit,
 		Timeout:    *timeout,
 		Root:       rootDir,
+		Loop:       loopName,
 		Pricing:    cost.DefaultPricing(),
 	}
 
@@ -102,10 +108,11 @@ func run(args []string) error {
 		Model:   *model,
 		BaseURL: *baseURL,
 		Extra:   *extra,
+		Loop:    loopName,
 		Started: time.Now(),
 	}
-	fmt.Printf("divvy-bench: model=%s endpoint=%s goals=%d repeat=%d root=%s\n",
-		*model, *baseURL, len(selected), *repeat, rootDir)
+	fmt.Printf("divvy-bench: model=%s endpoint=%s loop=%s goals=%d repeat=%d root=%s\n",
+		*model, *baseURL, loopName, len(selected), *repeat, rootDir)
 
 	var results []RunResult
 	for rep := 1; rep <= *repeat; rep++ {
@@ -117,6 +124,16 @@ func run(args []string) error {
 			res := runGoal(ctx, g, rep, bc)
 			fmt.Printf("--- %s: ok=%v wall=%s calls=%d tokens=%d leaves=%d/%d\n",
 				res.Goal, res.OK, res.Wall(), res.LLMCalls, res.TotalTokens, res.LeavesDone, res.Leaves)
+			if res.Loop == loopDirect {
+				switch {
+				case !res.AcceptRan:
+					fmt.Printf("    acceptance: not run (%s)\n", oneLine(res.AcceptOut))
+				case res.AcceptOK:
+					fmt.Printf("    acceptance: passed\n")
+				default:
+					fmt.Printf("    acceptance: FAILED %s\n", res.AcceptOut)
+				}
+			}
 			if res.Error != "" {
 				fmt.Printf("    error: %s\n", res.Error)
 			}

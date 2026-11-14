@@ -118,7 +118,7 @@ export OPENAI_MODEL=qwen2.5-coder:14b
 
 两者和直接模式的项目地图都尊重仓库的 git ignore 规则（根/嵌套 `.gitignore`、negation、`.git/info/exclude`）：构建产物、日志和本地私有目录不会淹没检索结果；`find_symbol` 的定义扫描、注入提示的 workspace 清单也同样过滤。`read_file` / `list_dir` 不过滤，仍可显式查看被忽略的文件。
 `read_file` 支持可选的 `start_line`/`end_line`（1-indexed、含端点，返回带行号的片段）：配合 `search_files` 的行号只读目标区段，大文件也能直接跳到 64KB 整读截断点之后，无需在 shell 里拼 `sed`。也支持 `{"paths":["a.go","b.go"]}` **一次批量读最多 8 个文件**（各自独立套 64KB 上限，带 `### path` 分隔头）——弱模型每轮只能调一个工具，批量读把"看 N 个相关文件"从 N 次 LLM 往返压成 1 次；任一路径不存在则整批失败，不会返回半截结果。`run_bash` 支持 `timeout_sec`（默认 60s），跑 `npm install`、`cargo build` 这类慢命令时显式放大超时。
-`replace_lines` 除行号区间和单点 `old_string`/`new_string` 外，还接受 `edits: [{old_string,new_string}…]` **批量原子编辑**：所有锚点先在内存里逐条校验（缺失或不唯一即整体失败、文件一字节都不改），全部通过后才一次写回——同一文件改多处不必串行多轮，也不会留下半改状态，用文本锚点还能避开行号漂移。`delete_path`（删目录必须显式 `recursive:true`，工作区根目录受保护）和 `move_path`（工作区内重命名/移动，禁止移入自身子树）让删除和重命名走沙箱校验，不用再借 `run_bash` 拼 `rm`/`mv`。
+`replace_lines` 除行号区间和单点 `old_string`/`new_string` 外，还接受 `edits: [{old_string,new_string}…]` **批量原子编辑**：所有锚点先在内存里逐条校验（缺失或不唯一即整体失败、文件一字节都不改），全部通过后才一次写回——同一文件改多处不必串行多轮，也不会留下半改状态，用文本锚点还能避开行号漂移。锚点匹配容忍弱模型最常犯的三种手误（**仍然只认唯一位置**，容忍度只影响"能不能找到"，不影响"会不会改错"）：从 `read_file` 带出来的 `  12: ` 行号前缀会被剥掉、缩进与行尾空白不参与比较、把 `  12: ` 与缩进都改坏的锚点也不至于直接失败。匹配不上时错误里会引用**文件里最接近的那几行（带真实行号与原文）**，模型照着改锚点即可，不必把同一段原文再猜一遍。CRLF 文件按原样保留行尾，不会因为一次编辑把整份文件的行尾翻新。`delete_path`（删目录必须显式 `recursive:true`，工作区根目录受保护）和 `move_path`（工作区内重命名/移动，禁止移入自身子树）让删除和重命名走沙箱校验，不用再借 `run_bash` 拼 `rm`/`mv`。
 验收失败时，Verifier 会按已探测的技术栈从输出里抽取去重、单行截断的根因诊断（最多 25 行）作为**诊断块前置**到错误全文之前；重试叶子只截取错误前缀注入上下文（4000 字符），根因因此一定在最显眼的位置，原始日志完整附在块后。目前覆盖：Go（`x.go:4:2: undefined:`、`--- FAIL`、`panic`）、Python（traceback 的 `File "x", line N`、`XError:`、pytest 的 `E` 行与 `FAILED`）、Rust（`error[E0xxx]:`、`--> file:line:col`、`panicked at`）、Node/TypeScript（tsc 的 `x.ts(10,5): error TS…`、Node 的源码位置行与 `ReferenceError:` 等异常头；刻意不收冗长的 `at …` 栈帧）。
 重试不是无条件的。每次失败都会算一个**指纹**（优先用上面那套根因诊断行，没有诊断规则时取输出头部并把数字统一掩码），连续 `-max-stall` 次（默认 `3`）指纹相同，就判定这个叶子在**原地打转**——它失败得很快，但每次失败都一样，时间闸门永远等不到。此时停止重试，转去重新拆解（拆解预算还有的话）或直接判 `FAILED`，并记一条 `leaf_stall` 事件。失败**各不相同**的叶子不受影响，照旧重试到 `-max-retries` / `-max-elapsed`。这是默认 `-max-retries 0` 下无限重试能真正收敛的关键：在此之前，只有 45 分钟的墙钟能结束一个卡死的叶子。
 
@@ -587,7 +587,20 @@ go run ./cmd/bench \
 
 每个目标在**全新临时工作区**里真实执行 divvy 全流程（拆解 → 叶子 → 真实 `go build`/`go test` 验收 → 根目标端到端验收），采集：成败、墙钟时间、LLM 调用数、token、成本、叶子数、以及引擎自身的失败计数器（验收失败/重试/停滞/重拆）。结果同时打印表格并写入 `<root>/report.json`，工作区保留供事后解剖（`git diff` 看模型到底改了什么）。
 
-语料库刻意小且版本化在代码里（基准的目标集漂移就无法发现回归）；当前三个目标覆盖三种任务形态：从零创建包（`string-utils`）、修复 seeded bug（`fix-average`，语料自带失败测试，harness 测试会守住"这个目标真的会失败"）、构建可运行服务（`http-health`）。默认端点是本机 Ollama，方法论与参考数字见 **[docs/weak-model-bench.md](docs/weak-model-bench.md)**。
+### 两种循环都能测（`-loop`）
+
+```bash
+go run ./cmd/bench -loop direct -goals string-utils,fix-average ...
+```
+
+`-loop direct` 把同一个语料喂给持久工具循环（网页界面默认的那种），**没有任务树、没有计划、没有叶子验收**。为了让两种循环可比，harness 用同一套种子工作区、同一条验收命令：
+
+- 树模式的成败来自计划里写下的 DoD（引擎自己跑验收）；
+- 直接模式没有契约可依，所以 harness 在循环返回后自己跑 `Goal.Accept`（语料里每个目标都声明了，缺了会有测试报错），成败以这条命令为准。
+
+如果宿主根本没有执行能力（非 Linux 上没有 bubblewrap/landlock），直接模式的验收会标成 `skipped` 并在报告里写明原因——这一行**不算已验证**，只是"模型自己说完成了"。
+
+语料库刻意小且版本化在代码里（基准的目标集漂移就无法发现回归）；当前四个目标覆盖四种任务形态：从零创建包（`string-utils`）、修复 seeded bug（`fix-average`，语料自带失败测试，harness 测试会守住"这个目标真的会失败"）、构建可运行服务（`http-health`）、CMake/C++ 目标（`cmake-add`）。默认端点是本机 Ollama，方法论与参考数字见 **[docs/weak-model-bench.md](docs/weak-model-bench.md)**。
 
 ---
 
