@@ -51,7 +51,11 @@ func run(args []string) error {
 
 	if *list {
 		for _, g := range Corpus {
-			fmt.Printf("%-14s module=%-10s accept=%-22s %s\n", g.Name, g.Module, g.Accept, firstLine(g.Prompt))
+			leaf := ""
+			if g.LeafSteps > 0 {
+				leaf = fmt.Sprintf(" leaf_steps=%d", g.LeafSteps)
+			}
+			fmt.Printf("%-14s module=%-10s accept=%-22s%s %s\n", g.Name, g.Module, g.Accept, leaf, firstLine(g.Prompt))
 		}
 		return nil
 	}

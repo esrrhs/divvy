@@ -145,6 +145,16 @@ func aggregate(rs []RunResult) Aggregate {
 	return a
 }
 
+// leafSteps resolves the per-leaf budget: a goal that pins its own wins, since
+// that is what makes it a decomposition test rather than another one-context
+// task.
+func (g Goal) leafSteps(benchDefault int) int {
+	if g.LeafSteps > 0 {
+		return g.LeafSteps
+	}
+	return benchDefault
+}
+
 // seedWorkspace materializes the goal's seed files, initializes the Go
 // module, and makes an initial git commit so -git-commit has a baseline and
 // a post-mortem `git diff` shows exactly what the model changed.
@@ -215,8 +225,8 @@ func runGoal(ctx context.Context, g Goal, repeat int, bc benchConfig) RunResult 
 	if loop == loopDirect {
 		cfg.AgentLoop = agent.AgentLoopDirect
 	}
-	if bc.MaxSteps > 0 {
-		cfg.MaxSteps = bc.MaxSteps
+	if steps := g.leafSteps(bc.MaxSteps); steps > 0 {
+		cfg.MaxSteps = steps
 	}
 	if bc.MaxRetries > 0 {
 		cfg.MaxRetries = bc.MaxRetries
@@ -302,7 +312,37 @@ func runGoal(ctx context.Context, g Goal, repeat int, bc benchConfig) RunResult 
 	default:
 		res.Error = "run returned no error but the root goal is not COMPLETED"
 	}
+	// A pass that required editing the test which defines the task is not a
+	// pass. Checked after the verdict so a run that already failed keeps its
+	// own error instead of being explained away by this one.
+	if res.OK {
+		if viol := guardViolation(res.Workdir, g); viol != "" {
+			res.OK = false
+			res.Error = "protected seed file: " + viol
+		}
+	}
 	return res
+}
+
+// guardViolation reports the first protected seed file whose bytes changed (or
+// that disappeared). Goals whose verdict rests on a seeded test carry that file
+// in Guard: without the check, a model can satisfy `go test ./...` by relaxing
+// the assertion, and the bench would report a capability that never existed.
+func guardViolation(workdir string, g Goal) string {
+	for _, rel := range g.Guard {
+		want, ok := g.Seed[rel]
+		if !ok {
+			continue
+		}
+		got, err := os.ReadFile(filepath.Join(workdir, filepath.FromSlash(rel)))
+		if err != nil {
+			return rel + " is missing"
+		}
+		if string(got) != want {
+			return rel + " was modified"
+		}
+	}
+	return ""
 }
 
 // runAcceptance runs the goal's acceptance command against the finished

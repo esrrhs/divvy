@@ -31,6 +31,20 @@ type Goal struct {
 	Prompt string
 	Seed   map[string]string
 	Accept string
+
+	// Guard lists seed files the goal forbids changing. They are usually the
+	// very test that defines the task: without this, a model can "pass" by
+	// editing the assertion instead of satisfying it, and the bench would
+	// report a capability that does not exist.
+	Guard []string
+
+	// LeafSteps pins the per-leaf tool budget for this goal (0 uses
+	// -max-steps). A goal that is too big for one leaf context is the only
+	// way to test the engine's actual claim — that decomposition carries
+	// work a single context cannot — so this goal shrinks the leaf budget
+	// instead of growing the task until it happens to overflow on its own.
+	// Direct mode is unaffected: its budget is -direct-steps by definition.
+	LeafSteps int
 }
 
 // Corpus is the fixed goal set. Keep it small: a full bench pass costs real
@@ -99,6 +113,67 @@ func TestAverage(t *testing.T) {
 		Prompt: "用 Go 写一个 HTTP 服务：监听 :18080，GET /health 返回 200 和字符串 ok，" +
 			"其它方法返回 405；并写单元测试。只用标准库。",
 		Accept: "go build ./... && go test ./...",
+	},
+	{
+		// The only goal that cannot be done in one leaf without ignoring the
+		// prompt: three files with three separate responsibilities. The
+		// contract lives in a seeded test that the model may not touch, so a
+		// pass means the API was implemented, not that the test was relaxed.
+		Name:   "config-cli",
+		Module: "cfgcli",
+		Prompt: "workspace 里只有 main_test.go：它定义了契约，但还没有任何实现。" +
+			"读它，然后按它实现：config.go 放 Config 结构体与 LoadConfig(path) (Config, error)（读 JSON，" +
+			"未出现的字段取零值，未知字段忽略）；run.go 放 Run(args []string, out io.Writer) error" +
+			"（从 args[0] 读配置，向 out 打印形如 \"name=<name> retries=<n>\" 的一行）；" +
+			"main.go 只留入口，把 os.Args[1:] 和 os.Stdout 交给 Run。" +
+			"让 go test ./... 通过。不要修改 main_test.go。",
+		Accept:    "go build ./... && go test ./...",
+		Guard:     []string{"main_test.go"},
+		LeafSteps: 6,
+		Seed: map[string]string{
+			"main_test.go": `package main
+
+import (
+	"bytes"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func writeConfig(t *testing.T, body string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "cfg.json")
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestLoadConfig(t *testing.T) {
+	p := writeConfig(t, ` + "`" + `{"name":"prod","retries":3,"verbose":true}` + "`" + `)
+	cfg, err := LoadConfig(p)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.Name != "prod" || cfg.Retries != 3 || !cfg.Verbose {
+		t.Fatalf("LoadConfig parsed %+v", cfg)
+	}
+}
+
+func TestRunPrintsSummary(t *testing.T) {
+	p := writeConfig(t, ` + "`" + `{"name":"dev","retries":1}` + "`" + `)
+	var out bytes.Buffer
+	if err := Run([]string{p}, &out); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "name=dev") || !strings.Contains(got, "retries=1") {
+		t.Fatalf("Run printed %q", got)
+	}
+}
+`,
+		},
 	},
 	{
 		Name: "cmake-add",
