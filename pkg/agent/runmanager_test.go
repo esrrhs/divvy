@@ -112,6 +112,7 @@ func waitPhase(t *testing.T, h *RunHandle, want RunPhase, timeout time.Duration)
 func TestRunManager_StartApproveComplete(t *testing.T) {
 	work, data := t.TempDir(), t.TempDir()
 	mgr := NewRunManager()
+	defer mgr.Shutdown(2 * time.Second)
 
 	h, err := mgr.Start(mgrCfg(work, data, "test_mgr_start"),
 		fileWritingScript(mgrAtomicPlan, nil), SilentLogger())
@@ -144,6 +145,7 @@ func TestRunManager_StartApproveComplete(t *testing.T) {
 func TestRunManager_WorkdirConflict(t *testing.T) {
 	work1, work2, data := t.TempDir(), t.TempDir(), t.TempDir()
 	mgr := NewRunManager()
+	defer mgr.Shutdown(2 * time.Second)
 
 	h1, err := mgr.Start(mgrCfg(work1, filepath.Join(data, "1"), "s1"),
 		fileWritingScript(mgrAtomicPlan, nil), SilentLogger())
@@ -193,6 +195,7 @@ func TestRunManager_WorkdirConflict(t *testing.T) {
 func TestRunManager_AdjustThenApprove(t *testing.T) {
 	work, data := t.TempDir(), t.TempDir()
 	mgr := NewRunManager()
+	defer mgr.Shutdown(2 * time.Second)
 	h, err := mgr.Start(mgrCfg(work, data, "test_mgr_adjust"),
 		fileWritingScript(mgrAtomicPlan, nil), SilentLogger())
 	if err != nil {
@@ -220,6 +223,7 @@ func TestRunManager_AdjustThenApprove(t *testing.T) {
 func TestRunManager_AbortAtReview(t *testing.T) {
 	work, data := t.TempDir(), t.TempDir()
 	mgr := NewRunManager()
+	defer mgr.Shutdown(2 * time.Second)
 	h, err := mgr.Start(mgrCfg(work, data, "test_mgr_abort"),
 		fileWritingScript(mgrAtomicPlan, nil), SilentLogger())
 	if err != nil {
@@ -246,6 +250,7 @@ func TestRunManager_PauseWhileRunning(t *testing.T) {
 	work, data := t.TempDir(), t.TempDir()
 	gate := make(chan struct{})
 	mgr := NewRunManager()
+	defer mgr.Shutdown(2 * time.Second)
 	h, err := mgr.Start(mgrCfg(work, data, "test_mgr_pause"),
 		fileWritingScript(mgrAtomicPlan, gate), SilentLogger())
 	if err != nil {
@@ -281,6 +286,7 @@ func TestRunManager_AddInstruction(t *testing.T) {
 	// the buffered line is left without a consumer.
 	gate := make(chan struct{})
 	mgr := NewRunManager()
+	defer mgr.Shutdown(2 * time.Second)
 	h, err := mgr.Start(mgrCfg(work, data, "test_mgr_add"),
 		fileWritingScript(mgrTwoLeafPlan, gate), SilentLogger())
 	if err != nil {
@@ -309,6 +315,7 @@ func TestRunManager_SteerNowInterruptsLeaf(t *testing.T) {
 	work, data := t.TempDir(), t.TempDir()
 	gate := make(chan struct{})
 	mgr := NewRunManager()
+	defer mgr.Shutdown(2 * time.Second)
 	h, err := mgr.Start(mgrCfg(work, data, "test_mgr_steer"),
 		fileWritingScript(mgrTwoLeafPlan, gate), SilentLogger())
 	if err != nil {
@@ -377,6 +384,7 @@ func TestRunManager_RedoQueued(t *testing.T) {
 		},
 	}
 	mgr := NewRunManager()
+	defer mgr.Shutdown(2 * time.Second)
 	h, err := mgr.Start(mgrCfg(work, data, "test_mgr_redo"), client, SilentLogger())
 	if err != nil {
 		t.Fatal(err)
@@ -436,6 +444,7 @@ func TestRunManager_AnswerQuestion(t *testing.T) {
 		},
 	}
 	mgr := NewRunManager()
+	defer mgr.Shutdown(2 * time.Second)
 	h, err := mgr.Start(mgrCfg(work, data, "test_mgr_answer"), client, SilentLogger())
 	if err != nil {
 		t.Fatal(err)
@@ -468,6 +477,7 @@ func TestRunManager_AnswerQuestion(t *testing.T) {
 func TestRunManager_PhaseGuards(t *testing.T) {
 	work, data := t.TempDir(), t.TempDir()
 	mgr := NewRunManager()
+	defer mgr.Shutdown(2 * time.Second)
 	h, err := mgr.Start(mgrCfg(work, data, "test_mgr_guards"),
 		fileWritingScript(mgrAtomicPlan, nil), SilentLogger())
 	if err != nil {
@@ -561,6 +571,7 @@ func TestRunManager_SteerNowDiscardsUnmergedIsolateWork(t *testing.T) {
 	cfg.Isolate = true
 	cfg.MaxRetries = 1
 	mgr := NewRunManager()
+	defer mgr.Shutdown(2 * time.Second)
 	h, err := mgr.Start(cfg, client, SilentLogger())
 	if err != nil {
 		t.Fatal(err)

@@ -17,6 +17,11 @@ import (
 func TestSSE_LiveEventLatencyUnderSecond(t *testing.T) {
 	work, data := t.TempDir(), t.TempDir()
 	mgr := agent.NewRunManager()
+	// The run must be stopped before the test ends: it keeps working in the
+	// background (the approve below releases it), and a run that outlives the
+	// test keeps writing into the temp dir — Go's cleanup then fails with
+	// "directory not empty" and reports the whole test as failed.
+	defer mgr.Shutdown(2 * time.Second)
 	h, err := mgr.Start(srvCfg(work, data, "srv_latency"), srvScript(), agent.SilentLogger())
 	if err != nil {
 		t.Fatal(err)

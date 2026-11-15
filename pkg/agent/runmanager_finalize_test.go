@@ -32,6 +32,7 @@ func TestRunManager_BeforeTerminalRunsBeforeDoneAndKeepsWorkdir(t *testing.T) {
 	}}
 
 	mgr := NewRunManager()
+	defer mgr.Shutdown(2 * time.Second)
 	t.Cleanup(func() { mgr.Shutdown(2 * time.Second); AfterTerminalPublished = nil })
 
 	var order []string

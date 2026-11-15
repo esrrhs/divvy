@@ -99,6 +99,7 @@ func TestAPI_DeletePausedSession(t *testing.T) {
 	work, data := t.TempDir(), t.TempDir()
 	gate := make(chan struct{})
 	mgr := agent.NewRunManager()
+	defer mgr.Shutdown(2 * time.Second)
 	s, err := New(mgr, data, WithToken("test-token"), WithHeartbeat(50*time.Millisecond),
 		WithWorkdir(work), WithClientFactory(func(agent.Config) llm.Client { return gatedScript(gate) }))
 	if err != nil {

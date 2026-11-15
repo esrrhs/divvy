@@ -146,6 +146,10 @@ func frameKind(t *testing.T, f sseFrame) (kind string, m map[string]any) {
 func TestSSE_ReplayLiveHeartbeatAndReconnect(t *testing.T) {
 	work, data := t.TempDir(), t.TempDir()
 	mgr := agent.NewRunManager()
+	// Stop the run before the test ends: a run that outlives the test keeps
+	// writing into the temp dir, and Go's cleanup then fails with "directory
+	// not empty" and reports the test as failed.
+	defer mgr.Shutdown(2 * time.Second)
 	h, err := mgr.Start(srvCfg(work, data, "srv_sse"), srvScript(), agent.SilentLogger())
 	if err != nil {
 		t.Fatal(err)
@@ -338,6 +342,7 @@ func TestSecretsNeverTouchDisk(t *testing.T) {
 	cfg := srvCfg(work, data, "srv_secret")
 	cfg.APIKey = sentinel
 	mgr := agent.NewRunManager()
+	defer mgr.Shutdown(2 * time.Second)
 	h, err := mgr.Start(cfg, srvScript(), agent.SilentLogger())
 	if err != nil {
 		t.Fatal(err)
