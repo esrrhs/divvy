@@ -351,12 +351,9 @@ func aiEditApplyItems(req aiEditApplyRequest) ([]aiEditApplyProposal, error) {
 }
 
 type aiEditApplyPrepared struct {
-	item       aiEditApplyProposal
 	rel        string
 	content    string
-	region     aiEditRegion
 	newContent string
-	hunks      []diffHunk
 	applied    int
 	rejected   int
 }
