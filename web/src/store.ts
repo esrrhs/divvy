@@ -3,8 +3,12 @@ import { api, ApiError } from './api/client'
 import { planFileOpen } from './lib/fileNav'
 import { EventSourceClient, type SseStatus } from './api/sse'
 import type {
+  AiEditApplyProposal,
+  AiEditProposal,
+  AiEditRequest,
   AiEditResponse,
   AiEditSelection,
+  AiEditTarget,
   AiEditTurn,
   PhaseSnapshot,
   RunPhase,
@@ -30,6 +34,12 @@ let aiEditAbort: AbortController | null = null
 function selectionsFor(byConv: Record<string, CodeSelection[]>, convId: string | null): CodeSelection[] {
   if (!convId) return []
   return byConv[convId] ?? []
+}
+
+// A single-file response from an older server has no `proposals`; treat the
+// response itself as the one proposal. New responses always carry the list.
+function proposalsOf(res: AiEditResponse): AiEditProposal[] {
+  return res.proposals?.length ? res.proposals : [res]
 }
 
 // Latest user-requested conversation. undefined means "follow currentConvId"
@@ -140,12 +150,16 @@ interface AppState {
   aiEditOpen: boolean
   aiEditPath: string | null
   aiEditSelection: AiEditSelection | null
+  /** All files in this round. One entry means the classic single-file ⌘K. */
+  aiEditTargets: AiEditTarget[]
   aiEditResult: AiEditResponse | null
+  /** "已生成 2/3" while a multi-file round streams progress events. */
+  aiEditProgress: string
   // Raw code as it streams in, before the diff is known.
   aiEditStreaming: string
   aiEditBusy: boolean
   // Set after a write so the dialog can offer an undo.
-  aiEditApplied: { applied: number; rejected: number } | null
+  aiEditApplied: { applied: number; rejected: number; paths?: string[] } | null
   // How many inline writes can still be undone. The dialog stays open while
   // there is more than one, so a second Cmd-Z reaches further back.
   aiEditUndoDepth: number
@@ -156,11 +170,15 @@ interface AppState {
   fileReloadNonce: number
   openAiEditDialog: (path: string, selection: AiEditSelection) => void
   closeAiEditDialog: () => void
+  /** ⌘K on another file while the dialog is open adds it to the same round. */
+  addAiEditTarget: (path: string, selection: AiEditSelection) => void
+  removeAiEditTarget: (path: string) => void
   runAiEdit: (instruction: string) => Promise<boolean>
   // Drops the earlier rounds so the next generation starts from the original
   // selection again.
   resetAiEdit: () => void
-  applyAiEdit: (decisions: boolean[]) => Promise<boolean>
+  /** Decisions are keyed by file path; omitted means accept everything. */
+  applyAiEdit: (decisionsByPath?: Record<string, boolean[]>) => Promise<boolean>
   undoAiEdit: () => Promise<boolean>
   removeSelection: (index: number) => void
   clearSelections: () => void
@@ -218,7 +236,9 @@ export const useStore = create<AppState>((set, get) => ({
   aiEditOpen: false,
   aiEditPath: null,
   aiEditSelection: null,
+  aiEditTargets: [],
   aiEditResult: null,
+  aiEditProgress: '',
   aiEditStreaming: '',
   aiEditBusy: false,
   aiEditApplied: null,
@@ -776,13 +796,14 @@ export const useStore = create<AppState>((set, get) => ({
       aiEditOpen: true,
       aiEditPath: path,
       aiEditSelection: selection,
+      aiEditTargets: [{ path, selection }],
       aiEditResult: null,
       aiEditStreaming: '',
+      aiEditProgress: '',
       aiEditBusy: false,
       aiEditApplied: null,
       // The history is NOT cleared here: a follow-up on another file must
-      // still see what the previous turn changed. It is cleared when the
-      // conversation changes.
+      // still see what the previous turn changed.
       aiEditUndoDepth: 0,
       actionError: null,
     })
@@ -796,15 +817,59 @@ export const useStore = create<AppState>((set, get) => ({
       aiEditOpen: false,
       aiEditPath: null,
       aiEditSelection: null,
+      aiEditTargets: [],
       aiEditResult: null,
       aiEditStreaming: '',
+      aiEditProgress: '',
       aiEditBusy: false,
       aiEditApplied: null,
       aiEditUndoDepth: 0,
     })
   },
+  addAiEditTarget: (path, selection) => {
+    const s = get()
+    if (!s.aiEditOpen) {
+      s.openAiEditDialog(path, selection)
+      return
+    }
+    const targets = s.aiEditTargets.length
+      ? s.aiEditTargets
+      : s.aiEditPath && s.aiEditSelection
+        ? [{ path: s.aiEditPath, selection: s.aiEditSelection }]
+        : []
+    const existing = targets.find((t) => t.path === path)
+    const next = existing
+      ? targets.map((t) => (t.path === path ? { path, selection } : t))
+      : [...targets, { path, selection }]
+    if (next.length > 6) {
+      set({ actionError: '一次最多改写 6 个文件' })
+      return
+    }
+    // The proposal is relative to the old target set: keeping it would let
+    // the user apply a diff for a file that is no longer in the round.
+    set({
+      aiEditTargets: next,
+      aiEditResult: null,
+      aiEditStreaming: '',
+      aiEditProgress: '',
+      aiEditApplied: null,
+      actionError: null,
+    })
+  },
+  removeAiEditTarget: (path) => {
+    const targets = get().aiEditTargets
+    if (targets.length <= 1) return
+    set({
+      aiEditTargets: targets.filter((t) => t.path !== path),
+      aiEditResult: null,
+      aiEditStreaming: '',
+      aiEditProgress: '',
+      aiEditApplied: null,
+      actionError: null,
+    })
+  },
   resetAiEdit: () => {
-    set({ aiEditResult: null, aiEditStreaming: '', aiEditHistory: [], actionError: null })
+    set({ aiEditResult: null, aiEditStreaming: '', aiEditProgress: '', aiEditHistory: [], actionError: null })
   },
   runAiEdit: async (instruction) => {
     const id = get().currentConvId
@@ -812,42 +877,67 @@ export const useStore = create<AppState>((set, get) => ({
       set({ actionError: '没有打开的对话' })
       return false
     }
-    const path = get().aiEditPath
-    const sel = get().aiEditSelection
-    if (!path || !sel) {
+    const s = get()
+    // Tests and older callers set only path/selection; accept that as a
+    // one-file round so the single-file protocol stays exactly the same.
+    const targets = s.aiEditTargets.length
+      ? s.aiEditTargets
+      : s.aiEditPath && s.aiEditSelection
+        ? [{ path: s.aiEditPath, selection: s.aiEditSelection }]
+        : []
+    if (!targets.length) {
       set({ actionError: '未选中文件或选区' })
       return false
     }
+    const multi = targets.length > 1
     aiEditAbort?.abort()
     const ctrl = new AbortController()
     aiEditAbort = ctrl
-    set({ actionError: null, aiEditBusy: true, aiEditResult: null, aiEditStreaming: '' })
+    set({ actionError: null, aiEditBusy: true, aiEditResult: null, aiEditStreaming: '', aiEditProgress: '' })
     try {
       // A follow-up carries the earlier rounds so the model revises its last
       // proposal instead of starting over from the original selection.
       const history = get().aiEditHistory
+      const body: AiEditRequest = {
+        instruction,
+        history: history.length ? history : undefined,
+        ...(multi
+          ? { targets }
+          : { path: targets[0].path, selection: targets[0].selection }),
+      }
       const res = await api.aiEditStream(
         id,
-        { path, selection: sel, instruction, history: history.length ? history : undefined },
+        body,
         (text) => set((s) => ({ aiEditStreaming: s.aiEditStreaming + text })),
         ctrl.signal,
+        (done, total, path) => set({ aiEditProgress: `已生成 ${done}/${total}：${path}` }),
       )
       if (ctrl.signal.aborted) return false
+      const props = proposalsOf(res)
+      const turn: AiEditTurn = {
+        instruction,
+        code: props[0]?.new_text ?? res.new_text,
+        path: props[0]?.path ?? targets[0].path,
+        ...(multi
+          ? { files: props.map((p) => ({ path: p.path, code: p.new_text })) }
+          : {}),
+      }
       set((s) => ({
         aiEditResult: res,
         aiEditBusy: false,
-        aiEditHistory: [...s.aiEditHistory, { instruction, code: res.new_text, path }],
+        aiEditProgress: '',
+        aiEditHistory: [...s.aiEditHistory, turn],
       }))
       return true
     } catch (e) {
       if (ctrl.signal.aborted) return false
-      set({ aiEditBusy: false, actionError: errorText(e) })
+      set({ aiEditBusy: false, aiEditProgress: '', actionError: errorText(e) })
       return false
     } finally {
       if (aiEditAbort === ctrl) aiEditAbort = null
     }
   },
-  applyAiEdit: async (decisions) => {
+  applyAiEdit: async (decisionsByPath) => {
     const id = get().currentConvId
     if (!id) {
       set({ actionError: '没有打开的对话' })
@@ -858,33 +948,58 @@ export const useStore = create<AppState>((set, get) => ({
       set({ actionError: '还没有生成候选改动' })
       return false
     }
+    const props = proposalsOf(res).filter((p) => !p.error)
+    if (!props.length) {
+      set({ actionError: '这一轮没有生成成功的文件，没有可写回的改动' })
+      return false
+    }
+    const items: AiEditApplyProposal[] = props.map((p) => ({
+      path: p.path,
+      base_hash: p.base_hash,
+      start_line: p.start_line,
+      end_line: p.end_line,
+      insert_line: p.insert_line,
+      old_text: p.old_text,
+      new_text: p.new_text,
+      decisions: decisionsByPath?.[p.path] ?? (p.hunks ?? []).map(() => true),
+    }))
+    const first = items[0]
     set({ actionError: null, aiEditBusy: true })
     try {
       const out = await api.aiEditApply(id, {
-        path: res.path,
-        base_hash: res.base_hash,
-        start_line: res.start_line,
-        end_line: res.end_line,
-        insert_line: res.insert_line,
-        old_text: res.old_text,
-        new_text: res.new_text,
-        decisions,
+        path: first.path,
+        base_hash: first.base_hash,
+        start_line: first.start_line,
+        end_line: first.end_line,
+        insert_line: first.insert_line,
+        old_text: first.old_text,
+        new_text: first.new_text,
+        decisions: first.decisions,
+        proposals: items,
       })
       if (out.conflict) {
-        set({ aiEditBusy: false, actionError: `文件已被外部修改，未写回：${out.conflict_path || res.path}。请重新生成。` })
+        set({ aiEditBusy: false, actionError: `文件已被外部修改，未写回：${out.conflict_path || first.path}。请重新生成。` })
         return false
       }
-      // Keep the dialog open: the write is done but undo lives here, and
-      // closing immediately would strand the user with no way back.
+      // Only files the server actually wrote are "on disk". A proposal with
+      // every hunk rejected stays pending, so a follow-up can still revise it.
+      const written = new Set(out.paths ?? (out.applied > 0 ? props.map((p) => p.path) : []))
       set((s) => ({
         aiEditBusy: false,
-        aiEditApplied: { applied: out.applied, rejected: out.rejected },
+        aiEditApplied: {
+          applied: out.applied,
+          rejected: out.rejected,
+          ...(written.size > 1 ? { paths: [...written] } : {}),
+        },
         aiEditResult: null,
         aiEditStreaming: '',
-        // The write is on disk now: a later turn must not replay it.
-        aiEditHistory: s.aiEditHistory.map((t, i) =>
-          i === s.aiEditHistory.length - 1 ? { ...t, applied: true } : t,
-        ),
+        aiEditProgress: '',
+        aiEditHistory: s.aiEditHistory.map((t, i) => {
+          if (i !== s.aiEditHistory.length - 1) return t
+          if (!t.files) return { ...t, applied: true }
+          const files = t.files.map((f) => (written.has(f.path) ? { ...f, applied: true } : f))
+          return { ...t, files, applied: files.every((f) => f.applied) }
+        }),
         // The write just made is undoable, on top of whatever was before it.
         aiEditUndoDepth: s.aiEditUndoDepth + 1,
         fileReloadNonce: s.fileReloadNonce + 1,
@@ -914,6 +1029,8 @@ export const useStore = create<AppState>((set, get) => ({
         aiEditOpen: remaining > 0,
         aiEditPath: remaining > 0 ? s.aiEditPath : null,
         aiEditSelection: remaining > 0 ? s.aiEditSelection : null,
+        aiEditTargets: remaining > 0 ? s.aiEditTargets : [],
+        aiEditProgress: '',
         fileReloadNonce: s.fileReloadNonce + 1,
       }))
       return true

@@ -9,7 +9,7 @@ import { scrollTopForLine } from '../lib/fileNav'
 import { FileDiffList } from './FileDiffView'
 import { DocIcon, SpinnerIcon, XIcon } from './icons'
 import { LangFromPath, tokenizeLines, type TokenKind } from '../lib/highlight'
-import type { AiEditResponse } from '../types'
+import type { AiEditProposal } from '../types'
 
 // Same rule as the diff view: only the kinds that carry meaning get a colour.
 // Plain text inherits the editor's own colour, so an unreadable file stays
@@ -35,7 +35,7 @@ function humanSize(n: number): string {
 //
 // This is what makes the rewrite reviewable IN PLACE: the middle panel shows
 // the file with the change in it, instead of a diff floating in a dialog.
-function proposedView(content: string, r: AiEditResponse): { text: string; marked: Set<number> } {
+function proposedView(content: string, r: AiEditProposal): { text: string; marked: Set<number> } {
   const lines = content.split('\n')
   const start = Math.max(0, (r.start_line ?? 1) - 1)
   const end = r.insert_line ? start : Math.max(start, r.end_line ?? r.start_line ?? 1)
@@ -55,7 +55,7 @@ function proposedView(content: string, r: AiEditResponse): { text: string; marke
 // read-only on purpose: the proposal has not been accepted yet, so the file on
 // disk is still the user's, and a stray keystroke must not turn it into
 // something else.
-function ProposalView({ content, result }: { content: string; result: AiEditResponse }) {
+function ProposalView({ content, result }: { content: string; result: AiEditProposal }) {
   const { text, marked } = useMemo(() => proposedView(content, result), [content, result])
   const lines = text.split('\n')
   const lang = LangFromPath(result.path)
@@ -207,10 +207,18 @@ export function FileViewer({ sessionId, path }: { sessionId: string | null; path
   const cancelFileNav = useStore((s) => s.cancelFileNav)
   const attachSelection = useStore((s) => s.attachSelection)
   const openAiEditDialog = useStore((s) => s.openAiEditDialog)
+  const addAiEditTarget = useStore((s) => s.addAiEditTarget)
+  const aiEditOpen = useStore((s) => s.aiEditOpen)
   const fileReloadNonce = useStore((s) => s.fileReloadNonce)
   // A pending AI rewrite for THIS file is reviewed in place, in this panel.
-  const proposal = useStore((s) => s.aiEditResult)
-  const proposalPath = useStore((s) => s.aiEditPath)
+  // A multi-file round carries one proposal per file, so the preview must
+  // pick the entry for the file actually open — not the first one.
+  const proposals = useStore((s) => s.aiEditResult)
+  const proposal = useMemo(() => {
+    if (!proposals) return null
+    const list = proposals.proposals?.length ? proposals.proposals : [proposals]
+    return list.find((p) => sameRelPath(p.path, path)) ?? null
+  }, [proposals, path])
   const [file, setFile] = useState<FsFileResponse | null>(null)
   const [draft, setDraft] = useState('')
   const [baseHash, setBaseHash] = useState('')
@@ -363,18 +371,23 @@ export function FileViewer({ sessionId, path }: { sessionId: string | null; path
       return
     }
     const range = lineRangeFromOffsets(draft, sel.start, sel.end)
-    if (sel.end !== sel.start) {
-      openAiEditDialog(path, { start_line: range.start_line, end_line: range.end_line })
-    } else {
-      // No selection: Cursor-style "generate here" inserts at the caret line.
-      openAiEditDialog(path, { insert_line: range.start_line })
+    const selection = sel.end !== sel.start
+      ? { start_line: range.start_line, end_line: range.end_line }
+      : // No selection: Cursor-style "generate here" inserts at the caret line.
+        { insert_line: range.start_line }
+    if (aiEditOpen) {
+      // ⌘K on another file while the dialog is open joins the SAME round.
+      // A second press on a file already in the round just updates its range.
+      addAiEditTarget(path, selection)
+      setAttachNote(`已加入这一轮 AI 改写：${path}（同一条指令会一起改）。`)
+      return
     }
+    openAiEditDialog(path, selection)
   }
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!(e.metaKey || e.ctrlKey) || e.key.toLowerCase() !== 'k') return
-      if (useStore.getState().aiEditOpen) return
       if (!canEdit) return
       e.preventDefault()
       aiEdit()
@@ -450,11 +463,13 @@ export function FileViewer({ sessionId, path }: { sessionId: string | null; path
                 title={
                   dirty
                     ? '请先保存，AI 改写基于磁盘上的文件'
-                    : '让 AI 改写选中的代码（未选中时按光标位置插入）。⌘/Ctrl+K'
+                    : aiEditOpen
+                      ? '把当前文件的选区加进这一轮 AI 改写（多个文件用同一条指令一起改）。⌘/Ctrl+K'
+                      : '让 AI 改写选中的代码（未选中时按光标位置插入）。⌘/Ctrl+K'
                 }
                 className="rounded border border-brand-700/60 bg-brand-950/40 px-2 py-0.5 text-[11.5px] text-brand-200 hover:bg-brand-900/50 disabled:cursor-not-allowed disabled:border-line disabled:bg-transparent disabled:text-slate-600"
               >
-                AI 改写<span className="ml-1 text-[10px] opacity-70">⌘K</span>
+                {aiEditOpen ? '加入改写' : 'AI 改写'}<span className="ml-1 text-[10px] opacity-70">⌘K</span>
               </button>
               <button
                 type="button"
@@ -539,7 +554,7 @@ export function FileViewer({ sessionId, path }: { sessionId: string | null; path
         </div>
       )}
 
-      {(!change || !showDiff) && !loading && !problem && file && proposal && proposalPath === path && (
+      {(!change || !showDiff) && !loading && !problem && file && proposal && (
         <>
           <p className="shrink-0 border-b border-line bg-brand-950/40 px-4 py-1.5 text-[11.5px] text-brand-200">
             AI 改写预览：下面是应用这次改写后的样子（尚未写回磁盘）。接受/拒绝在右侧的对话框里。
@@ -548,7 +563,7 @@ export function FileViewer({ sessionId, path }: { sessionId: string | null; path
         </>
       )}
 
-      {(!change || !showDiff) && !loading && !problem && file && !(proposal && proposalPath === path) && (
+      {(!change || !showDiff) && !loading && !problem && file && !proposal && (
         <CodeEditor
           key={path}
           value={draft}

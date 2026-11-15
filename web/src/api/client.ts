@@ -274,6 +274,7 @@ export const api = {
     body: AiEditRequest,
     onDelta: (text: string) => void,
     signal?: AbortSignal,
+    onProgress?: (done: number, total: number, path: string) => void,
   ): Promise<AiEditResponse> => {
     const res = await fetch(`/api/conversations/${id}/ai-edit`, {
       method: 'POST',
@@ -313,6 +314,9 @@ export const api = {
           if (event === 'delta') {
             const d = JSON.parse(payload) as { text?: string }
             if (d.text) onDelta(d.text)
+          } else if (event === 'progress') {
+            const p = JSON.parse(payload) as { done?: number; total?: number; path?: string }
+            onProgress?.(p.done ?? 0, p.total ?? 0, p.path ?? '')
           } else if (event === 'done') {
             done = JSON.parse(payload) as AiEditResponse
           } else if (event === 'error') {

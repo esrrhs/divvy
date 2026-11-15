@@ -213,4 +213,78 @@ describe('FileViewer AI rewrite preview', () => {
     )
     expect(marked?.textContent).toContain('line two rewritten')
   })
+
+  it('in a multi-file round, previews the proposal for the file actually open', async () => {
+    const other = {
+      path: 'pkg/other.go',
+      base_hash: 'hash-other',
+      start_line: 2,
+      end_line: 2,
+      old_text: 'line two\n',
+      new_text: 'OTHER_FILE_REWRITE\n',
+      hunks: [
+        {
+          index: 0,
+          lines: [
+            { type: 'remove', old_no: 2, text: 'line two' },
+            { type: 'add', new_no: 2, text: 'OTHER_FILE_REWRITE' },
+          ],
+        },
+      ],
+      preview: '@@ 块 1 @@',
+    }
+    useStore.setState({
+      aiEditResult: {
+        ...other,
+        proposals: [
+          other,
+          {
+            path: FILE,
+            base_hash: 'hash-1',
+            start_line: 2,
+            end_line: 2,
+            old_text: 'line two\n',
+            new_text: 'THIS_FILE_REWRITE\n',
+            hunks: [
+              {
+                index: 0,
+                lines: [
+                  { type: 'remove', old_no: 2, text: 'line two' },
+                  { type: 'add', new_no: 2, text: 'THIS_FILE_REWRITE' },
+                ],
+              },
+            ],
+            preview: '@@ 块 1 @@',
+          },
+        ],
+      },
+    })
+    await act(async () => {
+      root.render(<FileViewer sessionId="sess-a" path={FILE} />)
+      await Promise.resolve()
+    })
+    expect(host.textContent).toContain('THIS_FILE_REWRITE')
+    expect(host.textContent).not.toContain('OTHER_FILE_REWRITE')
+  })
+
+  it('the toolbar button joins the open dialog round instead of starting a new one', async () => {
+    useStore.setState({
+      aiEditResult: null,
+      aiEditTargets: [{ path: 'pkg/a.go', selection: { start_line: 1, end_line: 1 } }],
+      aiEditPath: 'pkg/a.go',
+    })
+    await act(async () => {
+      root.render(<FileViewer sessionId="sess-a" path={FILE} />)
+      await Promise.resolve()
+    })
+    const join = Array.from(host.querySelectorAll('button')).find((b) => b.textContent?.includes('加入改写'))
+    expect(join).toBeTruthy()
+    await act(async () => {
+      ;(join as HTMLButtonElement).click()
+      await Promise.resolve()
+    })
+    const targets = useStore.getState().aiEditTargets
+    expect(targets).toHaveLength(2)
+    expect(targets[1].path).toBe(FILE)
+  })
 })

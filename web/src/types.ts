@@ -412,6 +412,20 @@ export interface AiEditSelection {
   insert_line?: number
 }
 
+/** One file/region the same instruction applies to (multi-file ⌘K). */
+export interface AiEditTarget {
+  path: string
+  selection: AiEditSelection
+}
+
+/** One file's proposal inside a multi-file round. */
+export interface AiEditTurnFile {
+  path: string
+  code: string
+  /** This file's proposal has already been written back. */
+  applied?: boolean
+}
+
 /** One earlier round of an inline edit: the instruction and what came back. */
 export interface AiEditTurn {
   instruction: string
@@ -420,11 +434,15 @@ export interface AiEditTurn {
   path?: string
   /** The turn's code is already on disk, so it must not be replayed. */
   applied?: boolean
+  /** One entry per file for a multi-file round (older clients omit it). */
+  files?: AiEditTurnFile[]
 }
 
 export interface AiEditRequest {
-  path: string
-  selection: AiEditSelection
+  path?: string
+  selection?: AiEditSelection
+  /** Explicit list of files; when present the server rewrites all of them. */
+  targets?: AiEditTarget[]
   instruction: string
   stream?: boolean
   /** Earlier turns, so a follow-up revises the previous proposal. */
@@ -432,7 +450,7 @@ export interface AiEditRequest {
 }
 
 /** The server diffs the model's code reply against the region it sent. */
-export interface AiEditResponse {
+export interface AiEditProposal {
   path: string
   base_hash: string
   start_line: number
@@ -446,9 +464,16 @@ export interface AiEditResponse {
   /** The lines around the edited region, so the change can be shown in place. */
   context_before?: string
   context_after?: string
+  /** Set when this file's generation failed; the proposal is then a no-op. */
+  error?: string
 }
 
-export interface AiEditApplyRequest {
+export interface AiEditResponse extends AiEditProposal {
+  /** One entry per target. The top-level fields mirror the first one. */
+  proposals?: AiEditProposal[]
+}
+
+export interface AiEditApplyProposal {
   path: string
   base_hash: string
   start_line: number
@@ -459,6 +484,18 @@ export interface AiEditApplyRequest {
   decisions: boolean[]
 }
 
+export interface AiEditApplyRequest extends AiEditApplyProposal {
+  /** Multi-file form; when present the server writes all of them as one step. */
+  proposals?: AiEditApplyProposal[]
+}
+
+export interface AiEditApplyFileResult {
+  path: string
+  applied: number
+  rejected: number
+  new_content: string
+}
+
 export interface AiEditApplyResponse {
   path: string
   applied: number
@@ -466,6 +503,9 @@ export interface AiEditApplyResponse {
   new_content: string
   conflict: boolean
   conflict_path?: string
+  /** Files actually written (proposals with no accepted change are skipped). */
+  paths?: string[]
+  files?: AiEditApplyFileResult[]
 }
 
 export interface AiEditUndoResponse {
@@ -474,4 +514,6 @@ export interface AiEditUndoResponse {
   new_content: string
   /** Writes that can still be undone after this one. */
   remaining?: number
+  /** All files restored by this one undo step. */
+  paths?: string[]
 }

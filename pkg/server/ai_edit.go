@@ -38,13 +38,26 @@ type aiEditSelection struct {
 	InsertLine int `json:"insert_line,omitempty"`
 }
 
+// aiEditTarget is one file/region the instruction applies to. A request with
+// more than one target is a multi-file rewrite; the server generates ONE
+// proposal per target, still using the code-only reply the weak models can
+// actually produce, and the UI reviews/writes them together.
+type aiEditTarget struct {
+	Path      string          `json:"path"`
+	Selection aiEditSelection `json:"selection"`
+}
+
 type aiEditRequest struct {
 	Path        string          `json:"path"`
 	Selection   aiEditSelection `json:"selection"`
 	Instruction string          `json:"instruction"`
 	// Stream asks for an SSE response with incremental code as it is produced.
-	// The final parsed result arrives as the `done` event.
+	// The final parsed result arrives as the `done` event. With several
+	// targets the events are per-file progress instead of code deltas.
 	Stream bool `json:"stream,omitempty"`
+	// Targets is the explicit list of files to rewrite. Empty means the
+	// legacy single-file form (Path + Selection).
+	Targets []aiEditTarget `json:"targets,omitempty"`
 	// History carries the earlier turns of the same inline edit, so a
 	// follow-up ("再补一个超时分支") is answered in the context of what came
 	// before instead of starting from the original code every time.
@@ -53,6 +66,15 @@ type aiEditRequest struct {
 	// file in memory, so the model revises its own last proposal while the
 	// diff the user reviews stays relative to the file on disk.
 	History []aiEditTurn `json:"history,omitempty"`
+}
+
+// aiEditTurnFile is one file's proposal inside a multi-file turn. Applied is
+// per FILE: the user may write back only some of them and keep revising the
+// rest.
+type aiEditTurnFile struct {
+	Path    string `json:"path"`
+	Code    string `json:"code"`
+	Applied bool   `json:"applied,omitempty"`
 }
 
 // aiEditTurn is one earlier round of an inline edit: what the user asked for
@@ -67,6 +89,31 @@ type aiEditTurn struct {
 	// Applied reports that the turn's code is already on disk. The file
 	// carries it, so replaying it would apply it twice.
 	Applied bool `json:"applied,omitempty"`
+	// Files carries one entry per target of a multi-file round. Older clients
+	// send only Path/Code/Applied and are treated as a single-file turn.
+	Files []aiEditTurnFile `json:"files,omitempty"`
+}
+
+// aiEditProposal is the per-file result of one generation. It carries
+// everything the single-file response used to carry, so the review UI can
+// treat every target the same way and the apply path stays hash-guarded.
+type aiEditProposal struct {
+	Path          string     `json:"path"`
+	BaseHash      string     `json:"base_hash"`
+	StartLine     int        `json:"start_line"`
+	EndLine       int        `json:"end_line"`
+	InsertLine    int        `json:"insert_line,omitempty"`
+	OldText       string     `json:"old_text"`
+	NewText       string     `json:"new_text"`
+	Hunks         []diffHunk `json:"hunks"`
+	Preview       string     `json:"preview"`
+	ContextBefore string     `json:"context_before,omitempty"`
+	ContextAfter  string     `json:"context_after,omitempty"`
+	Truncated     bool       `json:"truncated,omitempty"`
+	// Error is set when THIS file's generation failed. The proposal then
+	// carries the unchanged region, so one flaky call does not throw away the
+	// work done for the other files — but the UI must say so out loud.
+	Error string `json:"error,omitempty"`
 }
 
 type aiEditResponse struct {
@@ -87,6 +134,25 @@ type aiEditResponse struct {
 	// Truncated reports that the file was too large to send whole and only a
 	// window around the selection was used.
 	Truncated bool `json:"truncated,omitempty"`
+	// Proposals holds one entry per target. The fields above mirror the FIRST
+	// proposal for older clients; new clients read this list.
+	Proposals []aiEditProposal `json:"proposals,omitempty"`
+}
+
+// aiEditApplyProposal is one file's decisions. The client echoes every field
+// of the proposal it reviewed, so the server can re-check the file instead of
+// trusting a session-side cache.
+type aiEditApplyProposal struct {
+	Path       string `json:"path"`
+	BaseHash   string `json:"base_hash"`
+	StartLine  int    `json:"start_line"`
+	EndLine    int    `json:"end_line"`
+	InsertLine int    `json:"insert_line,omitempty"`
+	OldText    string `json:"old_text"`
+	NewText    string `json:"new_text"`
+	// Decisions is one flag per diff hunk: true keeps the proposed side.
+	// Missing or short slices default to accept, matching applyHunkDecisions.
+	Decisions []bool `json:"decisions,omitempty"`
 }
 
 type aiEditApplyRequest struct {
@@ -101,6 +167,16 @@ type aiEditApplyRequest struct {
 	// Decisions is one flag per diff hunk: true keeps the proposed side.
 	// Missing or short slices default to accept, matching applyHunkDecisions.
 	Decisions []bool `json:"decisions,omitempty"`
+	// Proposals is the multi-file form. When present it wins over the legacy
+	// single-file fields above.
+	Proposals []aiEditApplyProposal `json:"proposals,omitempty"`
+}
+
+type aiEditApplyResult struct {
+	Path       string `json:"path"`
+	Applied    int    `json:"applied"`
+	Rejected   int    `json:"rejected"`
+	NewContent string `json:"new_content"`
 }
 
 type aiEditApplyResponse struct {
@@ -109,6 +185,10 @@ type aiEditApplyResponse struct {
 	Rejected   int    `json:"rejected"`
 	NewContent string `json:"new_content"`
 	Conflict   bool   `json:"conflict"`
+	// Paths are the files actually written (files with no accepted change are
+	// not touched). Files reports the per-file outcome.
+	Paths []string            `json:"paths,omitempty"`
+	Files []aiEditApplyResult `json:"files,omitempty"`
 }
 
 // aiEditContextLines is how many lines of context the dialog shows around the
@@ -152,20 +232,28 @@ func (s *Server) handleAiEdit(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	path := strings.TrimSpace(req.Path)
-	if path == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "path is required"})
+	targets, err := normalizeAiEditTargets(req)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	if strings.TrimSpace(req.Instruction) == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "instruction is required"})
-		return
-	}
+	// From here on the legacy single-file fields always carry the (only)
+	// target, so the single-file path below does not need to know whether the
+	// client used the new `targets` form.
+	req.Path, req.Selection = targets[0].Path, targets[0].Selection
+	path := req.Path
 
 	convID := r.PathValue("id")
 	c, err := s.loadConv(convID)
 	if err != nil {
 		writeJSON(w, statusForConvErr(err), map[string]string{"error": err.Error()})
+		return
+	}
+	if len(targets) > 1 {
+		// One instruction, several files: generate one proposal per file and
+		// return them together. The single-file path below streams code
+		// deltas; a multi-file reply has no single delta stream.
+		s.handleAiEditMulti(w, c, req, targets)
 		return
 	}
 	_, rel, err := resolveProjectPath(c.WorkDir, path)
@@ -209,22 +297,18 @@ func (s *Server) handleAiEdit(w http.ResponseWriter, r *http.Request) {
 	}
 	promptContent := content
 	promptRegion := region
-	if len(history) > 0 {
-		last := history[len(history)-1]
-		// Only a turn about THIS file, and not yet written, is a pending
-		// change to replay onto it. A turn about another file — or one whose
-		// code is already on disk — is context the model must see, but the
-		// file underneath it must not change.
-		sameFile := last.Path == "" || last.Path == rel
-		if sameFile && !last.Applied {
-			virtual, vregion, verr := aiEditVirtualRegion(content, region, last.Code)
-			if verr != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": verr.Error()})
-				return
-			}
-			promptContent = virtual
-			promptRegion = vregion
+	// The latest proposal for THIS file is the one to revise. With several
+	// files in a round the last turn overall is about another file, so
+	// looking only at history[len-1] would silently throw this file's
+	// pending proposal away.
+	if code, pending := aiEditPendingCode(history, rel, rel); pending {
+		virtual, vregion, verr := aiEditVirtualRegion(content, region, code)
+		if verr != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": verr.Error()})
+			return
 		}
+		promptContent = virtual
+		promptRegion = vregion
 	}
 
 	cfg, err := s.configForConversation(c)
@@ -235,7 +319,7 @@ func (s *Server) handleAiEdit(w http.ResponseWriter, r *http.Request) {
 	client := s.newClient(cfg)
 	secrets := s.secretsFor(c.ID)
 
-	prompt := buildAiEditPrompt(rel, promptContent, promptRegion, req.Instruction, history)
+	prompt := buildAiEditPrompt(rel, promptContent, promptRegion, req.Instruction, history, "")
 
 	// SSE only if the client asked for it and the ResponseWriter can flush.
 	flusher, canFlush := w.(http.Flusher)
@@ -289,7 +373,7 @@ func (s *Server) handleAiEdit(w http.ResponseWriter, r *http.Request) {
 	hunks, preview := aiEditDiff(region.OldText, newText, region.StartLine)
 	before, after := aiEditContext(content, region, aiEditContextLines)
 
-	out := aiEditResponse{
+	prop := aiEditProposal{
 		Path:          rel,
 		BaseHash:      fileSHA256([]byte(content)),
 		StartLine:     region.StartLine,
@@ -303,6 +387,7 @@ func (s *Server) handleAiEdit(w http.ResponseWriter, r *http.Request) {
 		ContextAfter:  Redact(after, secrets...),
 		Truncated:     region.Truncated,
 	}
+	out := aiEditResponseFromProposals([]aiEditProposal{prop})
 	if stream {
 		writeAiEditEvent(w, flusher, "done", out)
 		return
@@ -316,155 +401,14 @@ func (s *Server) handleAiEditApply(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	path := strings.TrimSpace(req.Path)
-	if path == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "path is required"})
-		return
-	}
-	if strings.TrimSpace(req.BaseHash) == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "base_hash is required: 需要它判断文件是否在你编辑期间被改动过"})
-		return
-	}
-
-	convID := r.PathValue("id")
-	c, err := s.loadConv(convID)
-	if err != nil {
-		writeJSON(w, statusForConvErr(err), map[string]string{"error": err.Error()})
-		return
-	}
-	_, rel, err := resolveProjectPath(c.WorkDir, path)
+	items, err := aiEditApplyItems(req)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-
-	unlock, lerr := s.mgr.BeginWorkdirWrite(c.WorkDir, "ai-edit:"+c.ID+":"+rel)
-	if lerr != nil {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "当前工作区正被另一任务占用，不能回写：" + lerr.Error()})
-		return
-	}
-	defer unlock()
-
-	// Reload under the lease: the conversation may have been rebound to a
-	// different workdir while we waited.
-	if latest, e2 := s.loadConv(convID); e2 == nil {
-		c = latest
-	}
-
-	sb, err := tools.NewSandbox(c.WorkDir)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
-	content, err := sb.ReadFile(rel)
-	if err != nil {
-		if os.IsNotExist(err) {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "file not found"})
-			return
-		}
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
-	if got := fileSHA256([]byte(content)); got != strings.TrimSpace(req.BaseHash) {
-		writeJSON(w, http.StatusConflict, map[string]string{
-			"error":         "文件在你生成改动之后被修改过，已停止写回，请重新生成",
-			"conflict_path": rel,
-		})
-		return
-	}
-
-	region, err := aiEditRegionFor(content, aiEditSelection{
-		StartLine:  req.StartLine,
-		EndLine:    req.EndLine,
-		InsertLine: req.InsertLine,
-	})
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-		return
-	}
-	if region.OldText != req.OldText {
-		writeJSON(w, http.StatusConflict, map[string]string{
-			"error":         "选中的代码与生成时不一致（文件可能已被外部修改），已停止写回",
-			"conflict_path": rel,
-		})
-		return
-	}
-
-	replacement, hunks, err := applyHunkDecisions(region.OldText, req.NewText, req.Decisions)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-		return
-	}
-	if region.InsertLine > 0 {
-		// An insertion has no old text to inherit line breaks from, so make
-		// sure it cannot glue itself onto the neighbouring lines.
-		if replacement != "" && !strings.HasSuffix(replacement, "\n") {
-			replacement += "\n"
-		}
-		if region.StartOffset > 0 && content[region.StartOffset-1] != '\n' {
-			replacement = "\n" + replacement
-		}
-	}
-
-	newContent := content[:region.StartOffset] + replacement + content[region.EndOffset:]
-	applied, rejected := 0, 0
-	for i := range hunks {
-		if i < len(req.Decisions) && !req.Decisions[i] {
-			rejected++
-			continue
-		}
-		applied++
-	}
-	if newContent == content {
-		writeJSON(w, http.StatusOK, aiEditApplyResponse{
-			Path:       rel,
-			Applied:    0,
-			Rejected:   rejected,
-			NewContent: content,
-		})
-		return
-	}
-
-	if err := sb.WriteFile(rel, newContent); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
-
-	// Remember how to undo this write. A later edit overwrites the record:
-	// inline edit undo is one level deep, like an editor's Cmd-Z after a
-	// single accepted change.
-	undo := &aiEditUndoRecord{
-		Version:    aiEditUndoVersion,
-		ConvID:     c.ID,
-		WorkDir:    c.WorkDir,
-		Path:       rel,
-		Restore:    content,
-		BeforeHash: fileSHA256([]byte(content)),
-		TargetHash: fileSHA256([]byte(newContent)),
-		At:         time.Now().UTC(),
-	}
-	if err := saveAiEditUndo(s.dataDir, undo); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "文件已写回，但撤销记录保存失败: " + err.Error()})
-		return
-	}
-
-	secrets := s.secretsFor(c.ID)
-	s.mu.Lock()
-	if latest, lerr := loadConversation(s.dataDir, c.ID); lerr == nil {
-		c = latest
-	}
-	c.appendMessage("system", kindNotice,
-		fmt.Sprintf("AI 已按块写回 %s（接受 %d 块，拒绝 %d 块）。", rel, applied, rejected),
-		"", "ai_edit_applied", secrets)
-	_ = saveConversation(s.dataDir, c, secrets)
-	s.mu.Unlock()
-
-	writeJSON(w, http.StatusOK, aiEditApplyResponse{
-		Path:       rel,
-		Applied:    applied,
-		Rejected:   rejected,
-		NewContent: newContent,
-	})
+	// Single-file and multi-file writes go through the same guarded path:
+	// every file is checked before the first one is touched.
+	s.applyAiEditProposals(w, r, items)
 }
 
 // aiEditRegion is the resolved byte/line span of one inline edit.
@@ -611,7 +555,7 @@ func aiEditTimeout(cfg agent.Config) time.Duration {
 // buildAiEditPrompt renders the system+user messages. The whole file is sent
 // when it fits, because an inline edit that cannot see the types and helpers
 // around it produces plausible garbage.
-func buildAiEditPrompt(rel, content string, region aiEditRegion, instruction string, history []aiEditTurn) []llm.Message {
+func buildAiEditPrompt(rel, content string, region aiEditRegion, instruction string, history []aiEditTurn, siblings string) []llm.Message {
 	lineCount := len(lineStartOffsets(content)) - 1
 	body, truncated := aiEditContextBlock(content, region)
 
@@ -622,6 +566,11 @@ func buildAiEditPrompt(rel, content string, region aiEditRegion, instruction str
 		"3. 保持文件原有缩进、引号风格和换行风格。\n" +
 		"4. 除指令要求的改动外，尽量保持原代码不变；不需要改动时原样输出选区代码。\n" +
 		"5. 不要编造不存在的函数或依赖；需要上下文时优先复用文件中已有的定义。"
+	if siblings != "" {
+		system += "\n6. 这条指令会同时改多个文件。「一起改的文件」里每个文件都会用同一条指令单独生成，" +
+			"你只负责当前文件选区的替换代码，不要输出别的文件的内容或文件名。" +
+			"如果当前文件不需要改动，原样输出选区代码。"
+	}
 
 	target := fmt.Sprintf("选中行范围：%d-%d（共 %d 行）", region.StartLine, region.EndLine, region.EndLine-region.StartLine+1)
 	if region.InsertLine > 0 {
@@ -642,6 +591,9 @@ func buildAiEditPrompt(rel, content string, region aiEditRegion, instruction str
 		}
 		user += "\n下面选区里的代码已经是上一轮的产出。请在它的基础上执行新的指令，" +
 			"保留上一轮已经做对的部分，仍只输出选区范围的完整替换代码。\n"
+	}
+	if siblings != "" {
+		user += "\n一起改的文件（同样执行下面的指令，你不要输出它们的代码）：\n" + siblings
 	}
 	user += "\n" + body + "\n改写指令：" + instruction + "\n\n只输出替换后的代码："
 	return []llm.Message{
