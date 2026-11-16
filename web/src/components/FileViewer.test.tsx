@@ -516,3 +516,108 @@ describe('FileViewer ghost diff during a live run', () => {
     expect(context.length).toBeGreaterThan(0)
   })
 })
+
+describe('FileViewer streaming Cmd-K preview', () => {
+  let root: Root
+  let host: HTMLElement
+
+  beforeEach(() => {
+    host = document.createElement('div')
+    document.body.appendChild(host)
+    root = createRoot(host)
+    ;(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
+    vi.spyOn(api, 'fsFile').mockResolvedValue({
+      path: FILE,
+      content: CONTENT,
+      size: CONTENT.length,
+      hash: 'hash-1',
+      editable: true,
+      mode: 0o644,
+    })
+    useStore.setState({
+      currentConvId: 'conv-a',
+      fileView: { path: FILE, sessionId: 'sess-a' },
+      turnChanges: null,
+      live: null,
+      aiEditOpen: true,
+      aiEditPath: FILE,
+      aiEditTargets: [{ path: FILE, selection: { start_line: 2, end_line: 2 } }],
+      aiEditSelection: { start_line: 2, end_line: 2 },
+      aiEditStreaming: '',
+      aiEditBusy: true,
+      aiEditResult: null,
+      aiEditHistory: [],
+      aiEditUndoDepth: 0,
+    })
+  })
+
+  afterEach(() => {
+    act(() => root.unmount())
+    host.remove()
+    vi.restoreAllMocks()
+  })
+
+  it('streams the arriving code as add rows over the old region while generating', async () => {
+    await act(async () => {
+      root.render(<FileViewer sessionId="sess-a" path={FILE} />)
+      await Promise.resolve()
+    })
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    // Partial code has landed: the streamed lines are adds, the old line that
+    // will be replaced is a remove, the header says it is still generating.
+    await act(async () => {
+      useStore.setState({ aiEditStreaming: 'line two rewritten' })
+    })
+    expect((host.textContent ?? '').includes('正在生成改写')).toBe(true)
+    const added = Array.from(host.querySelectorAll('pre span.block')).find((sp) =>
+      (sp.textContent ?? '').includes('line two rewritten'),
+    )
+    expect(added?.className).toContain('bg-emerald-950')
+    const removed = Array.from(host.querySelectorAll('pre span.block')).filter((sp) =>
+      (sp.textContent ?? '').includes('line two'),
+    )
+    expect(removed.length).toBeGreaterThan(0)
+  })
+
+  it('hands over to the finished proposal when generation completes', async () => {
+    await act(async () => {
+      root.render(<FileViewer sessionId="sess-a" path={FILE} />)
+      await Promise.resolve()
+    })
+    await act(async () => {
+      useStore.setState({ aiEditStreaming: 'line two rewritten' })
+    })
+    await act(async () => {
+      useStore.setState({
+        aiEditBusy: false,
+        aiEditResult: {
+          path: FILE,
+          base_hash: 'hash-1',
+          start_line: 2,
+          end_line: 2,
+          old_text: 'line two\n',
+          new_text: 'line two rewritten\n',
+          hunks: [
+            {
+              index: 0,
+              lines: [
+                { type: 'remove', old_no: 2, text: 'line two' },
+                { type: 'add', new_no: 2, text: 'line two rewritten' },
+              ],
+            },
+          ],
+          preview: '',
+        },
+      })
+    })
+    expect((host.textContent ?? '').includes('正在生成改写')).toBe(false)
+    expect((host.textContent ?? '').includes('AI 改写预览')).toBe(true)
+    const added = Array.from(host.querySelectorAll('pre span.block')).find((sp) =>
+      (sp.textContent ?? '').includes('line two rewritten'),
+    )
+    expect(added?.className).toContain('bg-emerald-950')
+  })
+})

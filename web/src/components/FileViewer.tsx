@@ -139,6 +139,90 @@ function ProposalView({ result }: { result: AiEditProposal }) {
   )
 }
 
+// StreamingProposalView renders a Cmd-K generation IN PROGRESS: the streamed
+// code so far as emerald add rows, the old region lines that will be replaced
+// as rose rows, the file around the region as plain context. It is derived
+// from the raw stream (aiEditStreaming) diffed against the old region, so it
+// grows as chunks land; the finished proposal (ProposalView) takes over when
+// generation completes. Single-file rounds only — a multi-file round shows
+// progress in the dialog instead.
+export function StreamingProposalView({
+  draft,
+  startLine,
+  endLine,
+  streamed,
+  path,
+}: {
+  draft: string
+  startLine: number
+  endLine: number
+  streamed: string
+  path: string
+}) {
+  const fileLines = useMemo(() => draft.split('\n'), [draft])
+  const oldRegion = useMemo(() => {
+    const from = Math.max(0, startLine - 1)
+    const to = Math.max(from, endLine)
+    return fileLines.slice(from, to).join('\n')
+  }, [fileLines, startLine, endLine])
+  const rows = useMemo(() => {
+    const out: ProposalRow[] = []
+    const diff = computeDiff(oldRegion, streamed)
+    let newNo = startLine
+    for (const l of diff.lines) {
+      if (l.type === 'remove') {
+        out.push({ type: 'remove', no: l.oldNo ?? newNo, text: l.text })
+      } else if (l.type === 'add') {
+        out.push({ type: 'add', no: newNo, text: l.text })
+        newNo += 1
+      } else {
+        out.push({ type: 'context', no: newNo, text: l.text })
+        newNo += 1
+      }
+    }
+    return out
+  }, [oldRegion, streamed, startLine])
+  const lang = LangFromPath(path)
+  const tokens = useMemo(() => tokenizeLines(rows.map((r) => r.text).join('\n'), lang), [rows, lang])
+  return (
+    <div className="flex min-h-0 flex-1 flex-col overflow-hidden bg-ink-950/60">
+      <div className="shrink-0 border-b border-brand-800/50 bg-brand-950/30 px-4 py-1.5 text-[11.5px] text-brand-200">
+        正在生成改写…（下面是已到达的部分，以增删行实时显示）
+      </div>
+      <div className="flex min-h-0 min-w-0 flex-1">
+        <div
+          aria-hidden
+          className="w-14 shrink-0 overflow-hidden border-r border-ink-800 bg-ink-950/80 py-2 text-right font-mono text-[12px] leading-[1.6] text-slate-700"
+        >
+          {rows.map((r, i) => (
+            <div key={i} className="px-2 text-slate-700">
+              {r.type === 'remove' ? '~' : r.no}
+            </div>
+          ))}
+        </div>
+        <pre className="min-h-0 min-w-0 flex-1 overflow-auto whitespace-pre px-3 py-2 font-mono text-[12px] leading-[1.6] text-slate-300">
+          {rows.map((r, i) => (
+            <span
+              key={i}
+              className={`block ${r.type === 'add' ? 'bg-emerald-950/40' : r.type === 'remove' ? 'bg-rose-950/40' : ''}`}
+            >
+              <span aria-hidden className="mr-2 inline-block w-3 select-none text-right text-slate-600">
+                {r.type === 'add' ? '+' : r.type === 'remove' ? '-' : ' '}
+              </span>
+              {tokens[i].map((t, j) => (
+                <span key={j} className={TOKEN_CLASS[t.kind]}>
+                  {t.text}
+                </span>
+              ))}
+              {'\n'}
+            </span>
+          ))}
+        </pre>
+      </div>
+    </div>
+  )
+}
+
 export function CodeEditor({
   value,
   path,
@@ -257,6 +341,11 @@ export function FileViewer({ sessionId, path }: { sessionId: string | null; path
   const addAiEditTarget = useStore((s) => s.addAiEditTarget)
   const aiEditOpen = useStore((s) => s.aiEditOpen)
   const fileReloadNonce = useStore((s) => s.fileReloadNonce)
+  const aiEditBusy = useStore((s) => s.aiEditBusy)
+  const aiEditStreaming = useStore((s) => s.aiEditStreaming)
+  const aiEditPath = useStore((s) => s.aiEditPath)
+  const aiEditTargets = useStore((s) => s.aiEditTargets)
+  const aiEditSelection = useStore((s) => s.aiEditSelection)
   // A pending AI rewrite for THIS file is reviewed in place, in this panel.
   // A multi-file round carries one proposal per file, so the preview must
   // pick the entry for the file actually open — not the first one.
@@ -266,6 +355,12 @@ export function FileViewer({ sessionId, path }: { sessionId: string | null; path
     const list = proposals.proposals?.length ? proposals.proposals : [proposals]
     return list.find((p) => sameRelPath(p.path, path)) ?? null
   }, [proposals, path])
+  // A single-file Cmd-K generation streams the code into this pane as it
+  // lands; multi-file rounds report progress in the dialog instead (the
+  // stream interleaves files, so per-file diffs would lie about order).
+  const aiSel = aiEditTargets[0]?.selection ?? aiEditSelection ?? {}
+  const streamingHere =
+    aiEditBusy && aiEditPath === path && aiEditTargets.length <= 1 && aiEditStreaming.length > 0
   const [file, setFile] = useState<FsFileResponse | null>(null)
   const [draft, setDraft] = useState('')
   const [baseHash, setBaseHash] = useState('')
@@ -702,6 +797,16 @@ export function FileViewer({ sessionId, path }: { sessionId: string | null; path
         </div>
       )}
 
+      {streamingHere && !loading && !problem && file && (
+        <StreamingProposalView
+          draft={draft}
+          startLine={aiSel.start_line ?? 1}
+          endLine={aiSel.end_line ?? aiSel.start_line ?? 1}
+          streamed={aiEditStreaming}
+          path={path}
+        />
+      )}
+
       {(!change || !showDiff) && !loading && !problem && file && proposal && (
         <>
           <p className="shrink-0 border-b border-line bg-brand-950/40 px-4 py-1.5 text-[11.5px] text-brand-200">
@@ -711,7 +816,7 @@ export function FileViewer({ sessionId, path }: { sessionId: string | null; path
         </>
       )}
 
-      {(!change || !showDiff) && !loading && !problem && file && !proposal && (
+      {(!change || !showDiff) && !streamingHere && !loading && !problem && file && !proposal && (
         <CodeEditor
           key={path}
           value={draft}
