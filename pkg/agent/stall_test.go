@@ -246,3 +246,59 @@ timed out
 		t.Fatal("different timed-out commands must not share a fingerprint")
 	}
 }
+
+// TestStall_WindowSurvivesStepTimeouts is the observed weak-model run: the
+// leaf alternated "compile error" ↔ per-step model timeout, every
+// fingerprint's consecutive run stayed at 1, and MaxStall never fired while
+// the leaf retried 8+ times. A timeout interrupts the repair of the failure
+// before it — it must inherit that failure's fingerprint so the stall window
+// keeps building.
+func TestStall_WindowSurvivesStepTimeouts(t *testing.T) {
+	work, data := t.TempDir(), t.TempDir()
+	cfg := mgrCfg(work, data, "sess_stall_timeout_"+t.Name())
+	cfg.MaxStall = 3
+	tree := engine.NewTaskTree("t-stall-timeout", "root", "goal")
+	o, err := New(cfg, tree, nil, SilentLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(o.Close)
+	leaf, err := tree.AddChild(tree.GetRoot().ID, "leaf-stall", "leaf", "do it", models.NodeTypeLeaf)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	compileErr := "math/math_test.go:11:2: expected declaration, found a"
+	o.recordNodeError(leaf.ID, compileErr)
+	timeoutMsg := ErrStepTimeout.Error() + " (2m0s); the attempt ended without a model reply"
+	o.recordNodeError(leaf.ID, timeoutMsg)
+	o.recordNodeError(leaf.ID, timeoutMsg)
+
+	hist, ok := func() ([]models.ErrorRecord, bool) {
+		n, ok := o.tree.CloneNode(leaf.ID)
+		return n.ErrorHistory, ok
+	}()
+	if !ok || len(hist) != 3 {
+		t.Fatalf("expected 3 records, got %d (ok=%v)", len(hist), ok)
+	}
+	fpCompile := hist[0].Fingerprint
+	for i, rec := range hist[1:] {
+		if rec.Fingerprint != fpCompile {
+			t.Fatalf("timeout record %d must inherit the compile fingerprint %q, got %q", i+1, fpCompile, rec.Fingerprint)
+		}
+	}
+	if run, stalled := o.stalled(leaf.ID); !stalled {
+		t.Fatalf("alternation compile↔timeout must reach MaxStall, run=%d", run)
+	} else if run != cfg.MaxStall {
+		t.Fatalf("run = %d, want %d", run, cfg.MaxStall)
+	}
+
+	// A genuinely new failure still starts a fresh window: the model did
+	// change the outcome, so the stall detector must not carry the old chain.
+	fresh := "verify: different command failed differently"
+	o.recordNodeError(leaf.ID, fresh)
+	n, _ := o.tree.CloneNode(leaf.ID)
+	if n.StallRun() != 1 {
+		t.Fatalf("a new failure must restart the window, run=%d", n.StallRun())
+	}
+}

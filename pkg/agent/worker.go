@@ -59,6 +59,14 @@ func (o *Orchestrator) runWorker(ctx context.Context, sb *tools.Sandbox, node *m
 			cancel()
 		}
 		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil && reqTimeout > 0 {
+				// The parent context is alive, so this is one hung model
+				// request, not a user abort or a leaf-budget expiry. Name the
+				// knob instead of leaking "context deadline exceeded" into the
+				// node's error history, where it reads like a code failure.
+				return summary, fmt.Errorf("%w (%s); the attempt ended without a model reply",
+					ErrStepTimeout, reqTimeout)
+			}
 			return summary, err
 		}
 		o.log.Debugf("worker raw: %s", truncate(resp.Content, 400))
@@ -235,6 +243,13 @@ const maxInvalidJSONRounds = 3
 // RetryCount / MaxRetries — syntax noise must not burn the leaf budget the
 // way a real verify failure does.
 var ErrInvalidJSON = errors.New("invalid JSON replies")
+
+// ErrStepTimeout marks one model request that hit the per-step timeout while
+// the leaf context itself was alive. It is not a code failure: retrying makes
+// sense, but the stall detector must treat it as a continuation of whatever
+// the leaf was already failing on (see stallFingerprintFor), not as fresh
+// evidence of progress.
+var ErrStepTimeout = errors.New("model request exceeded the per-step timeout")
 
 // ErrStall ends a turn that keeps producing the same failure after its
 // strategy-change interventions were exhausted: continuing has been shown not

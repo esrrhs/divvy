@@ -1484,7 +1484,7 @@ func (o *Orchestrator) recordSessionEnd(mode string, start time.Time, err error)
 // fingerprint is stored too: it is what lets the stall detector tell a leaf
 // that is repeating itself apart from one that is still making progress.
 func (o *Orchestrator) recordNodeError(nodeID, msg string) {
-	fp := stallFingerprint(o.projectType(), msg)
+	fp := o.stallFingerprintFor(nodeID, msg)
 	_ = o.tree.UpdateNode(nodeID, func(n *models.TaskNode) error {
 		n.RetryCount++
 		n.ErrorMsg = msg
@@ -1495,6 +1495,27 @@ func (o *Orchestrator) recordNodeError(nodeID, msg string) {
 		})
 		return nil
 	})
+}
+
+// stallFingerprintFor computes the failure fingerprint for the stall window.
+// A per-step model timeout is not a new failure mode: it interrupted the
+// repair of whatever the leaf was already failing on. Observed on a real weak
+// model — the leaf alternated "compile error" ↔ "context deadline exceeded",
+// every fingerprint's consecutive run stayed at 1, and the MaxStall safety
+// net never fired while the leaf retried 8+ times. Inherit the previous
+// fingerprint for timeouts so the chain keeps building; a leaf that had
+// actually progressed presents a new failure fingerprint instead.
+func (o *Orchestrator) stallFingerprintFor(nodeID, msg string) string {
+	if strings.Contains(msg, ErrStepTimeout.Error()) {
+		if live, ok := o.tree.CloneNode(nodeID); ok {
+			if n := len(live.ErrorHistory); n > 0 {
+				if fp := live.ErrorHistory[n-1].Fingerprint; fp != "" {
+					return fp
+				}
+			}
+		}
+	}
+	return stallFingerprint(o.projectType(), msg)
 }
 
 func (o *Orchestrator) printTree() {
