@@ -386,20 +386,24 @@ describe('FileViewer ghost diff during a live run', () => {
     expect(diffVisible()).toBe(true)
   })
 
-  it('does not ghost when the turn has ended', async () => {
+  it('ghosts a watched session even after it finished: fast turns complete between polls', async () => {
+    // A scripted (or very fast) model run lands the whole turn between two
+    // polls — by the time the change arrives the phase is done, but the UI
+    // watched this session, so the diff must still surface.
     useStore.setState({
       live: { session_id: 'sess-a', phase: 'done', approval_mode: 'auto', workdir: '/tmp' },
     })
     await renderViewer()
     await setChanges([{ path: FILE, status: 'modified', old_content: 'a', new_content: 'UNIQUE_V1' }])
-    await act(async () => {
-      await Promise.resolve()
-    })
+    expect(diffVisible()).toBe(true)
+  })
+
+  it('does not ghost on a page reload of a finished conversation (no live session)', async () => {
+    useStore.setState({ live: null })
+    await renderViewer()
+    await setChanges([{ path: FILE, status: 'modified', old_content: 'a', new_content: 'UNIQUE_V1' }])
     expect(diffVisible()).toBe(false)
     await setChanges([{ path: FILE, status: 'modified', old_content: 'a', new_content: 'UNIQUE_V2' }])
-    await act(async () => {
-      await Promise.resolve()
-    })
     expect(diffVisible()).toBe(false)
   })
 

@@ -208,7 +208,6 @@ export function FileViewer({ sessionId, path }: { sessionId: string | null; path
   const attachSelection = useStore((s) => s.attachSelection)
   const setViewerSelection = useStore((s) => s.setViewerSelection)
   const openFile = useStore((s) => s.openFile)
-  const livePhase = useStore((s) => s.live?.phase)
   const openAiEditDialog = useStore((s) => s.openAiEditDialog)
   const addAiEditTarget = useStore((s) => s.addAiEditTarget)
   const aiEditOpen = useStore((s) => s.aiEditOpen)
@@ -238,8 +237,16 @@ export function FileViewer({ sessionId, path }: { sessionId: string | null; path
   // honored until the next change arrives.
   const lastSeenChangeRef = useRef<string | null>(null)
   const diffScrollRef = useRef<HTMLDivElement | null>(null)
-  const runActive =
-    livePhase === 'running' || livePhase === 'leaf_approval' || livePhase === 'ask' || livePhase === 'plan_review'
+  // The ghost belongs to a session this UI actually watched. `runActive`
+  // alone is not enough: a scripted (or very fast) turn completes between two
+  // polls, so by the time the change lands the phase is already done — and
+  // the flip must still happen, or single-edit turns never ghost at all
+  // (observed in the GUI with a scripted endpoint finishing in ~2.5s).
+  const liveSession = useStore((s) => s.live)
+  const ghostAllowed =
+    !!liveSession &&
+    !!turnChanges &&
+    liveSession.session_id === turnChanges.sessionId
 
   const dirty = !!file && draft !== file.content
   const change: FileChange | undefined = turnChanges?.changes.find((c) => sameRelPath(c.path, path))
@@ -263,19 +270,24 @@ export function FileViewer({ sessionId, path }: { sessionId: string | null; path
       lastSeenChangeRef.current = null
       return
     }
-    if (lastSeenChangeRef.current === null) {
-      lastSeenChangeRef.current = changeKey
+    const seen = lastSeenChangeRef.current
+    lastSeenChangeRef.current = changeKey
+    if (!ghostAllowed) {
+      // Idle: this is history (an earlier turn's diff or an old reload) —
+      // never yank the editor away on its own.
       return
     }
-    if (lastSeenChangeRef.current === changeKey) return
-    lastSeenChangeRef.current = changeKey
-    if (!runActive) return
+    // Watched session: the change either just appeared (the first edit
+    // landed while watching — a typical one-edit turn) or grew. Both are the
+    // ghost moment.
+    if (seen !== null && seen === changeKey) return
+(fix(web): ghost 网关改为『被观看的 session』——脚本化端点实测暴露的时序洞)
     setShowDiff(true)
     requestAnimationFrame(() => {
       const el = diffScrollRef.current
       if (el) el.scrollTop = el.scrollHeight
     })
-  }, [changeKey, runActive])
+  }, [changeKey, ghostAllowed])
 
   useEffect(() => {
     if (!dirty) return
@@ -572,9 +584,10 @@ export function FileViewer({ sessionId, path }: { sessionId: string | null; path
         // Mid-run the agent edits files beyond the one on screen. Surfacing
         // them as a one-click hop keeps the whole turn legible without yanking
         // the user away from the file they are reading.
-        const others = runActive
-          ? (turnChanges?.changes ?? []).filter((c) => !sameRelPath(c.path, path))
-          : []
+        const others =
+          ghostAllowed
+            ? (turnChanges?.changes ?? []).filter((c) => !sameRelPath(c.path, path))
+            : []
         if (others.length === 0) return null
         return (
           <div className="shrink-0 border-b border-line bg-brand-950/20 px-4 py-1.5 text-[11.5px] text-brand-200">
