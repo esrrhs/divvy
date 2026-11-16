@@ -1,6 +1,7 @@
-import { useMemo, useState } from 'react'
+import { useMemo, useRef, useState } from 'react'
 import { useStore } from '../store'
 import type { StreamEvent } from '../types'
+import { clampSplitRatio } from '../lib/conversation'
 import { compactTokens, treeStats } from '../lib/tree'
 import { ProjectForm } from './ProjectForm'
 import { ConversationView } from './ConversationView'
@@ -139,10 +140,66 @@ function SessionView() {
   )
 }
 
+// Persisted conversation/viewer width ratio for the split layout.
+const SPLIT_KEY = 'divvy.splitRatio'
+
+function initialSplitRatio(): number {
+  try {
+    const raw = Number(localStorage.getItem(SPLIT_KEY) ?? '')
+    return clampSplitRatio(raw || Number.NaN)
+  } catch {
+    return 0.4
+  }
+}
+
 export function CenterMain() {
   const currentId = useStore((s) => s.currentId)
   const currentConvId = useStore((s) => s.currentConvId)
   const fileView = useStore((s) => s.fileView)
+  const [splitRatio, setSplitRatio] = useState(initialSplitRatio)
+  const splitRowRef = useRef<HTMLDivElement | null>(null)
+  const dragStart = useRef<{ x: number; ratio: number } | null>(null)
+
+  // The divider is the width allocation knob: drag it, or nudge with arrow
+  // keys. The ratio lives in localStorage so a reload keeps the layout.
+  function startDrag(e: React.MouseEvent) {
+    e.preventDefault()
+    const row = splitRowRef.current
+    if (!row) return
+    dragStart.current = { x: e.clientX, ratio: splitRatio }
+    const onMove = (ev: MouseEvent) => {
+      const w = row.getBoundingClientRect().width
+      const start = dragStart.current
+      if (!start || w <= 0) return
+      setSplitRatio(clampSplitRatio(start.ratio + (ev.clientX - start.x) / w))
+    }
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+      setSplitRatio((r) => {
+        try {
+          localStorage.setItem(SPLIT_KEY, String(r))
+        } catch {
+          // Private-mode storage: the layout just won't persist.
+        }
+        return r
+      })
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+  }
+
+  function nudge(delta: number) {
+    setSplitRatio((r) => {
+      const next = clampSplitRatio(r + delta)
+      try {
+        localStorage.setItem(SPLIT_KEY, String(next))
+      } catch {
+        // Same as above: persistence is best effort.
+      }
+      return next
+    })
+  }
 
   if (!currentConvId && !currentId) {
     return (
@@ -170,12 +227,34 @@ export function CenterMain() {
   // workspace file with no active conversation keeps the full-pane behavior.
   if (fileView && currentConvId) {
     return (
-      <div className="flex min-h-0 flex-1">
-        <div className="flex min-h-0 min-w-0 flex-[2] flex-col border-r border-line">
+      <div ref={splitRowRef} className="flex min-h-0 flex-1">
+        <div
+          className="flex min-h-0 min-w-0 flex-col border-r border-line"
+          style={{ width: `${splitRatio * 100}%` }}
+        >
           <ConversationView />
           {currentId || currentConvId ? <SessionView /> : null}
         </div>
-        <div className="flex min-h-0 min-w-0 flex-[3] flex-col bg-ink-900">
+        <div
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="调整对话与文件面板宽度"
+          tabIndex={0}
+          title="拖动调整宽度；←/→ 微调"
+          className="w-1 shrink-0 cursor-col-resize bg-ink-800 hover:bg-brand-700/70 focus:bg-brand-700/70 focus:outline-none"
+          onMouseDown={startDrag}
+          onKeyDown={(e) => {
+            if (e.key === 'ArrowLeft') {
+              e.preventDefault()
+              nudge(-0.02)
+            }
+            if (e.key === 'ArrowRight') {
+              e.preventDefault()
+              nudge(0.02)
+            }
+          }}
+        />
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-ink-900">
           <FileViewer sessionId={fileView.sessionId} path={fileView.path} />
         </div>
       </div>

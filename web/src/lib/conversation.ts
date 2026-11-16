@@ -277,3 +277,11 @@ export function autoContext(
   }
   return {}
 }
+
+// The split layout's conversation/viewer ratio. Clamped so neither pane can
+// collapse to nothing by dragging; 0.4 keeps the composer usable at narrow
+// widths without starving the diff review.
+export function clampSplitRatio(raw: number): number {
+  if (!Number.isFinite(raw)) return 0.4
+  return Math.min(0.7, Math.max(0.2, raw))
+}

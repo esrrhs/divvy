@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import type { CodeSelection } from '../types'
 import {
   autoContext,
+  clampSplitRatio,
   composeState,
   conversationRowKind,
   isResumablePhase,
@@ -217,5 +218,15 @@ describe('autoContext', () => {
 
   it('no open file means no auto context', () => {
     expect(autoContext(null, false, sel(), [], [])).toEqual({})
+  })
+})
+
+describe('clampSplitRatio', () => {
+  it('keeps the panes usable at the extremes and defaults on garbage', () => {
+    expect(clampSplitRatio(0.4)).toBe(0.4)
+    expect(clampSplitRatio(0.05)).toBe(0.2)
+    expect(clampSplitRatio(0.95)).toBe(0.7)
+    expect(clampSplitRatio(Number.NaN)).toBe(0.4)
+    expect(clampSplitRatio(Number.POSITIVE_INFINITY)).toBe(0.4)
   })
 })

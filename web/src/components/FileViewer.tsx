@@ -207,6 +207,8 @@ export function FileViewer({ sessionId, path }: { sessionId: string | null; path
   const cancelFileNav = useStore((s) => s.cancelFileNav)
   const attachSelection = useStore((s) => s.attachSelection)
   const setViewerSelection = useStore((s) => s.setViewerSelection)
+  const openFile = useStore((s) => s.openFile)
+  const livePhase = useStore((s) => s.live?.phase)
   const openAiEditDialog = useStore((s) => s.openAiEditDialog)
   const addAiEditTarget = useStore((s) => s.addAiEditTarget)
   const aiEditOpen = useStore((s) => s.aiEditOpen)
@@ -230,6 +232,14 @@ export function FileViewer({ sessionId, path }: { sessionId: string | null; path
   const [attachNote, setAttachNote] = useState<string | null>(null)
   const [sel, setSel] = useState<{ start: number; end: number }>({ start: 0, end: 0 })
   const [showDiff, setShowDiff] = useState(!!preferDiff)
+  // Ghost diff: while the turn is running, every new version of this file's
+  // change flips the pane to the diff and scrolls to the newest hunk — the
+  // edits scroll in as they land, Cursor-style. A manual 当前文件 click is
+  // honored until the next change arrives.
+  const lastSeenChangeRef = useRef<string | null>(null)
+  const diffScrollRef = useRef<HTMLDivElement | null>(null)
+  const runActive =
+    livePhase === 'running' || livePhase === 'leaf_approval' || livePhase === 'ask' || livePhase === 'plan_review'
 
   const dirty = !!file && draft !== file.content
   const change: FileChange | undefined = turnChanges?.changes.find((c) => sameRelPath(c.path, path))
@@ -239,6 +249,33 @@ export function FileViewer({ sessionId, path }: { sessionId: string | null; path
     setFileDirty(dirty)
     return () => setFileDirty(false)
   }, [dirty, setFileDirty])
+
+  // Keyed on what makes the change "different": applied status plus the
+  // full old/new contents (a same-length replacement must still count).
+  // Mid-run each edit tool rewrites the file; at apply time applied_* changes.
+  // First sight after open never yanks the user — the diff surfaces from the
+  // second difference onward.
+  const changeKey = change
+    ? `${appliedKey}|${change.old_content ?? ''}|${change.new_content ?? ''}`
+    : ''
+  useEffect(() => {
+    if (!change) {
+      lastSeenChangeRef.current = null
+      return
+    }
+    if (lastSeenChangeRef.current === null) {
+      lastSeenChangeRef.current = changeKey
+      return
+    }
+    if (lastSeenChangeRef.current === changeKey) return
+    lastSeenChangeRef.current = changeKey
+    if (!runActive) return
+    setShowDiff(true)
+    requestAnimationFrame(() => {
+      const el = diffScrollRef.current
+      if (el) el.scrollTop = el.scrollHeight
+    })
+  }, [changeKey, runActive])
 
   useEffect(() => {
     if (!dirty) return
@@ -256,13 +293,18 @@ export function FileViewer({ sessionId, path }: { sessionId: string | null; path
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentConvId, path])
 
+  // Navigation-time view choice only. `change` is deliberately NOT a
+  // dependency: mid-run change updates are the ghost diff's job (below), and
+  // this effect re-running on them used to force the editor back over the
+  // ghost whenever the file was opened with preferDiff:false.
   useEffect(() => {
     if (preferDiff === false) {
       setShowDiff(false)
       return
     }
     if (preferDiff && change) setShowDiff(true)
-  }, [preferDiff, change, revealNonce])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [preferDiff, revealNonce])
 
   useEffect(() => {
     let cancelled = false
@@ -526,6 +568,31 @@ export function FileViewer({ sessionId, path }: { sessionId: string | null; path
         </div>
       </div>
 
+      {(() => {
+        // Mid-run the agent edits files beyond the one on screen. Surfacing
+        // them as a one-click hop keeps the whole turn legible without yanking
+        // the user away from the file they are reading.
+        const others = runActive
+          ? (turnChanges?.changes ?? []).filter((c) => !sameRelPath(c.path, path))
+          : []
+        if (others.length === 0) return null
+        return (
+          <div className="shrink-0 border-b border-line bg-brand-950/20 px-4 py-1.5 text-[11.5px] text-brand-200">
+            本轮还在改动：
+            {others.map((c) => (
+              <button
+                key={c.path}
+                type="button"
+                className="ml-1.5 underline hover:text-brand-100"
+                onClick={() => openFile(c.path, sessionId, { preferDiff: true })}
+              >
+                {c.path}
+                {c.status === 'added' ? '（新增）' : c.status === 'deleted' ? '（删除）' : ''}
+              </button>
+            ))}
+          </div>
+        )
+      })()}
       {file?.reason && (
         <p className="shrink-0 border-b border-line bg-ink-900 px-4 py-1.5 text-[11.5px] text-amber-200/90">{file.reason}</p>
       )}
@@ -562,7 +629,7 @@ export function FileViewer({ sessionId, path }: { sessionId: string | null; path
       )}
 
       {change && showDiff && !loading && (
-        <div className="min-h-0 flex-1 overflow-auto px-4 py-3">
+        <div ref={diffScrollRef} className="min-h-0 flex-1 overflow-auto px-4 py-3">
           <p className="mb-2 text-[11.5px] text-slate-500">
             下面是这一轮对该文件的改动（来自该轮开始时的快照）。最新一轮且任务已结束后可按块写回工作区；较早轮次只读，以免误改当前文件。撤销整轮修改是另一件事：会把该轮涉及的文件恢复到该轮开始前，不会按块挑选，也不会使用 git reset。
           </p>

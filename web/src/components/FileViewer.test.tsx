@@ -288,3 +288,138 @@ describe('FileViewer AI rewrite preview', () => {
     expect(targets[1].path).toBe(FILE)
   })
 })
+
+describe('FileViewer ghost diff during a live run', () => {
+  let root: Root
+  let host: HTMLElement
+
+  beforeEach(() => {
+    host = document.createElement('div')
+    document.body.appendChild(host)
+    root = createRoot(host)
+    ;(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
+    vi.spyOn(api, 'fsFile').mockResolvedValue({
+      path: FILE,
+      content: CONTENT,
+      size: CONTENT.length,
+      hash: 'hash-1',
+      editable: true,
+      mode: 0o644,
+    })
+    useStore.setState({
+      currentConvId: 'conv-a',
+      currentId: 'sess-a',
+      conversation: null,
+      desiredConvId: undefined,
+      convNavGen: 0,
+      sessionNavGen: 0,
+      pendingSelections: [],
+      pendingSelectionsByConv: {},
+      fileDirty: false,
+      pendingFileNav: null,
+      loadTurnChanges: async () => {},
+      fileView: { path: FILE, sessionId: 'sess-a', preferDiff: false },
+      turnChanges: null,
+      live: { session_id: 'sess-a', phase: 'running', approval_mode: 'auto', workdir: '/tmp' },
+    })
+  })
+
+  afterEach(() => {
+    act(() => {
+      root.unmount()
+    })
+    host.remove()
+    vi.restoreAllMocks()
+  })
+
+  async function renderViewer() {
+    await act(async () => {
+      root.render(<FileViewer sessionId="sess-a" path={FILE} />)
+      await Promise.resolve()
+    })
+  }
+
+  function diffVisible(): boolean {
+    return (host.textContent ?? '').includes('下面是这一轮对该文件的改动')
+  }
+
+  async function setChanges(changes: Record<string, unknown>[]) {
+    await act(async () => {
+      useStore.setState({
+        turnChanges: { sessionId: 'sess-a', changes: changes as never, editable: false },
+      })
+      await Promise.resolve()
+    })
+  }
+
+  it('flips to the diff when the turn edits the open file, honors the manual switch, and flips again on the next edit', async () => {
+    await renderViewer()
+    // No change yet: editor mode, and the ghost did not fire.
+    expect(diffVisible()).toBe(false)
+
+    // First sight of a change: remember, but do not yank.
+    await setChanges([{ path: FILE, status: 'modified', old_content: 'a', new_content: 'UNIQUE_V1' }])
+    await act(async () => {
+      await Promise.resolve()
+    })
+    expect(diffVisible()).toBe(false)
+
+    // The edit grows (second version): ghost diff surfaces, live run.
+    await setChanges([{ path: FILE, status: 'modified', old_content: 'a', new_content: 'UNIQUE_V2' }])
+    await act(async () => {
+      await Promise.resolve()
+    })
+    expect(diffVisible()).toBe(true)
+
+    // Manual switch back to the editor is honored.
+    await act(async () => {
+      const btn = [...host.querySelectorAll('button')].find((b) => b.textContent?.trim() === '当前文件')
+      btn!.click()
+    })
+    expect(diffVisible()).toBe(false)
+
+    // The next edit wins again: the diff is what the user is here for.
+    await setChanges([{ path: FILE, status: 'modified', old_content: 'a', new_content: 'UNIQUE_V3' }])
+    await act(async () => {
+      await Promise.resolve()
+    })
+    expect(diffVisible()).toBe(true)
+  })
+
+  it('does not ghost when the turn has ended', async () => {
+    useStore.setState({
+      live: { session_id: 'sess-a', phase: 'done', approval_mode: 'auto', workdir: '/tmp' },
+    })
+    await renderViewer()
+    await setChanges([{ path: FILE, status: 'modified', old_content: 'a', new_content: 'UNIQUE_V1' }])
+    await act(async () => {
+      await Promise.resolve()
+    })
+    expect(diffVisible()).toBe(false)
+    await setChanges([{ path: FILE, status: 'modified', old_content: 'a', new_content: 'UNIQUE_V2' }])
+    await act(async () => {
+      await Promise.resolve()
+    })
+    expect(diffVisible()).toBe(false)
+  })
+
+  it('lists the turn\u2019s other touched files with a one-click hop', async () => {
+    await renderViewer()
+    await setChanges([
+      { path: FILE, status: 'modified', old_content: 'a', new_content: 'UNIQUE_V1' },
+      { path: 'pkg/other.go', status: 'added', old_content: '', new_content: 'other body' },
+    ])
+    await act(async () => {
+      await Promise.resolve()
+    })
+    const hop = [...host.querySelectorAll('button')].find((b) => b.textContent?.includes('pkg/other.go'))
+    expect(hop).toBeTruthy()
+    expect(hop!.textContent).toContain('新增')
+
+    await act(async () => {
+      hop!.click()
+    })
+    expect(useStore.getState().fileView?.path).toBe('pkg/other.go')
+    expect(useStore.getState().fileView?.preferDiff).toBe(true)
+  })
+})
