@@ -433,3 +433,86 @@ describe('FileViewer ghost diff during a live run', () => {
     expect(useStore.getState().fileView?.preferDiff).toBe(true)
   })
 })
+
+describe('FileViewer ghost diff during a live run', () => {
+  let root: Root
+  let host: HTMLElement
+
+  beforeEach(() => {
+    host = document.createElement('div')
+    document.body.appendChild(host)
+    root = createRoot(host)
+    ;(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
+    vi.spyOn(api, 'fsFile').mockResolvedValue({
+      path: FILE,
+      content: CONTENT,
+      size: CONTENT.length,
+      hash: 'hash-1',
+      editable: true,
+      mode: 0o644,
+    })
+    useStore.setState({
+      currentConvId: 'conv-a',
+      fileView: { path: FILE, sessionId: 'sess-a' },
+      // Reset what the earlier describes leak: a stale turnChanges + live
+      // pair makes the ghost effect flip to the turn diff, covering the very
+      // proposal preview this describe inspects.
+      turnChanges: null,
+      live: null,
+      aiEditOpen: true,
+      aiEditPath: FILE,
+      aiEditResult: {
+        path: FILE,
+        base_hash: 'hash-1',
+        start_line: 1,
+        end_line: 0,
+        insert_line: 1,
+        old_text: '',
+        new_text: 'return a + b // scripted inline edit',
+        hunks: [
+          {
+            index: 0,
+            lines: [{ type: 'add', new_no: 1, text: 'return a + b // scripted inline edit' }],
+          },
+        ],
+        preview: '',
+        context_after: 'package math\n\n// Add returns a+b.\nfunc Add(a, b int) int {\n\treturn a + b\n}\n',
+      },
+      aiEditStreaming: '',
+      aiEditBusy: false,
+      aiEditApplied: null,
+      aiEditHistory: [],
+      aiEditUndoDepth: 0,
+    })
+  })
+
+  afterEach(() => {
+    act(() => root.unmount())
+    host.remove()
+    vi.restoreAllMocks()
+  })
+
+  it('renders an insert proposal as an emerald add row over the file context', async () => {
+    await act(async () => {
+      root.render(<FileViewer sessionId="sess-a" path={FILE} />)
+      await Promise.resolve()
+    })
+    await act(async () => {
+      await Promise.resolve()
+    })
+    await act(async () => {
+      await Promise.resolve()
+    })
+    // The inserted line is an add row with its text, followed by the file as
+    // plain context (this is the exact shape the scripted-endpoint run
+    // produced for an insertion at line 1).
+    const added = [...host.querySelectorAll('pre span')].find((sp) =>
+      (sp.textContent ?? '').includes('return a + b // scripted inline edit'),
+    )
+    expect(added?.className).toContain('bg-emerald-950')
+    const context = Array.from(host.querySelectorAll('pre span.block')).filter((sp) =>
+      (sp.textContent ?? '').includes('package math'),
+    )
+    expect(context.length).toBeGreaterThan(0)
+  })
+})
