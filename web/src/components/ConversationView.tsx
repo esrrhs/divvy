@@ -28,22 +28,45 @@ function refLabel(r: FileRef): string {
   return r.path
 }
 
-function AttachmentChips({ refs, onRemove }: { refs: FileRef[]; onRemove?: (index: number) => void }) {
+function AttachmentChips({
+  refs,
+  onRemove,
+  onOpen,
+}: {
+  refs: FileRef[]
+  onRemove?: (index: number) => void
+  onOpen?: (r: FileRef) => void
+}) {
   if (!refs.length) return null
   return (
     <div className="mt-1.5 flex flex-wrap gap-1">
       {refs.map((r, i) => (
         <span
           key={`${r.type}-${r.path}-${r.start_line ?? ''}-${r.end_line ?? ''}-${i}`}
-          className="inline-flex items-center gap-1 rounded border border-line bg-ink-900 px-1.5 py-0.5 font-mono text-[10.5px] text-slate-300"
+          className={`inline-flex items-center gap-1 rounded border border-line bg-ink-900 px-1.5 py-0.5 font-mono text-[10.5px] text-slate-300 ${onOpen && !r.excluded ? 'cursor-pointer hover:border-brand-600/60 hover:text-brand-200' : ''}`}
           title={r.excluded ? `${refLabel(r)}（未纳入：${r.excluded}）` : r.draft ? `${refLabel(r)}：未保存草稿，未写入项目` : refLabel(r)}
+          onClick={
+            onOpen && !r.excluded
+              ? (e) => {
+                  e.stopPropagation()
+                  onOpen(r)
+                }
+              : undefined
+          }
         >
           {r.type === 'dir' ? '📁' : r.type === 'selection' ? '✂️' : '📄'} {refLabel(r)}
           {r.draft && <span className="text-amber-300">草稿</span>}
           {r.excluded && <span className="text-amber-400">跳过</span>}
           {r.truncated && <span className="text-slate-500">截断</span>}
           {onRemove && (
-            <button type="button" className="text-slate-500 hover:text-slate-200" onClick={() => onRemove(i)}>
+            <button
+              type="button"
+              className="text-slate-500 hover:text-slate-200"
+              onClick={(e) => {
+                e.stopPropagation()
+                onRemove(i)
+              }}
+            >
               ×
             </button>
           )}
@@ -56,9 +79,11 @@ function AttachmentChips({ refs, onRemove }: { refs: FileRef[]; onRemove?: (inde
 function SelectionChips({
   items,
   onRemove,
+  onOpen,
 }: {
   items: CodeSelection[]
   onRemove?: (index: number) => void
+  onOpen?: (r: FileRef) => void
 }) {
   if (!items.length) return null
   return (
@@ -73,6 +98,7 @@ function SelectionChips({
           draft: s.draft,
         }))}
         onRemove={onRemove}
+        onOpen={onOpen}
       />
     </div>
   )
@@ -266,7 +292,15 @@ function ResultCard({ msg, convId }: { msg: ConvMessage; convId: string }) {
   )
 }
 
-function MessageBubble({ msg, convId }: { msg: ConvMessage; convId: string }) {
+function MessageBubble({
+  msg,
+  convId,
+  onOpenRef,
+}: {
+  msg: ConvMessage
+  convId: string
+  onOpenRef?: (r: FileRef) => void
+}) {
   if (msg.kind === 'run_finished') {
     return <ResultCard msg={msg} convId={convId} />
   }
@@ -284,7 +318,7 @@ function MessageBubble({ msg, convId }: { msg: ConvMessage; convId: string }) {
       ) : (
         <p className="mt-1 whitespace-pre-wrap break-words text-[12.5px] leading-relaxed">{msg.text}</p>
       )}
-      {msg.attachments && <AttachmentChips refs={msg.attachments} />}
+      {msg.attachments && <AttachmentChips refs={msg.attachments} onOpen={onOpenRef} />}
     </div>
   )
 }
@@ -297,6 +331,7 @@ export function ConversationView() {
   const fileView = useStore((s) => s.fileView)
   const fileDirty = useStore((s) => s.fileDirty)
   const viewerSelection = useStore((s) => s.viewerSelection)
+  const openFile = useStore((s) => s.openFile)
   const resumeConversation = useStore((s) => s.resumeConversation)
   const cancelQueue = useStore((s) => s.cancelQueue)
   const cancelSteer = useStore((s) => s.cancelSteer)
@@ -631,7 +666,21 @@ export function ConversationView() {
           </p>
         )}
         {visibleMessages.map((m) => (
-          <MessageBubble key={m.id} msg={m} convId={conv.id} />
+          <MessageBubble
+            key={m.id}
+            msg={m}
+            convId={conv.id}
+            onOpenRef={(r) => {
+              if (!conv) return
+              // Selections and file refs alike jump to the file in the split
+              // viewer, with the reveal line for selections.
+              openFile(
+                r.path,
+                conv.current_session_id || conv.run_session_id || null,
+                r.start_line ? { line: r.start_line } : undefined,
+              )
+            }}
+          />
         ))}
         {liveAssistant && (
           <div className="rounded-md border border-brand-800/40 bg-brand-950/20 px-3 py-2">
@@ -727,20 +776,49 @@ export function ConversationView() {
         {!autoDropped && (auto.selection || auto.path) && (
           <div className="mt-1.5">
             <span
-              className="inline-flex items-center gap-1 rounded border border-brand-700/50 bg-brand-950/30 px-1.5 py-0.5 font-mono text-[10.5px] text-brand-200"
-              title="当前在文件查看器里打开/选中的内容会自动随这条消息带上；点 × 只带项目结构。"
+              className="inline-flex cursor-pointer items-center gap-1 rounded border border-brand-700/50 bg-brand-950/30 px-1.5 py-0.5 font-mono text-[10.5px] text-brand-200 hover:border-brand-500/70"
+              title="当前在文件查看器里打开/选中的内容会自动随这条消息带上；点击跳回该文件，点 × 只带项目结构。"
+              onClick={() => {
+                const target = auto.selection?.path ?? auto.path
+                if (target) {
+                  openFile(
+                    target,
+                    conv.current_session_id || conv.run_session_id || null,
+                    auto.selection?.start_line ? { line: auto.selection.start_line } : undefined,
+                  )
+                }
+              }}
             >
               {auto.selection ? '✂️' : '📄'}{' '}
               {auto.selection ? selectionLabel(auto.selection) : auto.path}
               <span className="text-brand-400/80">自动</span>
-              <button type="button" className="text-brand-400/70 hover:text-brand-100" onClick={() => setAutoDropped(true)}>
+              <button
+                type="button"
+                className="text-brand-400/70 hover:text-brand-100"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  setAutoDropped(true)
+                }}
+              >
                 ×
               </button>
             </span>
           </div>
         )}
-        <SelectionChips items={pendingSelections} onRemove={removeSelection} />
-        <AttachmentChips refs={paths} onRemove={(index) => setPaths((cur) => cur.filter((_, i) => i !== index))} />
+        <SelectionChips
+          items={pendingSelections}
+          onRemove={removeSelection}
+          onOpen={(r) =>
+            openFile(r.path, conv.current_session_id || conv.run_session_id || null, r.start_line ? { line: r.start_line } : undefined)
+          }
+        />
+        <AttachmentChips
+          refs={paths}
+          onRemove={(index) => setPaths((cur) => cur.filter((_, i) => i !== index))}
+          onOpen={(r) =>
+            openFile(r.path, conv.current_session_id || conv.run_session_id || null, r.start_line ? { line: r.start_line } : undefined)
+          }
+        />
         <textarea
           ref={area}
           className="input mt-1.5 min-h-[64px] resize-y text-[12.5px]"

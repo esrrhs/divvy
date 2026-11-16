@@ -767,3 +767,89 @@ describe('ConversationView auto context chip', () => {
     expect(useStore.getState().pendingSelections.map((s) => s.text)).toEqual(['manual range'])
   })
 })
+
+describe('ConversationView attachment chips open the viewer', () => {
+  let root: Root
+  let host: HTMLElement
+
+  beforeEach(() => {
+    ;(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
+    host = document.createElement('div')
+    document.body.appendChild(host)
+    root = createRoot(host)
+    vi.spyOn(api, 'getConversation').mockImplementation(async (id) => conv(id))
+    vi.spyOn(api, 'getSession').mockImplementation(async (id) => sessionDetail(id))
+    vi.spyOn(api, 'listConversations').mockResolvedValue([conv('a')])
+    vi.spyOn(api, 'getTurnChanges').mockResolvedValue({ session_id: '', changes: [], editable: false })
+    useStore.setState({
+      currentConvId: null,
+      currentId: null,
+      conversation: null,
+      desiredConvId: undefined,
+      convNavGen: 0,
+      sessionNavGen: 0,
+      pendingSelections: [],
+      pendingSelectionsByConv: {},
+      conversations: [],
+      fileView: null,
+      fileDirty: false,
+      pendingFileNav: null,
+      viewerSelection: null,
+      apiError: null,
+      actionError: null,
+      live: null,
+      tree: null,
+    })
+  })
+
+  afterEach(() => {
+    act(() => root.unmount())
+    host.remove()
+    vi.restoreAllMocks()
+  })
+
+  it('a message attachment chip jumps to the file in the viewer with the reveal line', async () => {
+    const msg: Conversation = conv('a', 'sess-a', {
+      messages: [
+        {
+          id: 'm1',
+          role: 'user',
+          kind: 'user',
+          text: '改这个',
+          created_at: '',
+          attachments: [
+            { path: 'math/math.go', type: 'selection', start_line: 4, end_line: 6 },
+            { path: 'math/other.go', type: 'file' },
+          ],
+        },
+      ],
+    })
+    vi.spyOn(api, 'getConversation').mockImplementation(async () => msg)
+    await useStore.getState().openConversation('a')
+    await act(async () => {
+      root.render(<ConversationView />)
+      await Promise.resolve()
+    })
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    const selChip = [...host.querySelectorAll('span')].find((sp) => (sp.textContent ?? '').includes('math/math.go:L4'))
+    expect(selChip).toBeTruthy()
+    expect(selChip?.className).toContain('cursor-pointer')
+
+    await act(async () => {
+      selChip!.click()
+    })
+    expect(useStore.getState().fileView?.path).toBe('math/math.go')
+    expect(useStore.getState().fileView?.line).toBe(4)
+
+    // The plain file chip opens without a reveal line.
+    const fileChip = [...host.querySelectorAll('span')].find((sp) => (sp.textContent ?? '').includes('math/other.go'))
+    await act(async () => {
+      fileChip!.click()
+    })
+    expect(useStore.getState().fileView?.path).toBe('math/other.go')
+    expect(useStore.getState().fileView?.line).toBeUndefined()
+  })
+})
