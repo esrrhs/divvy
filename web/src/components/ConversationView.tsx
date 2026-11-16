@@ -13,6 +13,7 @@ import {
 import { useStore } from '../store'
 import type { CodeSelection, ConvMessage, FileRef, MessageMode, TurnChange, TurnChangesResponse } from '../types'
 import { FileDiffList } from './FileDiffView'
+import { ModelMarkdown } from './ModelMarkdown'
 import { SpinnerIcon } from './icons'
 
 function refLabel(r: FileRef): string {
@@ -278,7 +279,11 @@ function MessageBubble({ msg, convId }: { msg: ConvMessage; convId: string }) {
           <span className="ml-auto truncate font-mono text-[10px] text-slate-700">{msg.session_id}</span>
         )}
       </div>
-      <p className="mt-1 whitespace-pre-wrap break-words text-[12.5px] leading-relaxed">{msg.text}</p>
+      {msg.kind === 'model_reply' ? (
+        <ModelMarkdown text={msg.text} />
+      ) : (
+        <p className="mt-1 whitespace-pre-wrap break-words text-[12.5px] leading-relaxed">{msg.text}</p>
+      )}
       {msg.attachments && <AttachmentChips refs={msg.attachments} />}
     </div>
   )
