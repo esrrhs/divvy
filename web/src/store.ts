@@ -146,6 +146,12 @@ interface AppState {
   confirmFileNav: () => void
   cancelFileNav: () => void
   attachSelection: (sel: CodeSelection, opts?: { conversationId?: string }) => void
+  // Live selection in the file viewer, tracked for the composer's automatic
+  // context chip. Null when there is no active (non-empty) selection. This is
+  // not a pending attachment: the user has not asked to send it, so it never
+  // enters pendingSelections and is dropped on close/navigation.
+  viewerSelection: CodeSelection | null
+  setViewerSelection: (sel: CodeSelection | null) => void
   // AI inline edit (Cursor Cmd-K style) dialog state.
   aiEditOpen: boolean
   aiEditPath: string | null
@@ -226,6 +232,7 @@ export const useStore = create<AppState>((set, get) => ({
   fileView: null,
   fileDirty: false,
   pendingFileNav: null,
+  viewerSelection: null,
   pendingSelections: [],
   pendingSelectionsByConv: {},
   turnChanges: null,
@@ -313,6 +320,7 @@ export const useStore = create<AppState>((set, get) => ({
         fileView: null,
         fileDirty: false,
         pendingFileNav: null,
+        viewerSelection: null,
         turnChanges: null,
         apiError: null,
         pendingSelections: selectionsFor(get().pendingSelectionsByConv, convId),
@@ -630,11 +638,28 @@ export const useStore = create<AppState>((set, get) => ({
     }
     if (!id) {
       if (!sessionStillCurrent()) return
-      set({ currentId: null, live: null, tree: null, selectedNodeId: null, fileView: null, fileDirty: false, pendingFileNav: null, events: [] })
+      set({ currentId: null, live: null, tree: null, selectedNodeId: null, fileView: null, fileDirty: false, pendingFileNav: null, viewerSelection: null, events: [] })
       return
     }
     if (!sessionStillCurrent()) return
-    set({ currentId: id, events: [], live: null, tree: null, selectedNodeId: null, fileView: null, fileDirty: false, pendingFileNav: null })
+    // The open file belongs to the project, not to the session: a new run
+    // (postMessage, resume) starts a new session and used to close the file
+    // the user was reading mid-loop — Cursor keeps your editor open. The
+    // per-conversation navigation paths (openConversation / onNewSession)
+    // clear these explicitly before calling, so preserving here only affects
+    // same-conversation switches. Stale disk content after a run edits the
+    // file is guarded by the baseHash 409 on save, as before.
+    set((s) => ({
+      currentId: id,
+      events: [],
+      live: null,
+      tree: null,
+      selectedNodeId: null,
+      fileView: s.fileView,
+      fileDirty: s.fileDirty,
+      pendingFileNav: s.pendingFileNav,
+      viewerSelection: s.viewerSelection,
+    }))
     get().disconnect()
     try {
       const detail = await api.getSession(id)
@@ -732,13 +757,14 @@ export const useStore = create<AppState>((set, get) => ({
       set({ pendingFileNav: 'close' })
       return
     }
-    set({ fileView: null, pendingFileNav: null, fileDirty: false })
+    set({ fileView: null, pendingFileNav: null, fileDirty: false, viewerSelection: null })
   },
   setFileDirty: (dirty) => set({ fileDirty: dirty }),
+  setViewerSelection: (sel) => set({ viewerSelection: sel }),
   confirmFileNav: () => {
     const p = get().pendingFileNav
     if (p === 'close') {
-      set({ fileView: null, pendingFileNav: null, fileDirty: false })
+      set({ fileView: null, pendingFileNav: null, fileDirty: false, viewerSelection: null })
       return
     }
     if (p) {

@@ -631,3 +631,139 @@ describe('ConversationView send continuation', () => {
     }
   })
 })
+
+describe('ConversationView auto context chip', () => {
+  let root: Root
+  let host: HTMLElement
+
+  beforeEach(() => {
+    ;(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
+    host = document.createElement('div')
+    document.body.appendChild(host)
+    root = createRoot(host)
+    vi.spyOn(api, 'getConversation').mockImplementation(async (id) => conv(id))
+    vi.spyOn(api, 'getSession').mockImplementation(async (id) => sessionDetail(id))
+    vi.spyOn(api, 'listConversations').mockResolvedValue([conv('a')])
+    vi.spyOn(api, 'getTurnChanges').mockResolvedValue({ session_id: '', changes: [], editable: false })
+    useStore.setState({
+      currentConvId: null,
+      currentId: null,
+      conversation: null,
+      desiredConvId: undefined,
+      convNavGen: 0,
+      sessionNavGen: 0,
+      pendingSelections: [],
+      pendingSelectionsByConv: {},
+      conversations: [],
+      fileView: null,
+      fileDirty: false,
+      pendingFileNav: null,
+      viewerSelection: null,
+      apiError: null,
+      actionError: null,
+      live: null,
+      tree: null,
+    })
+  })
+
+  afterEach(() => {
+    act(() => {
+      root.unmount()
+    })
+    host.remove()
+    vi.restoreAllMocks()
+  })
+
+  function chipText(): string {
+    return [...host.querySelectorAll('span')].map((n) => n.textContent ?? '').join('\n')
+  }
+
+  it('the open file rides along with the message unless the chip is dropped', async () => {
+    vi.spyOn(api, 'postMessage').mockResolvedValue(conv('a'))
+    await useStore.getState().openConversation('a')
+    useStore.setState({ fileView: { sessionId: 'sess-a', path: 'math/math.go' } })
+    await act(async () => {
+      root.render(<ConversationView />)
+    })
+    expect(chipText()).toContain('自动')
+    expect(chipText()).toContain('math/math.go')
+
+    const ta = host.querySelector('textarea') as HTMLTextAreaElement
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!.call(ta, 'look at this file')
+      ta.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    await act(async () => {
+      host.querySelector('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+    })
+    expect(api.postMessage).toHaveBeenCalledWith('a', 'look at this file', expect.objectContaining({
+      paths: ['math/math.go'],
+    }))
+    // The new run's session switch keeps the file open: the user keeps their
+    // place, and the chip returns for the next message.
+    expect(chipText()).toContain('自动')
+    expect(chipText()).toContain('math/math.go')
+
+    // Drop the chip: the same file is not carried again on the next message.
+    await act(async () => {
+      const drop = [...host.querySelectorAll('button')].find((b) => b.closest('span')?.textContent?.includes('自动'))
+      expect(drop).toBeTruthy()
+      drop!.click()
+    })
+    expect(chipText()).not.toContain('自动')
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!.call(ta, 'without the file')
+      ta.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    await act(async () => {
+      host.querySelector('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+    })
+    expect(api.postMessage).toHaveBeenLastCalledWith('a', 'without the file', expect.objectContaining({
+      paths: [],
+    }))
+  })
+
+  it('a live viewer selection is carried as a draft selection when the buffer is dirty', async () => {
+    vi.spyOn(api, 'postMessage').mockResolvedValue(conv('a'))
+    await useStore.getState().openConversation('a')
+    useStore.setState({
+      fileView: { sessionId: 'sess-a', path: 'math/math.go' },
+      fileDirty: true,
+      viewerSelection: { path: 'math/math.go', start_line: 3, end_line: 5, text: 'return a - b', draft: true },
+    })
+    await act(async () => {
+      root.render(<ConversationView />)
+    })
+    expect(chipText()).toContain('L3-5')
+    expect(chipText()).toContain('未保存草稿')
+
+    const ta = host.querySelector('textarea') as HTMLTextAreaElement
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!.call(ta, 'fix this range')
+      ta.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    await act(async () => {
+      host.querySelector('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+    })
+    expect(api.postMessage).toHaveBeenLastCalledWith('a', 'fix this range', expect.objectContaining({
+      paths: [],
+      selections: [{ path: 'math/math.go', start_line: 3, end_line: 5, text: 'return a - b', draft: true }],
+    }))
+  })
+
+  it('a manual attachment wins: no duplicate auto chip for the same file', async () => {
+    vi.spyOn(api, 'postMessage').mockResolvedValue(conv('a'))
+    await useStore.getState().openConversation('a')
+    useStore.setState({ fileView: { sessionId: 'sess-a', path: 'math/math.go' } })
+    await act(async () => {
+      root.render(<ConversationView />)
+    })
+    expect(chipText()).toContain('自动')
+    await act(async () => {
+      useStore.getState().attachSelection(sel('manual range', 'math/math.go'))
+    })
+    // The manual selection covers the file; the auto chip must disappear.
+    expect(chipText()).not.toContain('自动')
+    expect(useStore.getState().pendingSelections.map((s) => s.text)).toEqual(['manual range'])
+  })
+})

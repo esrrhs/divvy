@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 'react'
 import { api } from '../api/client'
 import {
+  autoContext,
   composeState,
   mentionQuery,
   messageKindMeta,
@@ -288,6 +289,9 @@ export function ConversationView() {
   const postMessage = useStore((s) => s.postMessage)
   const pendingSelections = useStore((s) => s.pendingSelections)
   const removeSelection = useStore((s) => s.removeSelection)
+  const fileView = useStore((s) => s.fileView)
+  const fileDirty = useStore((s) => s.fileDirty)
+  const viewerSelection = useStore((s) => s.viewerSelection)
   const resumeConversation = useStore((s) => s.resumeConversation)
   const cancelQueue = useStore((s) => s.cancelQueue)
   const cancelSteer = useStore((s) => s.cancelSteer)
@@ -306,6 +310,24 @@ export function ConversationView() {
   const [paths, setPaths] = useState<FileRef[]>([])
   const [picker, setPicker] = useState<{ start: number; query: string; items: FileRef[] } | null>(null)
   const [highlight, setHighlight] = useState(0)
+  // What the user is currently looking at in the viewer rides along with the
+  // next message (Cursor-style), shown as a dismissible chip. Computed here
+  // rather than stored so manual attachments always win without syncing.
+  const autoAll = autoContext(
+    fileView?.path ?? null,
+    fileDirty,
+    viewerSelection,
+    paths.map((p) => p.path),
+    pendingSelections,
+  )
+  // The signature comes from the undropped context: a new file or a moved
+  // selection un-drops the chip, because the user dropped what they saw, not
+  // the next thing they open.
+  const autoSig = autoAll.selection
+    ? `${autoAll.selection.path}:${autoAll.selection.start_line}-${autoAll.selection.end_line}:${autoAll.selection.draft ? 'd' : 's'}`
+    : (autoAll.path ?? '')
+  const [autoDropped, setAutoDropped] = useState(false)
+  const auto = autoDropped ? {} : autoAll
   const scroller = useRef<HTMLDivElement>(null)
   const area = useRef<HTMLTextAreaElement>(null)
   const searchGen = useRef(0)
@@ -374,6 +396,12 @@ export function ConversationView() {
     // conversation's in-flight send/save/ask/recover state.
     syncComposerLocks(conv?.id)
   }, [conv?.id])
+
+  // A different open file (or a moved selection) is a new auto context — the
+  // dismissal does not carry over.
+  useEffect(() => {
+    setAutoDropped(false)
+  }, [autoSig])
 
   if (!conv) return null
 
@@ -459,13 +487,14 @@ export function ConversationView() {
     if (block.kind === 'paused' && resolved !== 'steer' && resolved !== 'takeover') return
     if (!text.trim()) return
     const sourceConvId = conv!.id
-    const sentSelections = pendingSelections
+    const sentSelections = auto.selection ? [...pendingSelections, auto.selection] : pendingSelections
+    const sentPaths = auto.path && !paths.some((p) => p.path === auto.path) ? [...paths.map((p) => p.path), auto.path] : paths.map((p) => p.path)
     const token = beginComposerOp(sourceConvId, 'send')
     syncComposerLocks(useStore.getState().currentConvId)
     let ok = false
     try {
       ok = await postMessage(text, {
-        paths: paths.map((p) => p.path),
+        paths: sentPaths,
         selections: sentSelections,
         mode: resolved,
       })
@@ -480,6 +509,7 @@ export function ConversationView() {
       setText('')
       setPaths([])
       setPicker(null)
+      setAutoDropped(false)
     }
   }
 
@@ -537,7 +567,7 @@ export function ConversationView() {
         ? '当前正在执行。默认插入会立刻打断当前叶子（审批/问答中会先记下）；也可排队下一条，或中止并接管。输入 @ 可强制附加文件。'
         : block.kind === 'paused'
           ? '已暂停。可先续跑；也可输入调整后点「插入到当前轮」（续跑后注入），或「中止并接管」。输入 @ 可强制附加文件。'
-          : '描述要做的修改。每轮会自动带上项目结构和相关文件；用 @ 可强制附加指定文件或目录'
+          : '描述要做的修改。每轮会自动带上项目结构和当前打开的文件（选区也会带上，可点 × 去掉）；用 @ 可强制附加指定文件或目录'
 
   return (
     <div className="flex min-h-0 shrink-0 flex-col border-b border-line">
@@ -689,6 +719,21 @@ export function ConversationView() {
       )}
 
       <form onSubmit={(e) => void send(undefined, e)} className="relative border-t border-line px-4 py-2">
+        {!autoDropped && (auto.selection || auto.path) && (
+          <div className="mt-1.5">
+            <span
+              className="inline-flex items-center gap-1 rounded border border-brand-700/50 bg-brand-950/30 px-1.5 py-0.5 font-mono text-[10.5px] text-brand-200"
+              title="当前在文件查看器里打开/选中的内容会自动随这条消息带上；点 × 只带项目结构。"
+            >
+              {auto.selection ? '✂️' : '📄'}{' '}
+              {auto.selection ? selectionLabel(auto.selection) : auto.path}
+              <span className="text-brand-400/80">自动</span>
+              <button type="button" className="text-brand-400/70 hover:text-brand-100" onClick={() => setAutoDropped(true)}>
+                ×
+              </button>
+            </span>
+          </div>
+        )}
         <SelectionChips items={pendingSelections} onRemove={removeSelection} />
         <AttachmentChips refs={paths} onRemove={(index) => setPaths((cur) => cur.filter((_, i) => i !== index))} />
         <textarea

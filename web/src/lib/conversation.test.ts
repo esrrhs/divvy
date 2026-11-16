@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest'
+import type { CodeSelection } from '../types'
 import {
+  autoContext,
   composeState,
   conversationRowKind,
   isResumablePhase,
@@ -171,5 +173,49 @@ describe('selectionLabel', () => {
       'src/a.ts:L3-5（未保存草稿）',
     )
     expect(selectionLabel({ path: 'src/a.ts', start_line: 3, end_line: 3 })).toBe('src/a.ts:L3')
+  })
+})
+
+describe('autoContext', () => {
+  const sel = (path = 'math/math.go', draft = false): CodeSelection => ({
+    path,
+    start_line: 3,
+    end_line: 5,
+    text: 'return a - b',
+    draft,
+  })
+
+  it('carries the open file when clean and nothing else is attached', () => {
+    expect(autoContext('math/math.go', false, null, [], [])).toEqual({ path: 'math/math.go' })
+  })
+
+  it('carries the live selection instead of the file', () => {
+    expect(autoContext('math/math.go', false, sel(), [], [])).toEqual({ selection: sel() })
+  })
+
+  it('marks an unsaved buffer as a draft selection', () => {
+    expect(autoContext('math/math.go', true, sel('math/math.go', true), [], [])).toEqual({
+      selection: sel('math/math.go', true),
+    })
+  })
+
+  it('carries nothing for a dirty file with no selection: a whole-file draft is not what the user asked for', () => {
+    expect(autoContext('math/math.go', true, null, [], [])).toEqual({})
+  })
+
+  it('defers to a manual selection covering the same file', () => {
+    expect(autoContext('math/math.go', false, sel(), [sel().path], [sel()])).toEqual({})
+  })
+
+  it('defers to a manual path attachment', () => {
+    expect(autoContext('math/math.go', false, null, ['math/math.go'], [])).toEqual({})
+  })
+
+  it('ignores a stale selection from another file and falls back to the clean file', () => {
+    expect(autoContext('math/other.go', false, sel(), [], [])).toEqual({ path: 'math/other.go' })
+  })
+
+  it('no open file means no auto context', () => {
+    expect(autoContext(null, false, sel(), [], [])).toEqual({})
   })
 })

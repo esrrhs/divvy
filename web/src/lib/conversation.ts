@@ -1,6 +1,8 @@
 // Pure helpers for the project-conversation UI. Kept free of React so they
 // can be unit-tested without a DOM.
 
+import type { CodeSelection } from '../types'
+
 export type ComposeKind = 'start' | 'steer' | 'paused' | 'blocked'
 
 export type ComposeState =
@@ -243,4 +245,35 @@ export function selectionLabel(sel: { path: string; start_line: number; end_line
   const lines =
     sel.start_line === sel.end_line ? `L${sel.start_line}` : `L${sel.start_line}-${sel.end_line}`
   return `${sel.path}:${lines}${sel.draft ? '（未保存草稿）' : ''}`
+}
+
+// Cursor-style automatic context: what the user is looking at rides along
+// with the next message unless they drop the chip. Manual attachments always
+// win — the auto chip never duplicates a file the user attached themselves.
+// An unsaved buffer is carried as a draft selection (the server marks it
+// "UNSAVED EDITOR DRAFT" instead of reading disk); a dirty file with no
+// selection carries nothing, because a whole-file draft injection is not
+// something the user asked for and the disk read would be wrong anyway.
+export interface AutoContext {
+  path?: string
+  selection?: CodeSelection
+}
+
+export function autoContext(
+  openPath: string | null | undefined,
+  dirty: boolean,
+  viewerSel: CodeSelection | null | undefined,
+  manualPaths: string[],
+  manualSelections: CodeSelection[],
+): AutoContext {
+  const opened = (openPath ?? '').trim()
+  if (!opened) return {}
+  const covered = manualSelections.some((s) => sameRelPath(s.path, opened))
+  if (viewerSel && sameRelPath(viewerSel.path, opened) && !covered) {
+    return { selection: viewerSel }
+  }
+  if (!dirty && !covered && !manualPaths.some((p) => sameRelPath(p, opened))) {
+    return { path: opened }
+  }
+  return {}
 }

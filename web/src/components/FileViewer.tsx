@@ -206,6 +206,7 @@ export function FileViewer({ sessionId, path }: { sessionId: string | null; path
   const confirmFileNav = useStore((s) => s.confirmFileNav)
   const cancelFileNav = useStore((s) => s.cancelFileNav)
   const attachSelection = useStore((s) => s.attachSelection)
+  const setViewerSelection = useStore((s) => s.setViewerSelection)
   const openAiEditDialog = useStore((s) => s.openAiEditDialog)
   const addAiEditTarget = useStore((s) => s.addAiEditTarget)
   const aiEditOpen = useStore((s) => s.aiEditOpen)
@@ -272,6 +273,7 @@ export function FileViewer({ sessionId, path }: { sessionId: string | null; path
     setFile(null)
     setDraft('')
     setBaseHash('')
+    setViewerSelection(null)
     api
       .fsFile(path, sessionId ?? undefined, currentConvId ?? undefined)
       .then((f) => {
@@ -303,6 +305,9 @@ export function FileViewer({ sessionId, path }: { sessionId: string | null; path
       })
     return () => {
       cancelled = true
+      // Leaving this file (close or navigate) drops the live selection so a
+      // stale range can never ride along with the next message.
+      setViewerSelection(null)
     }
   }, [path, sessionId, currentConvId, appliedKey, fileReloadNonce])
 
@@ -337,6 +342,24 @@ export function FileViewer({ sessionId, path }: { sessionId: string | null; path
     } finally {
       setSaving(false)
     }
+  }
+
+  // Keep the composer's automatic-context chip in step with the live
+  // selection. A collapsed caret means "looking at the file", not a selection;
+  // the chip falls back to the file itself (when clean) instead.
+  function syncViewerSelection(start: number, end: number) {
+    if (start === end) {
+      setViewerSelection(null)
+      return
+    }
+    const range = lineRangeFromOffsets(draft, start, end)
+    setViewerSelection({
+      path,
+      start_line: range.start_line,
+      end_line: range.end_line,
+      text: draft.slice(Math.min(start, end), Math.max(start, end)),
+      draft: dirty,
+    })
   }
 
   function attach() {
@@ -574,7 +597,10 @@ export function FileViewer({ sessionId, path }: { sessionId: string | null; path
           onChange={(next) => {
             if (canEdit) setDraft(next)
           }}
-          onSelect={(start, end) => setSel({ start, end })}
+          onSelect={(start, end) => {
+            setSel({ start, end })
+            syncViewerSelection(start, end)
+          }}
         />
       )}
 
