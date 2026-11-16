@@ -11,7 +11,9 @@ import (
 	"time"
 
 	"github.com/esrrhs/divvy/pkg/agent"
+	"github.com/esrrhs/divvy/pkg/engine"
 	"github.com/esrrhs/divvy/pkg/llm"
+	"github.com/esrrhs/divvy/pkg/models"
 )
 
 const testSecretKey = "sk-test-secret-key-do-not-persist"
@@ -1427,5 +1429,26 @@ func TestConversation_FreshConversationEmitsEmptyArrays(t *testing.T) {
 		if string(field) != "[]" {
 			t.Fatalf("%s must be an empty array for a fresh conversation, got %s", name, field)
 		}
+	}
+}
+
+// Direct mode is one continuous tool conversation; its synthetic single leaf
+// would always read "叶子 0/1" on failure. The summary must keep the leaf
+// count for tree mode and drop it for direct mode.
+func TestFinishedMessageTextLeafCountFollowsMode(t *testing.T) {
+	tree := engine.NewTaskTree("t-leaf-count", "root", "goal")
+	if _, err := tree.AddChild(tree.GetRoot().ID, "leaf-1", "leaf", "do it", models.NodeTypeLeaf); err != nil {
+		t.Fatal(err)
+	}
+	direct := finishedMessageText("failed", "context deadline exceeded", tree, agent.AgentLoopDirect)
+	if strings.Contains(direct, "叶子") {
+		t.Fatalf("direct mode must not show a leaf count: %s", direct)
+	}
+	if !strings.Contains(direct, "context deadline exceeded") {
+		t.Fatalf("direct mode should still carry the result: %s", direct)
+	}
+	treeMode := finishedMessageText("failed", "", tree, agent.AgentLoopGuided)
+	if !strings.Contains(treeMode, "叶子 0/1") {
+		t.Fatalf("tree mode should keep the leaf count: %s", treeMode)
 	}
 }

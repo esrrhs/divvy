@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/esrrhs/divvy/pkg/agent"
 	"github.com/esrrhs/divvy/pkg/engine"
 	"github.com/esrrhs/divvy/pkg/models"
 )
@@ -572,7 +573,7 @@ func runOutcome(phase string, failed bool) string {
 	}
 }
 
-func finishedMessageText(outcome, result string, tree *engine.TaskTree) string {
+func finishedMessageText(outcome, result string, tree *engine.TaskTree, agentLoop string) string {
 	label := map[string]string{
 		"completed": "执行结束：已完成",
 		"paused":    "执行已暂停，可在本对话续跑，或中止后再发新需求",
@@ -584,9 +585,14 @@ func finishedMessageText(outcome, result string, tree *engine.TaskTree) string {
 	}
 	var extra []string
 	if tree != nil {
-		done, all, _ := tree.GetLeafProgress()
-		if all > 0 {
-			extra = append(extra, fmt.Sprintf("叶子 %d/%d", done, all))
+		// The leaf count is tree-mode vocabulary. Direct mode is one
+		// continuous tool conversation — its synthetic single leaf would
+		// always read "叶子 0/1" on failure, which tells the user nothing.
+		if agentLoop != agent.AgentLoopDirect {
+			done, all, _ := tree.GetLeafProgress()
+			if all > 0 {
+				extra = append(extra, fmt.Sprintf("叶子 %d/%d", done, all))
+			}
 		}
 		if root := tree.GetRoot(); root != nil && root.State == models.TaskStateFailed && root.ErrorMsg != "" && result == "" {
 			result = root.ErrorMsg

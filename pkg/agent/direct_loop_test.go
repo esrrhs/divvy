@@ -579,6 +579,50 @@ func TestDirect_RepeatedIdenticalCallGetsIntervention(t *testing.T) {
 	}
 }
 
+// TestDirect_StallEndsTurnAfterInterventions is the observed weak-model run:
+// the model re-runs the same failing verification forever. Two observation
+// reminders are the conversational budget; after that, directFailureLimit
+// further identical failures must end the turn with ErrStall instead of
+// quietly spending the remaining step budget (the real run burned ten more
+// calls after the last reminder, then died on the request timeout).
+func TestDirect_StallEndsTurnAfterInterventions(t *testing.T) {
+	work, data := t.TempDir(), t.TempDir()
+	cfg := directCfg(t, work, data, "make the test pass")
+	cfg.DirectSteps = 40
+	calls := 0
+	client := &llm.ScriptedClient{Handle: func(ctx context.Context, req llm.Request) (*llm.Response, error) {
+		calls++
+		return &llm.Response{Content: `{"thought":"retry","action":"run_bash","args":{"command":"go test ./..."}}`}, nil
+	}}
+	o, err := NewFromGoal(cfg, client, SilentLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(o.Close)
+	err = NewDirect(o, &testDirectCtl{}).Run(context.Background())
+	if !errors.Is(err, ErrStall) {
+		t.Fatalf("err = %v, want ErrStall", err)
+	}
+	want := directFailureLimit * (directFailureNags + 1)
+	if calls != want {
+		t.Fatalf("model calls = %d, want %d (two reminders, then the turn must end)", calls, want)
+	}
+	root := o.tree.GetRoot()
+	if root == nil || root.State != models.TaskStateFailed {
+		t.Fatalf("root must be failed, got %+v", root)
+	}
+	if !strings.Contains(root.ErrorMsg, "go test ./...") || !strings.Contains(root.ErrorMsg, "observation reminders") {
+		t.Fatalf("root error should name the command and the reminders: %q", root.ErrorMsg)
+	}
+	st, loadErr := loadDirectState(filepath.Join(data, o.SessionID()+".direct.json"), cfg.APIKey)
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if st != nil && st.Done {
+		t.Fatal("stall stop must not mark the transcript done")
+	}
+}
+
 // TestDirect_ContextWindowKeepsLaterFollowUps is the long-session follow-up
 // gap: directRequestWindow pins only the system prompt and the first user
 // message. A mid-conversation inject or later follow-up sits in the body and

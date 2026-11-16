@@ -236,6 +236,11 @@ const maxInvalidJSONRounds = 3
 // way a real verify failure does.
 var ErrInvalidJSON = errors.New("invalid JSON replies")
 
+// ErrStall ends a turn that keeps producing the same failure after its
+// strategy-change interventions were exhausted: continuing has been shown not
+// to help, and the remaining budget belongs to the user.
+var ErrStall = errors.New("stalled without progress")
+
 func invalidJSONRetryPrompt(streak int) string {
 	return fmt.Sprintf(
 		"Could not parse a tool call (invalid/empty JSON, streak %d/%d). "+

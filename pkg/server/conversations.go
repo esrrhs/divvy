@@ -587,7 +587,7 @@ func (s *Server) finalizeConversationRun(convID string, h *agent.RunHandle, phas
 		if n := len(summary); n > 0 {
 			changeNote = fmt.Sprintf("改动 %d 个文件", n)
 		}
-		text := finishedMessageText(outcome, result, tree)
+		text := finishedMessageText(outcome, result, tree, conversationAgentMode(c))
 		if changeNote != "" {
 			text = text + " " + changeNote + "。"
 		}

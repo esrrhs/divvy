@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -29,10 +30,13 @@ func TestDirect_RepeatedVerifyFailureDemandsObservation(t *testing.T) {
 	act := taggedAction{Name: tools.ToolRunBash, Args: map[string]any{"command": "go test ./..."}}
 	failOut := "exit_code: 1\n--- FAIL: TestAdd (0.00s)\n    add_test.go:7: Add(2,3)=-1"
 
-	if msg, nag := d.trackRepeatedFailure(act, failOut, nil); nag || msg != "" {
+	if msg, nag, giveUp := d.trackRepeatedFailure(act, failOut, nil); nag || msg != "" || giveUp != nil {
 		t.Fatalf("first failure must not nag, got %q", msg)
 	}
-	msg, nag := d.trackRepeatedFailure(act, failOut, nil)
+	msg, nag, giveUp := d.trackRepeatedFailure(act, failOut, nil)
+	if giveUp != nil {
+		t.Fatalf("second identical failure must nag, not end the turn: %v", giveUp)
+	}
 	if !nag {
 		t.Fatal("second identical failure should demand a strategy change")
 	}
@@ -45,7 +49,7 @@ func TestDirect_RepeatedVerifyFailureDemandsObservation(t *testing.T) {
 
 	// A passing run ends the failure streak: the next failure is a new
 	// problem and must not inherit the previous count.
-	if _, nag := d.trackRepeatedFailure(act, "exit_code: 0\nok  \taddtest", nil); nag {
+	if _, nag, giveUp := d.trackRepeatedFailure(act, "exit_code: 0\nok  \taddtest", nil); nag || giveUp != nil {
 		t.Fatal("a passing run must reset the failure streak")
 	}
 	if d.failKey != "" || d.failCount != 0 {
@@ -53,27 +57,57 @@ func TestDirect_RepeatedVerifyFailureDemandsObservation(t *testing.T) {
 	}
 
 	// A different failing command is a different problem, not a repeat.
-	if _, nag := d.trackRepeatedFailure(act, failOut, nil); nag {
+	if _, nag, giveUp := d.trackRepeatedFailure(act, failOut, nil); nag || giveUp != nil {
 		t.Fatal("first failure after reset must not nag")
 	}
 	other := taggedAction{Name: tools.ToolRunBash, Args: map[string]any{"command": "go vet ./..."}}
-	if msg, nag := d.trackRepeatedFailure(other, "exit_code: 1\nvet: undefined: Foo", nil); nag || msg != "" {
+	if msg, nag, giveUp := d.trackRepeatedFailure(other, "exit_code: 1\nvet: undefined: Foo", nil); nag || msg != "" || giveUp != nil {
 		t.Fatalf("a different command must not be folded into the previous streak: %q", msg)
 	}
 
 	// Nags are capped per turn so the intervention cannot become the loop.
+	// Once the cap is reached, directFailureLimit further identical failures
+	// end the turn — an observed weak-model run burned ten more calls on the
+	// same failing command after the last reminder, then died on the request
+	// timeout. Stopping is the honest outcome.
 	d = NewDirect(o, nil)
-	for i := 0; i < directFailureLimit; i++ {
-		d.trackRepeatedFailure(act, failOut, nil)
+	for i := 0; i < directFailureLimit*directFailureNags; i++ {
+		if _, _, err := d.trackRepeatedFailure(act, failOut, nil); err != nil {
+			t.Fatalf("failure %d must still be inside the nag budget: %v", i+1, err)
+		}
 	}
-	for i := 0; i < directFailureLimit*2; i++ {
-		d.trackRepeatedFailure(act, failOut, nil)
-	}
-	if d.failNags < directFailureNags {
+	if d.failNags != directFailureNags {
 		t.Fatalf("expected the cap to be reached, nags=%d", d.failNags)
 	}
-	if _, nag := d.trackRepeatedFailure(act, failOut, nil); nag {
-		t.Fatalf("nags must stop after %d per turn", directFailureNags)
+	if _, nag, err := d.trackRepeatedFailure(act, failOut, nil); nag || err != nil {
+		t.Fatalf("first failure past the cap must stay silent: nag=%v err=%v", nag, err)
+	}
+	giveUpErr := func() error {
+		_, _, err := d.trackRepeatedFailure(act, failOut, nil)
+		return err
+	}()
+	if giveUpErr == nil {
+		t.Fatal("the next identical failure must end the turn")
+	}
+	if !errors.Is(giveUpErr, ErrStall) {
+		t.Fatalf("give-up must be ErrStall: %v", giveUpErr)
+	}
+	if !strings.Contains(giveUpErr.Error(), "go test ./...") {
+		t.Fatalf("give-up should name the command: %v", giveUpErr)
+	}
+	// A successful verification right before the give-up threshold still
+	// resets the streak: the model did change the outcome, so it earns a
+	// fresh count.
+	d = NewDirect(o, nil)
+	for i := 0; i < directFailureLimit*directFailureNags; i++ {
+		d.trackRepeatedFailure(act, failOut, nil)
+	}
+	d.trackRepeatedFailure(act, failOut, nil)
+	if _, _, err := d.trackRepeatedFailure(act, "exit_code: 0\nok  \taddtest", nil); err != nil {
+		t.Fatalf("a passing run must clear the streak even past the nag cap: %v", err)
+	}
+	if _, _, err := d.trackRepeatedFailure(act, failOut, nil); err != nil {
+		t.Fatalf("a new failure after success must start a fresh count: %v", err)
 	}
 }
 
@@ -123,7 +157,7 @@ func TestDirect_NonVerifyFailureDoesNotEscalate(t *testing.T) {
 	d := NewDirect(o, nil)
 	act := taggedAction{Name: tools.ToolReplaceLines, Args: map[string]any{"path": "a.go"}}
 	for i := 0; i < 5; i++ {
-		if msg, nag := d.trackRepeatedFailure(act, "ERROR: old_string not found", nil); nag || msg != "" {
+		if msg, nag, giveUp := d.trackRepeatedFailure(act, "ERROR: old_string not found", nil); nag || msg != "" || giveUp != nil {
 			t.Fatalf("non-verify failure must not trigger the strategy prompt: %q", msg)
 		}
 	}

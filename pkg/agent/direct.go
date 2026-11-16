@@ -45,7 +45,10 @@ const (
 	// so it gets the same one-observation-round budget.
 	directFailureLimit = 2
 	// directFailureNags caps how many strategy-change prompts one turn gets,
-	// so the intervention itself cannot become the loop.
+	// so the intervention itself cannot become the loop. Once the budget is
+	// gone, directFailureLimit further identical failures end the turn — a
+	// model that ignored two detailed escalations will not benefit from the
+	// remaining step budget, and spinning it costs minutes of wall clock.
 	directFailureNags = 2
 )
 
@@ -812,6 +815,13 @@ func (d *DirectAgent) loop(ctx context.Context) error {
 				// Session budget tripped inside chat().
 				return d.stop(err)
 			}
+			if errors.Is(err, context.DeadlineExceeded) && reqTimeout > 0 {
+				// The per-step timeout tripped: the parent context is alive
+				// (checked above), so this is one hung model request, not a
+				// user abort. Name the knob instead of leaking a bare
+				// "context deadline exceeded" into the user's summary.
+				return d.stop(fmt.Errorf("model request exceeded the per-step timeout (%s); the turn ended without a model reply — completed changes stay in the workspace, resend to continue", reqTimeout))
+			}
 			return d.stop(err)
 		}
 
@@ -1092,11 +1102,17 @@ func (d *DirectAgent) applyActions(ctx context.Context, nodeID string, actions [
 		if toolOutcomeFailed(act.Name, out, callErr) {
 			// The repeated-call guard does not catch "edit, run the same
 			// failing check, edit again": the calls differ, but the outcome
-			// never does. Name that loop and demand an observation. The
-			// prompt is appended after the skipped tool results so a native
+			// never does. Name that loop and demand an observation; once the
+			// nag budget is gone, a further identical failure ends the turn
+			// instead of letting the model spin to its step limit. The prompt
+			// is appended after the skipped tool results so a native
 			// tool_calls message is not interleaved with a user message.
-			msg, nag := d.trackRepeatedFailure(act, out, callErr)
+			msg, nag, giveUp := d.trackRepeatedFailure(act, out, callErr)
 			d.skipRemaining(actions[i+1:], "Not executed: an earlier tool in the same model reply failed or returned a non-zero exit. Inspect that result, repair if needed, and re-issue only what is still appropriate. Do not assume this tool ran.")
+			if giveUp != nil {
+				_ = d.persist()
+				return false, "", giveUp
+			}
 			if nag {
 				d.st.Messages = append(d.st.Messages, llm.Message{Role: llm.RoleUser, Content: msg})
 			}
@@ -1149,26 +1165,28 @@ func (d *DirectAgent) trackRepeatCall(act taggedAction) (string, bool) {
 // command keeps failing the same way. The calls differ, so nothing looks
 // repeated, but the outcome never changes. After directFailureLimit identical
 // failures the model is told to observe before editing again — the same
-// escalation that measurably beat plain "fix it again" in solo mode.
-func (d *DirectAgent) trackRepeatedFailure(act taggedAction, out string, callErr error) (string, bool) {
+// escalation that measurably beat plain "fix it again" in solo mode. Once the
+// nag budget is gone the loop stops pretending: directFailureLimit further
+// identical failures return a terminal error instead of another prompt, so a
+// stuck model cannot quietly spend the rest of its budget (and the user's
+// minutes) repeating a command that provably cannot succeed.
+func (d *DirectAgent) trackRepeatedFailure(act taggedAction, out string, callErr error) (string, bool, error) {
 	if act.Name != tools.ToolRunBash {
-		return "", false
+		return "", false, nil
 	}
 	if !toolOutcomeFailed(act.Name, out, callErr) {
 		// A passing verification means the previous failure was addressed;
 		// the next failure is a new problem. A successful non-verify call
 		// (read/edit) does not reset the run: edits are exactly what the
-		// model does between identical failures.
+		// model does between identical failures. Only run_bash reaches here
+		// (the guard above), so a passing call is always a verification.
 		d.failKey, d.failCount = "", 0
-		return "", false
-	}
-	if d.failNags >= directFailureNags {
-		return "", false
+		return "", false, nil
 	}
 	cmd, _ := stringFromArgs(act.Args, "command")
 	key := stallFingerprint(d.o.projectType(), act.Name+"\n"+cmd+"\n"+out)
 	if key == "" {
-		return "", false
+		return "", false, nil
 	}
 	if key == d.failKey {
 		d.failCount++
@@ -1176,16 +1194,20 @@ func (d *DirectAgent) trackRepeatedFailure(act taggedAction, out string, callErr
 		d.failKey, d.failCount = key, 1
 	}
 	if d.failCount < directFailureLimit {
-		return "", false
+		return "", false, nil
 	}
 	d.failCount = 0
+	if d.failNags >= directFailureNags {
+		return "", false, fmt.Errorf("%w: %q failed the same way %d times in a row even after %d observation reminders; stopping instead of burning the remaining tool budget — inspect the workspace or adjust the instruction and resend",
+			ErrStall, cmd, directFailureLimit, d.failNags)
+	}
 	d.failNags++
 	d.o.log.Warnf("direct: %q failed the same way %d times; demanding an observation before another edit", cmd, directFailureLimit)
 	d.o.events.Record("direct_repeated_failure", d.o.tree.RootID, map[string]any{
 		"command": clip(cmd, evReasonChars),
 		"count":   directFailureLimit,
 	})
-	return directFailureEscalation(cmd, out, directFailureLimit), true
+	return directFailureEscalation(cmd, out, directFailureLimit), true, nil
 }
 
 func directFailureEscalation(command, output string, n int) string {
