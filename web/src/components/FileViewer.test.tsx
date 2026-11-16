@@ -195,7 +195,7 @@ describe('FileViewer AI rewrite preview', () => {
     vi.restoreAllMocks()
   })
 
-  it('shows the file with the rewrite applied, and the changed line marked', async () => {
+  it('shows the rewrite as an inline diff: removed line in rose, added in emerald', async () => {
     await act(async () => {
       root.render(<FileViewer sessionId="sess-a" path={FILE} />)
       await Promise.resolve()
@@ -205,13 +205,19 @@ describe('FileViewer AI rewrite preview', () => {
     })
 
     expect(host.textContent).toContain('AI 改写预览')
-    // The proposed text is what is shown.
-    expect(host.textContent).toContain('line two rewritten')
-    // And the changed line is marked.
-    const marked = Array.from(host.querySelectorAll('span')).find((sp) =>
+    // Both halves of the change are visible — the removed old line and the
+    // added new one — not just the rewritten file.
+    const removed = Array.from(host.querySelectorAll('span')).find((sp) =>
+      sp.className.includes('bg-rose-950'),
+    )
+    expect(removed?.textContent).toContain('line two')
+    const added = Array.from(host.querySelectorAll('span')).find((sp) =>
       sp.className.includes('bg-emerald-950'),
     )
-    expect(marked?.textContent).toContain('line two rewritten')
+    expect(added?.textContent).toContain('line two rewritten')
+    // The +/- markers ride along, diff-style.
+    expect(removed?.textContent).toMatch(/-/)
+    expect(added?.textContent).toMatch(/\+/)
   })
 
   it('in a multi-file round, previews the proposal for the file actually open', async () => {

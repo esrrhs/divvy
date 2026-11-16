@@ -8,8 +8,9 @@ import { draftLocateNotice } from '../lib/search'
 import { scrollTopForLine } from '../lib/fileNav'
 import { FileDiffList } from './FileDiffView'
 import { DocIcon, SpinnerIcon, XIcon } from './icons'
+import { computeDiff } from '../lib/diff'
 import { LangFromPath, tokenizeLines, type TokenKind } from '../lib/highlight'
-import type { AiEditProposal } from '../types'
+import type { AiEditProposal, DiffHunkLine } from '../types'
 
 // Same rule as the diff view: only the kinds that carry meaning get a colour.
 // Plain text inherits the editor's own colour, so an unreadable file stays
@@ -33,55 +34,99 @@ function humanSize(n: number): string {
 // proposedView builds the file as it would look with the pending AI rewrite
 // applied, plus the line numbers the proposal touches.
 //
-// This is what makes the rewrite reviewable IN PLACE: the middle panel shows
-// the file with the change in it, instead of a diff floating in a dialog.
-function proposedView(content: string, r: AiEditProposal): { text: string; marked: Set<number> } {
-  const lines = content.split('\n')
-  const start = Math.max(0, (r.start_line ?? 1) - 1)
-  const end = r.insert_line ? start : Math.max(start, r.end_line ?? r.start_line ?? 1)
-  const before = lines.slice(0, start).join('\n')
-  const after = lines.slice(end).join('\n')
-  const text = before + '\n' + r.new_text + after
-  const marked = new Set<number>()
-  for (const h of r.hunks ?? []) {
-    for (const l of h.lines ?? []) {
-      if (l.type === 'add' && l.new_no) marked.add(l.new_no)
-    }
-  }
-  return { text, marked }
+// One rendered row of the inline proposal diff: the pending rewrite shown as
+// remove/add lines embedded in the file, the way the turn diff and Cursor's
+// inline edit read. `no` is the line number (old number for removes, new for
+// everything else).
+interface ProposalRow {
+  type: 'context' | 'add' | 'remove'
+  no: number | null
+  text: string
 }
 
-// ProposalView shows the file with the pending rewrite applied. It is
+function proposalRows(r: AiEditProposal): ProposalRow[] {
+  const rows: ProposalRow[] = []
+  const pushCtx = (block: string | undefined, from: number) => {
+    const cleaned = (block ?? '').replace(/\n$/, '')
+    if (cleaned === '') return 0
+    const lines = cleaned.split('\n')
+    lines.forEach((text, i) => rows.push({ type: 'context', no: from + i, text }))
+    return lines.length
+  }
+  // Lines before the region carry their real numbers: the region starts at
+  // start_line (or insert_line for pure insertions).
+  const regionStart = r.insert_line ?? r.start_line ?? 1
+  const beforeBlock = (r.context_before ?? '').replace(/\n$/, '')
+  const beforeCount = pushCtx(beforeBlock, Math.max(1, regionStart - beforeBlock.split('\n').length))
+
+  // The diff itself: the server's hunks when present, else derived.
+  const diffLines: DiffHunkLine[] = (r.hunks ?? []).flatMap((h) => h.lines ?? [])
+  const source: DiffHunkLine[] =
+    diffLines.length > 0
+      ? diffLines
+      : computeDiff(r.old_text ?? '', r.new_text ?? '').lines.map((l) => ({
+          type: l.type,
+          old_no: l.type === 'add' ? null : l.oldNo ?? null,
+          new_no: l.type === 'remove' ? null : l.newNo ?? null,
+          text: l.text,
+        }))
+  let lastNew = regionStart - 1 + beforeCount
+  let lastOld = regionStart - 1 + beforeCount
+  for (const l of source) {
+    if (l.type === 'remove') {
+      lastOld += 1
+      rows.push({ type: 'remove', no: l.old_no ?? lastOld, text: l.text })
+    } else if (l.type === 'add') {
+      lastNew += 1
+      rows.push({ type: 'add', no: l.new_no ?? lastNew, text: l.text })
+    } else {
+      lastOld += 1
+      lastNew += 1
+      rows.push({ type: 'context', no: l.new_no ?? lastNew, text: l.text })
+    }
+  }
+  pushCtx(r.context_after, lastNew + 1)
+  return rows
+}
+
+// ProposalView shows the pending rewrite as an inline diff: removed lines in
+// rose, added lines in emerald, the rest of the file as plain context. It is
 // read-only on purpose: the proposal has not been accepted yet, so the file on
 // disk is still the user's, and a stray keystroke must not turn it into
 // something else.
-function ProposalView({ content, result }: { content: string; result: AiEditProposal }) {
-  const { text, marked } = useMemo(() => proposedView(content, result), [content, result])
-  const lines = text.split('\n')
+function ProposalView({ result }: { result: AiEditProposal }) {
+  const rows = useMemo(() => proposalRows(result), [result])
   const lang = LangFromPath(result.path)
-  const tokens = useMemo(() => tokenizeLines(text, lang), [text, lang])
+  const tokens = useMemo(() => tokenizeLines(rows.map((r) => r.text).join('\n'), lang), [rows, lang])
+  const rowCls: Record<ProposalRow['type'], string> = {
+    context: '',
+    add: 'bg-emerald-950/40',
+    remove: 'bg-rose-950/40',
+  }
+  const noCls: Record<ProposalRow['type'], string> = {
+    context: 'text-slate-700',
+    add: 'bg-emerald-900/40 text-emerald-300',
+    remove: 'bg-rose-900/40 text-rose-300',
+  }
   return (
     <div className="flex min-h-0 flex-1 overflow-hidden bg-ink-950/60">
       <div
         aria-hidden
         className="w-14 shrink-0 overflow-hidden border-r border-ink-800 bg-ink-950/80 py-2 text-right font-mono text-[12px] leading-[1.6] text-slate-700"
       >
-        {lines.map((_, i) => (
-          <div
-            key={i}
-            className={`px-2 ${marked.has(i + 1) ? 'bg-emerald-900/40 text-emerald-300' : ''}`}
-          >
-            {i + 1}
+        {rows.map((r, i) => (
+          <div key={i} className={`px-2 ${noCls[r.type]}`}>
+            {r.no ?? '~'}
           </div>
         ))}
       </div>
       <pre className="min-h-0 min-w-0 flex-1 overflow-auto whitespace-pre px-3 py-2 font-mono text-[12px] leading-[1.6] text-slate-300">
-        {tokens.map((line, i) => (
-          <span
-            key={i}
-            className={`block ${marked.has(i + 1) ? 'bg-emerald-950/40 text-emerald-200' : ''}`}
-          >
-            {line.map((t, j) => (
+        {rows.map((r, i) => (
+          <span key={i} className={`block ${rowCls[r.type]}`}>
+            <span aria-hidden className="mr-2 inline-block w-3 select-none text-right text-slate-600">
+              {r.type === 'add' ? '+' : r.type === 'remove' ? '-' : ' '}
+            </span>
+            {tokens[i].map((t, j) => (
               <span key={j} className={TOKEN_CLASS[t.kind]}>
                 {t.text}
               </span>
@@ -662,7 +707,7 @@ export function FileViewer({ sessionId, path }: { sessionId: string | null; path
           <p className="shrink-0 border-b border-line bg-brand-950/40 px-4 py-1.5 text-[11.5px] text-brand-200">
             AI 改写预览：下面是应用这次改写后的样子（尚未写回磁盘）。接受/拒绝在右侧的对话框里。
           </p>
-          <ProposalView content={file.content} result={proposal} />
+          <ProposalView result={proposal} />
         </>
       )}
 
