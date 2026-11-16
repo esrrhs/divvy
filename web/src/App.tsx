@@ -6,6 +6,7 @@ import { TopBar } from './components/TopBar'
 import { AskDialog } from './components/AskDialog'
 import { AiEditDialog } from './components/AiEditDialog'
 import { ActionToast } from './components/ActionToast'
+import { ErrorBoundary } from './components/ErrorBoundary'
 import { getToken } from './api/client'
 import { useStore } from './store'
 
@@ -43,25 +44,27 @@ export default function App() {
   }, [refreshSessions, refreshConversations])
 
   return (
-    <div className="flex h-full flex-col">
-      <TopBar live={live} sseStatus={sseStatus} />
-      <div className="flex min-h-0 flex-1">
-        <Sidebar
-          onNewSession={() => {
-            // Reuse the same conversation-nav invalidation as closing or
-            // deleting the current conversation so in-flight responses cannot
-            // restore the previous identity.
-            void openConversation('')
-          }}
-        />
-        <main className="flex min-w-0 flex-1 flex-col bg-ink-900">
-          <CenterMain />
-        </main>
-        <RightPanel />
+    <ErrorBoundary>
+      <div className="flex h-full flex-col">
+        <TopBar live={live} sseStatus={sseStatus} />
+        <div className="flex min-h-0 flex-1">
+          <Sidebar
+            onNewSession={() => {
+              // Reuse the same conversation-nav invalidation as closing or
+              // deleting the current conversation so in-flight responses cannot
+              // restore the previous identity.
+              void openConversation('')
+            }}
+          />
+          <main className="flex min-w-0 flex-1 flex-col bg-ink-900">
+            <CenterMain />
+          </main>
+          <RightPanel />
+        </div>
+        <AskDialog />
+        <AiEditDialog />
+        <ActionToast />
       </div>
-      <AskDialog />
-      <AiEditDialog />
-      <ActionToast />
-    </div>
+    </ErrorBoundary>
   )
 }

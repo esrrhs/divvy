@@ -360,7 +360,9 @@ export function ConversationView() {
   useEffect(() => {
     const el = scroller.current
     if (el) el.scrollTop = el.scrollHeight
-  }, [conv?.messages.length, conv?.id, conv?.live_assistant, conv?.pending_ask, live?.live_assistant, live?.pending_ask])
+    // `messages` is guarded too: a server that (still) reports null for a
+    // fresh conversation must not unmount the whole app here.
+  }, [conv?.messages?.length, conv?.id, conv?.live_assistant, conv?.pending_ask, live?.live_assistant, live?.pending_ask])
 
   useEffect(() => {
     setPaths([])

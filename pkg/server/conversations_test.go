@@ -1381,3 +1381,51 @@ func TestConversation_SessionGoalRedactsAPIKey(t *testing.T) {
 		time.Sleep(15 * time.Millisecond)
 	}
 }
+
+// A conversation created without a message carries nil slices; the wire used
+// to emit them as JSON null while the web app's types say array — one
+// unguarded `.length` there unmounted the whole view (white screen on first
+// open). The view must emit [] for every array-typed field.
+func TestConversation_FreshConversationEmitsEmptyArrays(t *testing.T) {
+	work, data := t.TempDir(), t.TempDir()
+	ts := apiServer(t, work, data)
+
+	status, resp := apiDo(t, http.MethodPost, apiBase(ts)+"/conversations?token=test-token", map[string]any{
+		"workdir":  work,
+		"model":    "scripted",
+		"base_url": "http://127.0.0.1:9/v1",
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("create status=%d resp=%v", status, resp)
+	}
+	id, _ := resp["id"].(string)
+	if id == "" {
+		t.Fatalf("missing conversation id: %v", resp)
+	}
+
+	status, detail := apiDo(t, http.MethodGet, apiBase(ts)+"/conversations/"+id+"?token=test-token", nil)
+	if status != http.StatusOK {
+		t.Fatalf("detail status=%d resp=%v", status, detail)
+	}
+	raw, _ := json.Marshal(detail)
+	var wire struct {
+		Messages   json.RawMessage `json:"messages"`
+		WorkLog    json.RawMessage `json:"work_log"`
+		SessionIDs json.RawMessage `json:"session_ids"`
+	}
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatal(err)
+	}
+	for name, field := range map[string]json.RawMessage{
+		"messages":    wire.Messages,
+		"work_log":    wire.WorkLog,
+		"session_ids": wire.SessionIDs,
+	} {
+		if len(field) == 0 || string(field) == "null" {
+			t.Fatalf("%s must serialize as [] not null: %s", name, raw)
+		}
+		if string(field) != "[]" {
+			t.Fatalf("%s must be an empty array for a fresh conversation, got %s", name, field)
+		}
+	}
+}

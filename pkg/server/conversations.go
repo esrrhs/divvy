@@ -738,8 +738,23 @@ func (s *Server) viewConversation(c *Conversation) conversationView {
 		BaseURL: c.Settings.BaseURL,
 	})
 	keyRequired := cfg.RequiresAPIKey() && !s.hasAPIKey(c.ID) && strings.TrimSpace(cfg.APIKey) == ""
+	// Array-typed fields must serialize as [], never null: a fresh conversation
+	// carries nil slices, and Go emits them as JSON null — the web app's types
+	// say array, and one unguarded `.length` there unmounted the whole view.
+	// Normalize at this single choke point; every conversation response goes
+	// through it.
+	conv := *c
+	if conv.Messages == nil {
+		conv.Messages = []ConvMessage{}
+	}
+	if conv.WorkLog == nil {
+		conv.WorkLog = []string{}
+	}
+	if conv.SessionIDs == nil {
+		conv.SessionIDs = []string{}
+	}
 	v := conversationView{
-		Conversation: *c,
+		Conversation: conv,
 		HasAPIKey:    s.hasAPIKey(c.ID) || strings.TrimSpace(cfg.APIKey) != "",
 		ContextNote:  convContextNote,
 		RunPhase:     phase,
