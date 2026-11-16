@@ -827,12 +827,14 @@ func (d *DirectAgent) loop(ctx context.Context) error {
 				// Session budget tripped inside chat().
 				return d.stop(err)
 			}
-			if errors.Is(err, context.DeadlineExceeded) && reqTimeout > 0 {
+			if errors.Is(err, context.DeadlineExceeded) && stepBudget > 0 {
 				// The per-step timeout tripped: the parent context is alive
 				// (checked above), so this is one hung model request, not a
-				// user abort. Name the knob instead of leaking a bare
-				// "context deadline exceeded" into the user's summary.
-				return d.stop(fmt.Errorf("%w (%s); the turn ended without a model reply — completed changes stay in the workspace, resend to continue", ErrStepTimeout, reqTimeout))
+				// user abort. Name the knob AND the endpoint: a stalled run
+				// against a misconfigured or unreachable endpoint (observed:
+				// the default api.openai.com while the model runs on a local
+				// Ollama) looks identical to a hung model otherwise.
+				return d.stop(fmt.Errorf("%w (%s) at %s; the turn ended without a model reply — completed changes stay in the workspace, resend to continue", ErrStepTimeout, stepBudget, d.o.cfg.BaseURL))
 			}
 			return d.stop(err)
 		}

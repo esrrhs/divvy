@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -16,6 +17,11 @@ import (
 
 // OpenAIClient talks to any OpenAI-compatible /chat/completions endpoint.
 type OpenAIClient struct {
+	// OnRetry, when set, is called for every retryable failure before the
+	// backoff wait. A slow endpoint with MaxRetries=0 retries until the
+	// caller's deadline; without this hook that storm is invisible — the run
+	// shows "running" for minutes with a single llm_call at the end.
+	OnRetry     func(attempt int, err error)
 	APIKey      string
 	BaseURL     string
 	HTTPClient  *http.Client
@@ -45,6 +51,11 @@ func NewOpenAIClient(apiKey, baseURL string, timeout time.Duration) *OpenAIClien
 		MaxBackoff: 30 * time.Second,
 		UserAgent:  "divvy",
 		HTTPClient: &http.Client{Timeout: timeout + 15*time.Second},
+		// Retries must not be invisible: a stuck endpoint retried until the
+		// caller's deadline looks exactly like a hung run from the outside.
+		OnRetry: func(attempt int, err error) {
+			log.Printf("llm: retryable failure (attempt %d): %v", attempt, err)
+		},
 	}
 }
 
@@ -144,6 +155,9 @@ func (c *OpenAIClient) Chat(ctx context.Context, req Request) (*Response, error)
 				continue
 			}
 			return nil, err
+		}
+		if c.OnRetry != nil {
+			c.OnRetry(attempt+1, err)
 		}
 	}
 }

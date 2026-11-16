@@ -74,8 +74,8 @@ func (o *Orchestrator) runWorker(ctx context.Context, sb *tools.Sandbox, node *m
 				// request, not a user abort or a leaf-budget expiry. Name the
 				// knob instead of leaking "context deadline exceeded" into the
 				// node's error history, where it reads like a code failure.
-				return summary, fmt.Errorf("%w (%s); the attempt ended without a model reply",
-					ErrStepTimeout, budget)
+				return summary, fmt.Errorf("%w (%s) at %s; the attempt ended without a model reply",
+					ErrStepTimeout, budget, o.cfg.BaseURL)
 			}
 			return summary, err
 		}
