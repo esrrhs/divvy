@@ -272,7 +272,10 @@ export const api = {
   aiEditStream: async (
     id: string,
     body: AiEditRequest,
-    onDelta: (text: string) => void,
+    // Multi-file rounds tag each delta with its file (per-file delta events);
+    // single-file rounds omit the path, which the caller resolves to the
+    // round's only target.
+    onDelta: (text: string, path?: string) => void,
     signal?: AbortSignal,
     onProgress?: (done: number, total: number, path: string) => void,
   ): Promise<AiEditResponse> => {
@@ -312,8 +315,8 @@ export const api = {
         } else if (line.startsWith('data: ')) {
           const payload = line.slice(6)
           if (event === 'delta') {
-            const d = JSON.parse(payload) as { text?: string }
-            if (d.text) onDelta(d.text)
+            const d = JSON.parse(payload) as { text?: string; path?: string }
+            if (d.text) onDelta(d.text, d.path)
           } else if (event === 'progress') {
             const p = JSON.parse(payload) as { done?: number; total?: number; path?: string }
             onProgress?.(p.done ?? 0, p.total ?? 0, p.path ?? '')

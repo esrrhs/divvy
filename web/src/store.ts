@@ -163,6 +163,10 @@ interface AppState {
   aiEditProgress: string
   // Raw code as it streams in, before the diff is known.
   aiEditStreaming: string
+  /** Streamed code per file path, attributed via the delta events' path
+   * field. Single-file rounds key by the round's only target; this is what
+   * the viewer's streaming preview renders. */
+  aiEditStreamsByPath: Record<string, string>
   aiEditBusy: boolean
   // Set after a write so the dialog can offer an undo.
   aiEditApplied: { applied: number; rejected: number; paths?: string[] } | null
@@ -247,6 +251,7 @@ export const useStore = create<AppState>((set, get) => ({
   aiEditResult: null,
   aiEditProgress: '',
   aiEditStreaming: '',
+  aiEditStreamsByPath: {},
   aiEditBusy: false,
   aiEditApplied: null,
   aiEditHistory: [],
@@ -825,6 +830,7 @@ export const useStore = create<AppState>((set, get) => ({
       aiEditTargets: [{ path, selection }],
       aiEditResult: null,
       aiEditStreaming: '',
+  aiEditStreamsByPath: {},
       aiEditProgress: '',
       aiEditBusy: false,
       aiEditApplied: null,
@@ -846,6 +852,7 @@ export const useStore = create<AppState>((set, get) => ({
       aiEditTargets: [],
       aiEditResult: null,
       aiEditStreaming: '',
+  aiEditStreamsByPath: {},
       aiEditProgress: '',
       aiEditBusy: false,
       aiEditApplied: null,
@@ -877,6 +884,7 @@ export const useStore = create<AppState>((set, get) => ({
       aiEditTargets: next,
       aiEditResult: null,
       aiEditStreaming: '',
+  aiEditStreamsByPath: {},
       aiEditProgress: '',
       aiEditApplied: null,
       actionError: null,
@@ -889,6 +897,7 @@ export const useStore = create<AppState>((set, get) => ({
       aiEditTargets: targets.filter((t) => t.path !== path),
       aiEditResult: null,
       aiEditStreaming: '',
+  aiEditStreamsByPath: {},
       aiEditProgress: '',
       aiEditApplied: null,
       actionError: null,
@@ -919,7 +928,7 @@ export const useStore = create<AppState>((set, get) => ({
     aiEditAbort?.abort()
     const ctrl = new AbortController()
     aiEditAbort = ctrl
-    set({ actionError: null, aiEditBusy: true, aiEditResult: null, aiEditStreaming: '', aiEditProgress: '' })
+    set({ actionError: null, aiEditBusy: true, aiEditResult: null, aiEditStreaming: '', aiEditStreamsByPath: {}, aiEditProgress: '' })
     try {
       // A follow-up carries the earlier rounds so the model revises its last
       // proposal instead of starting over from the original selection.
@@ -934,7 +943,16 @@ export const useStore = create<AppState>((set, get) => ({
       const res = await api.aiEditStream(
         id,
         body,
-        (text) => set((s) => ({ aiEditStreaming: s.aiEditStreaming + text })),
+        (text, path) =>
+          set((s) => {
+            // Single-file rounds stream without a path; multi-file rounds tag
+            // each delta, so the viewer can show the file it is open on.
+            const key = path ?? targets[0].path
+            return {
+              aiEditStreamsByPath: { ...s.aiEditStreamsByPath, [key]: (s.aiEditStreamsByPath[key] ?? '') + text },
+              ...(path === undefined ? { aiEditStreaming: s.aiEditStreaming + text } : {}),
+            }
+          }),
         ctrl.signal,
         (done, total, path) => set({ aiEditProgress: `已生成 ${done}/${total}：${path}` }),
       )
@@ -1019,6 +1037,7 @@ export const useStore = create<AppState>((set, get) => ({
         },
         aiEditResult: null,
         aiEditStreaming: '',
+  aiEditStreamsByPath: {},
         aiEditProgress: '',
         aiEditHistory: s.aiEditHistory.map((t, i) => {
           if (i !== s.aiEditHistory.length - 1) return t

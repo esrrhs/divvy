@@ -172,3 +172,58 @@ describe('multi-file ⌘K store', () => {
     expect(useStore.getState().actionError).toContain('没有可写回')
   })
 })
+
+describe('multi-file ⌘K per-file stream attribution', () => {
+  beforeEach(() => {
+    useStore.setState({
+      currentConvId: 'conv-a',
+      actionError: null,
+      aiEditOpen: true,
+      aiEditPath: 'a.go',
+      aiEditSelection: { start_line: 2, end_line: 2 },
+      aiEditTargets: targets,
+      aiEditResult: null,
+      aiEditStreaming: '',
+      aiEditStreamsByPath: {},
+      aiEditProgress: '',
+      aiEditBusy: false,
+      aiEditApplied: null,
+      aiEditHistory: [],
+      aiEditUndoDepth: 0,
+      fileReloadNonce: 0,
+    })
+  })
+
+  it('attributes deltas to their files via the path tag', async () => {
+    vi.spyOn(api, 'aiEditStream').mockImplementation(async (_id, _body, onDelta, _signal, onProgress) => {
+      // Interleaved on purpose: the server's per-file goroutines emit deltas
+      // tagged with their path, and the store must not mix them up.
+      onDelta('a-part-1', 'a.go')
+      onDelta('b-part-1', 'b.go')
+      onProgress?.(1, 2, 'a.go')
+      onDelta('a-part-2', 'a.go')
+      onDelta('b-part-2', 'b.go')
+      onProgress?.(2, 2, 'b.go')
+      return MULTI
+    })
+    await useStore.getState().runAiEdit('一起改')
+    const streams = useStore.getState().aiEditStreamsByPath
+    expect(streams['a.go']).toBe('a-part-1a-part-2')
+    expect(streams['b.go']).toBe('b-part-1b-part-2')
+    // Multi-file deltas do not pollute the single-file dialog display.
+    expect(useStore.getState().aiEditStreaming).toBe('')
+  })
+
+  it('untagged deltas (single-file round) land on the round\u2019s only target', async () => {
+    useStore.setState({ aiEditTargets: [targets[0]] })
+    vi.spyOn(api, 'aiEditStream').mockImplementation(async (_id, _body, onDelta) => {
+      onDelta('single-1')
+      onDelta('single-2')
+      return MULTI
+    })
+    await useStore.getState().runAiEdit('只改一个')
+    const streams = useStore.getState().aiEditStreamsByPath
+    expect(streams['a.go']).toBe('single-1single-2')
+    expect(useStore.getState().aiEditStreaming).toBe('single-1single-2')
+  })
+})

@@ -284,6 +284,22 @@ func (s *Server) handleAiEditMulti(w http.ResponseWriter, c *Conversation, req a
 				Temperature: 0.1,
 				MaxTokens:   aiEditMaxTokens(p.promptRegion),
 			}
+			if stream {
+				// Per-file deltas tagged with the path: the client assembles
+				// each file's stream separately, so N concurrent generations
+				// do not turn into the mixed-up delta stream this protocol
+				// deliberately avoids. Writes serialize under mu (progress
+				// events interleave from the other goroutines).
+				request.Stream = true
+				request.OnToken = func(delta string) {
+					mu.Lock()
+					writeAiEditEvent(w, flusher, "delta", map[string]any{
+						"path": p.rel,
+						"text": Redact(delta, secrets...),
+					})
+					mu.Unlock()
+				}
+			}
 			resp, err := client.Chat(ctx, request)
 			if err != nil {
 				prop.Error = "LLM 调用失败: " + err.Error()

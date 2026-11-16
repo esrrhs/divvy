@@ -483,3 +483,89 @@ func TestAiEdit_MultiFileFollowUpRevisesOwnProposal(t *testing.T) {
 		t.Fatal("no prompt was built for a.go")
 	}
 }
+
+// The multi-file stream must not become the mixed-up delta stream this
+// protocol deliberately avoids: every delta event carries the file it
+// belongs to, so the client can assemble each file's code separately while
+// the per-file goroutines generate concurrently.
+func TestAiEdit_MultiFileStreamTagsDeltasWithPaths(t *testing.T) {
+	work := t.TempDir()
+	writeMultiFiles(t, work)
+	h, client := multiHarness(t, work, false)
+	client.StreamChunks = 2
+	id := newAiEditConv(t, h.Server, work)
+
+	body, _ := json.Marshal(map[string]any{
+		"targets":     multiTargets(),
+		"instruction": "把返回值乘十",
+		"stream":      true,
+	})
+	req, err := http.NewRequest(http.MethodPost, apiBase(h.Server)+"/conversations/"+id+"/ai-edit?token=test-token", strings.NewReader(string(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "text/event-stream") {
+		t.Fatalf("content-type=%q, want SSE", ct)
+	}
+
+	type deltaRow struct {
+		Path string `json:"path"`
+		Text string `json:"text"`
+	}
+	deltas := map[string]*strings.Builder{}
+	getDelta := func(p string) *strings.Builder {
+		if deltas[p] == nil {
+			deltas[p] = &strings.Builder{}
+		}
+		return deltas[p]
+	}
+	progress := 0
+	var done aiEditResponse
+	sc := bufio.NewScanner(resp.Body)
+	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	event := ""
+	for sc.Scan() {
+		line := sc.Text()
+		switch {
+		case strings.HasPrefix(line, "event: "):
+			event = strings.TrimPrefix(line, "event: ")
+		case strings.HasPrefix(line, "data: "):
+			payload := strings.TrimPrefix(line, "data: ")
+			switch event {
+			case "delta":
+				var d deltaRow
+				if err := json.Unmarshal([]byte(payload), &d); err != nil {
+					t.Fatalf("delta payload: %v (%s)", err, payload)
+				}
+				if d.Path == "" {
+					t.Fatalf("multi-file delta without a path tag: %s", payload)
+				}
+				getDelta(d.Path).WriteString(d.Text)
+			case "progress":
+				progress++
+			case "done":
+				if err := json.Unmarshal([]byte(payload), &done); err != nil {
+					t.Fatalf("done payload: %v (%s)", err, payload)
+				}
+			}
+		}
+	}
+	if progress != 2 {
+		t.Fatalf("progress events = %d, want 2 (one per file)", progress)
+	}
+	if got := getDelta("a.go").String(); got != "func A() int {\n\treturn 10\n}\n" {
+		t.Fatalf("a.go stream = %q", got)
+	}
+	if got := getDelta("b.go").String(); got != "func B() int {\n\treturn 20\n}\n" {
+		t.Fatalf("b.go stream = %q", got)
+	}
+	if len(done.Proposals) != 2 {
+		t.Fatalf("done should carry both proposals, got %d", len(done.Proposals))
+	}
+}

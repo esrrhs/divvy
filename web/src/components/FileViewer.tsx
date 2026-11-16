@@ -342,8 +342,7 @@ export function FileViewer({ sessionId, path }: { sessionId: string | null; path
   const aiEditOpen = useStore((s) => s.aiEditOpen)
   const fileReloadNonce = useStore((s) => s.fileReloadNonce)
   const aiEditBusy = useStore((s) => s.aiEditBusy)
-  const aiEditStreaming = useStore((s) => s.aiEditStreaming)
-  const aiEditPath = useStore((s) => s.aiEditPath)
+  const aiEditStreamsByPath = useStore((s) => s.aiEditStreamsByPath)
   const aiEditTargets = useStore((s) => s.aiEditTargets)
   const aiEditSelection = useStore((s) => s.aiEditSelection)
   // A pending AI rewrite for THIS file is reviewed in place, in this panel.
@@ -355,12 +354,13 @@ export function FileViewer({ sessionId, path }: { sessionId: string | null; path
     const list = proposals.proposals?.length ? proposals.proposals : [proposals]
     return list.find((p) => sameRelPath(p.path, path)) ?? null
   }, [proposals, path])
-  // A single-file Cmd-K generation streams the code into this pane as it
-  // lands; multi-file rounds report progress in the dialog instead (the
-  // stream interleaves files, so per-file diffs would lie about order).
-  const aiSel = aiEditTargets[0]?.selection ?? aiEditSelection ?? {}
-  const streamingHere =
-    aiEditBusy && aiEditPath === path && aiEditTargets.length <= 1 && aiEditStreaming.length > 0
+  // A Cmd-K generation streams the code of THIS file into the pane as it
+  // lands. Multi-file rounds tag each delta with its file, so the streamed
+  // text is per-file and the viewer can follow whichever file it has open.
+  const aiSel =
+    aiEditTargets.find((t) => sameRelPath(t.path, path))?.selection ?? aiEditSelection ?? {}
+  const streamedHere = Object.entries(aiEditStreamsByPath).find(([k]) => sameRelPath(k, path))?.[1] ?? ''
+  const streamingHere = aiEditBusy && streamedHere.length > 0
   const [file, setFile] = useState<FsFileResponse | null>(null)
   const [draft, setDraft] = useState('')
   const [baseHash, setBaseHash] = useState('')
@@ -802,7 +802,7 @@ export function FileViewer({ sessionId, path }: { sessionId: string | null; path
           draft={draft}
           startLine={aiSel.start_line ?? 1}
           endLine={aiSel.end_line ?? aiSel.start_line ?? 1}
-          streamed={aiEditStreaming}
+          streamed={streamedHere}
           path={path}
         />
       )}

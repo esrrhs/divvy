@@ -543,7 +543,7 @@ describe('FileViewer streaming Cmd-K preview', () => {
       aiEditPath: FILE,
       aiEditTargets: [{ path: FILE, selection: { start_line: 2, end_line: 2 } }],
       aiEditSelection: { start_line: 2, end_line: 2 },
-      aiEditStreaming: '',
+      aiEditStreamsByPath: {},
       aiEditBusy: true,
       aiEditResult: null,
       aiEditHistory: [],
@@ -569,7 +569,7 @@ describe('FileViewer streaming Cmd-K preview', () => {
     // Partial code has landed: the streamed lines are adds, the old line that
     // will be replaced is a remove, the header says it is still generating.
     await act(async () => {
-      useStore.setState({ aiEditStreaming: 'line two rewritten' })
+      useStore.setState({ aiEditStreamsByPath: { [FILE]: 'line two rewritten' } })
     })
     expect((host.textContent ?? '').includes('正在生成改写')).toBe(true)
     const added = Array.from(host.querySelectorAll('pre span.block')).find((sp) =>
@@ -588,7 +588,7 @@ describe('FileViewer streaming Cmd-K preview', () => {
       await Promise.resolve()
     })
     await act(async () => {
-      useStore.setState({ aiEditStreaming: 'line two rewritten' })
+      useStore.setState({ aiEditStreamsByPath: { [FILE]: 'line two rewritten' } })
     })
     await act(async () => {
       useStore.setState({
@@ -619,5 +619,71 @@ describe('FileViewer streaming Cmd-K preview', () => {
       (sp.textContent ?? '').includes('line two rewritten'),
     )
     expect(added?.className).toContain('bg-emerald-950')
+  })
+})
+
+describe('FileViewer per-file streaming in multi-file rounds', () => {
+  let root: Root
+  let host: HTMLElement
+
+  const OTHER = 'pkg/other.go'
+  const OTHER_CONTENT = 'package other\n\nfunc Existing() {}\n'
+
+  beforeEach(() => {
+    host = document.createElement('div')
+    document.body.appendChild(host)
+    root = createRoot(host)
+    ;(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
+    vi.spyOn(api, 'fsFile').mockImplementation(async (p: string) => ({
+      path: p,
+      content: p === FILE ? CONTENT : OTHER_CONTENT,
+      size: 100,
+      hash: 'hash-' + p,
+      editable: true,
+      mode: 0o644,
+    }))
+    useStore.setState({
+      currentConvId: 'conv-a',
+      fileView: { path: OTHER, sessionId: 'sess-a' },
+      turnChanges: null,
+      live: null,
+      aiEditOpen: true,
+      aiEditBusy: true,
+      aiEditTargets: [
+        { path: FILE, selection: { start_line: 2, end_line: 2 } },
+        { path: OTHER, selection: { start_line: 3, end_line: 3 } },
+      ],
+      // Both files have streamed content; the viewer is open on OTHER and
+      // must render OTHER's stream, not the first target's.
+      aiEditStreamsByPath: {
+        [FILE]: 'line two rewritten',
+        [OTHER]: 'func Rewritten() {}',
+      },
+      aiEditResult: null,
+      aiEditHistory: [],
+      aiEditUndoDepth: 0,
+    })
+  })
+
+  afterEach(() => {
+    act(() => root.unmount())
+    host.remove()
+    vi.restoreAllMocks()
+  })
+
+  it('renders the open file\u2019s own stream, not another target\u2019s', async () => {
+    await act(async () => {
+      root.render(<FileViewer sessionId="sess-a" path={OTHER} />)
+      await Promise.resolve()
+    })
+    await act(async () => {
+      await Promise.resolve()
+    })
+    expect((host.textContent ?? '').includes('正在生成改写')).toBe(true)
+    const added = Array.from(host.querySelectorAll('pre span.block')).find((sp) =>
+      (sp.textContent ?? '').includes('func Rewritten() {}'),
+    )
+    expect(added?.className).toContain('bg-emerald-950')
+    expect((host.textContent ?? '').includes('line two rewritten')).toBe(false)
   })
 })
