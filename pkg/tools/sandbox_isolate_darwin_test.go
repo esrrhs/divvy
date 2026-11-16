@@ -179,6 +179,10 @@ func TestDarwinProfile_Shape(t *testing.T) {
 		"(deny default)",
 		"(deny network*)",
 		`(deny mach-lookup (global-name "com.apple.securityd"))`,
+		// Resolving the /var symlink needs a read on "/var" itself; without it
+		// the CLT shims (python3 via xcode-select) die with EPERM instead of
+		// falling through to the real toolchain.
+		`(literal "/var")`,
 		`(subpath "` + realPath(root) + `")`,
 		`(subpath "` + dirs.tmp + `")`,
 		`(subpath "` + dirs.cache + `")`,

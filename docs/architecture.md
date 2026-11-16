@@ -116,9 +116,10 @@ NewFromGoal / Load
 2. **启动时实测，不信假设。** 两个平台的探针都真跑一次命令（`ProbeShellIsolation`）：Linux 确认 `bwrap` 在并且能跑通 `true`；macOS 额外验证两条**否定性**断言——往工作区外写被拒、家目录里的哨兵文件读不到。判定靠 `os.Stat` 和退出码，不抓输出（输出格式跨版本不稳）。探针不过界面上就显示"不可用"，而不是运行到一半才发现。
 3. **临时目录与 HOME 是重定向的。** 每次执行都用 `$TMPDIR/divvy-exec` 下的私有 `home`/`gopath`，`HOME` 指过去，所以 `ls ~` 看到的不是真实家目录。Go 的 build cache 单独放在 `divvy-gocache` 并跨次复用，否则每次 `go build` 都从零编译。
 
-macOS 后端有两个只能靠实测发现的坑，值得记下来：
+macOS 后端有三个只能靠实测发现的坑，值得记下来：
 
 - **Seatbelt 按调用者拼写的路径匹配。** `os.TempDir()` 在 macOS 返回 `/var/folders/...`，内核看到的是 `/private/var/folders/...`；`/var` 在 SBPL 里写 `(subpath "/var/...")` **不会**匹配 `/private/var/...`。所以 profile 里每条路径都要同时写 literal 与 `realPath` 两种拼写，并且传给子进程的 `TMPDIR`/`GOCACHE` 必须是解析后的拼写——否则 `go build` 会以 `mkdir ... operation not permitted` 失败，而 profile 看上去"明明允许了"。
+- **`/var` 符号链接本身的解析也要一条授权。** CLT 工具链 shim（`/usr/bin/python3` 这类）内部会走 `xcode-select`，后者按 `/var/select/developer_dir` 这个**未解析**拼写打开路径；解析 `/var` 链接的动作是一次对 `"/var"` 的读取，profile 不给 `(literal "/var")` 时它以 EPERM 收场，shim 误报"没有开发者工具"并试图触发安装流程（又会被写拒绝拦住），`python3 -m py_compile` 这条验收就永远过不去。给 literal 而不是 subpath：`/var` 的子路径仍由解析后的 `/private/var` 规则管辖，策略面没有扩大。
 - **`sandbox-exec` 是 deprecated 但仍可用。** Apple 从 10.15 起在文档里弃用它，实测到 macOS 26/27 仍工作。所以探针是唯一可信的判据：将来它被移除，探针失败、`run_bash` 退回不可用，引擎行为不会改变。
 
 SBPL 是权限黑名单式封锁，不是命名空间隔离：`/usr`、`/Library` 这类系统前缀在沙箱内可读，可写面仍只有工作区与临时目录，网络出口被 deny。够用来跑构建和测试，不等价于"只读整个磁盘"——家目录的私有文件靠"不 allow"挡住，而不是靠"看不见"。

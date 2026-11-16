@@ -168,6 +168,15 @@ func darwinProfile(root string, dirs execDirs) string {
 	b.WriteString("(allow file-write* (literal \"/dev/null\") (literal \"/dev/dtracehelper\"))\n")
 
 	b.WriteString("(allow file-read*\n    (literal \"/\")\n")
+	// Resolving the /var → /private/var symlink is itself a read of "/var", and
+	// every open of a "/var/..." path goes through it: without this grant the
+	// lookup dies with EPERM before the resolved /private/var path is ever
+	// checked. The CLT toolchain shims hit exactly that — /usr/bin/python3
+	// consults xcode-select, which opens "/var/select/developer_dir" — and a
+	// hard EPERM makes the shim report "no developer tools" instead of quietly
+	// falling through to the real location. A literal, not a subpath: children
+	// stay governed by the /private/var rules below.
+	b.WriteString("    (literal \"/var\")\n")
 	for _, p := range darwinSystemReadPaths {
 		fmt.Fprintf(&b, "    (subpath %s)\n", sbplQuote(p))
 	}
