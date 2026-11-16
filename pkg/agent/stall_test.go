@@ -302,3 +302,32 @@ func TestStall_WindowSurvivesStepTimeouts(t *testing.T) {
 		t.Fatalf("a new failure must restart the window, run=%d", n.StallRun())
 	}
 }
+
+// TestWorker_FirstRequestToleratesColdModelLoad: the leaf's first request may
+// include a cold model load (Ollama evicts after ~5 idle minutes; retry
+// backoff between attempts is exactly that kind of idle). The first request
+// must get the cold-start floor instead of burning RequestTimeout; later
+// requests stay on RequestTimeout.
+func TestWorker_FirstRequestToleratesColdModelLoad(t *testing.T) {
+	calls := 0
+	client := &llm.ScriptedClient{Handle: func(ctx context.Context, req llm.Request) (*llm.Response, error) {
+		calls++
+		if calls == 1 {
+			select {
+			case <-time.After(400 * time.Millisecond):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		return jsonAction("finish", map[string]string{"summary": "cold start absorbed"}), nil
+	}}
+	o, sb := newWorkerOrchestrator(t, client)
+	o.cfg.RequestTimeout = 200 * time.Millisecond
+	summary, err := o.runWorker(context.Background(), sb, o.tree.GetRoot(), "")
+	if err != nil {
+		t.Fatalf("worker = %v, want success (first request must tolerate the load)", err)
+	}
+	if summary != "cold start absorbed" {
+		t.Fatalf("summary = %q", summary)
+	}
+}

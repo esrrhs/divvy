@@ -162,6 +162,26 @@ export function CenterMain() {
     )
   }
 
+  // Chat and editor coexist — the Cursor layout. Opening a file used to
+  // replace the conversation entirely, which threw the composer (and with it
+  // the auto-context chip and the whole loop) off screen: to send a message
+  // you had to close the file you were looking at. Now the conversation keeps
+  // its column while the file sits beside it; 关闭 hands the space back. A
+  // workspace file with no active conversation keeps the full-pane behavior.
+  if (fileView && currentConvId) {
+    return (
+      <div className="flex min-h-0 flex-1">
+        <div className="flex min-h-0 min-w-0 flex-[2] flex-col border-r border-line">
+          <ConversationView />
+          {currentId || currentConvId ? <SessionView /> : null}
+        </div>
+        <div className="flex min-h-0 min-w-0 flex-[3] flex-col bg-ink-900">
+          <FileViewer sessionId={fileView.sessionId} path={fileView.path} />
+        </div>
+      </div>
+    )
+  }
+
   // A workspace file opened from the left file browser replaces the session
   // view in the center pane; closing returns to the live/tree view.
   if (fileView) {

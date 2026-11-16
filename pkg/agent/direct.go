@@ -726,6 +726,7 @@ func (d *DirectAgent) loop(ctx context.Context) error {
 		return d.finish(summary)
 	}
 
+	firstRequest := true
 	for step := d.st.Step + 1; step <= maxSteps; step++ {
 		if err := ctx.Err(); err != nil {
 			return d.stop(err)
@@ -753,10 +754,20 @@ func (d *DirectAgent) loop(ctx context.Context) error {
 		}
 
 		reqTimeout := d.o.cfg.RequestTimeout
+		// The first request of the run may include model load time: a local
+		// endpoint that has evicted the model (Ollama's keep-alive expires
+		// after ~5 idle minutes) spends the first request loading it, and
+		// burning RequestTimeout on the load killed turns before their first
+		// real step — observed with phi4-mini via Ollama. Later requests talk
+		// to a warm model and keep RequestTimeout.
+		stepBudget := reqTimeout
+		if firstRequest && reqTimeout > 0 && reqTimeout < firstRequestFloor {
+			stepBudget = firstRequestFloor
+		}
 		stepCtx := ctx
 		var cancel context.CancelFunc
-		if _, hasDeadline := ctx.Deadline(); !hasDeadline && reqTimeout > 0 {
-			stepCtx, cancel = context.WithTimeout(ctx, reqTimeout)
+		if _, hasDeadline := ctx.Deadline(); !hasDeadline && stepBudget > 0 {
+			stepCtx, cancel = context.WithTimeout(ctx, stepBudget)
 		}
 		streamID := fmt.Sprintf("%s-%d", d.o.tree.ID, step)
 		var streamed strings.Builder
@@ -793,6 +804,7 @@ func (d *DirectAgent) loop(ctx context.Context) error {
 			}
 		}
 		resp, err := d.chatDirect(stepCtx, nodeID, req)
+		firstRequest = false
 		if cancel != nil {
 			cancel()
 		}
@@ -820,7 +832,7 @@ func (d *DirectAgent) loop(ctx context.Context) error {
 				// (checked above), so this is one hung model request, not a
 				// user abort. Name the knob instead of leaking a bare
 				// "context deadline exceeded" into the user's summary.
-				return d.stop(fmt.Errorf("model request exceeded the per-step timeout (%s); the turn ended without a model reply — completed changes stay in the workspace, resend to continue", reqTimeout))
+				return d.stop(fmt.Errorf("%w (%s); the turn ended without a model reply — completed changes stay in the workspace, resend to continue", ErrStepTimeout, reqTimeout))
 			}
 			return d.stop(err)
 		}

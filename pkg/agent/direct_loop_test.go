@@ -623,6 +623,13 @@ func TestDirect_StallEndsTurnAfterInterventions(t *testing.T) {
 	}
 }
 
+// TestDirect_FirstRequestToleratesColdModelLoad is the observed Ollama
+// behavior: after ~5 idle minutes the model is evicted, and the run's first
+// request spends that load time instead of generating — which used to burn
+// RequestTimeout and kill the turn before its first real step. The first
+// request must get the cold-start floor; later requests stay on
+// RequestTimeout.
+
 // TestDirect_ContextWindowKeepsLaterFollowUps is the long-session follow-up
 // gap: directRequestWindow pins only the system prompt and the first user
 // message. A mid-conversation inject or later follow-up sits in the body and

@@ -42,10 +42,20 @@ func (o *Orchestrator) runWorker(ctx context.Context, sb *tools.Sandbox, node *m
 		}
 		o.log.Actionf("worker %s step %d/%d", node.ID, step, maxSteps)
 
+		// The attempt's first request may include a cold model load: local
+		// endpoints evict models after a few idle minutes, and retry backoff
+		// between attempts is exactly the kind of idle that triggers it.
+		// Burning RequestTimeout on the load failed attempts that were never
+		// given a chance (observed with phi4-mini via Ollama); the floor only
+		// widens the first request, later ones stay on RequestTimeout.
+		budget := reqTimeout
+		if step == 1 && reqTimeout > 0 && reqTimeout < firstRequestFloor {
+			budget = firstRequestFloor
+		}
 		stepCtx := ctx
 		var cancel context.CancelFunc
-		if _, hasDeadline := ctx.Deadline(); !hasDeadline && reqTimeout > 0 {
-			stepCtx, cancel = context.WithTimeout(ctx, reqTimeout)
+		if _, hasDeadline := ctx.Deadline(); !hasDeadline && budget > 0 {
+			stepCtx, cancel = context.WithTimeout(ctx, budget)
 		}
 		resp, err := o.chat(stepCtx, "worker", node.ID, llm.Request{
 			Model:       o.cfg.Model,
@@ -65,7 +75,7 @@ func (o *Orchestrator) runWorker(ctx context.Context, sb *tools.Sandbox, node *m
 				// knob instead of leaking "context deadline exceeded" into the
 				// node's error history, where it reads like a code failure.
 				return summary, fmt.Errorf("%w (%s); the attempt ended without a model reply",
-					ErrStepTimeout, reqTimeout)
+					ErrStepTimeout, budget)
 			}
 			return summary, err
 		}
@@ -250,6 +260,13 @@ var ErrInvalidJSON = errors.New("invalid JSON replies")
 // the leaf was already failing on (see stallFingerprintFor), not as fresh
 // evidence of progress.
 var ErrStepTimeout = errors.New("model request exceeded the per-step timeout")
+
+// firstRequestFloor keeps the run's very first request (and each leaf
+// attempt's first request) patient enough to cover a local endpoint's cold
+// model load — Ollama evicts models after ~5 idle minutes, and the next
+// request spends minutes loading instead of generating. A floor, not an
+// override: a configured RequestTimeout above it stays as configured.
+const firstRequestFloor = 5 * time.Minute
 
 // ErrStall ends a turn that keeps producing the same failure after its
 // strategy-change interventions were exhausted: continuing has been shown not
