@@ -542,10 +542,8 @@ func (s *Server) armConversationFinalize(convID string, h *agent.RunHandle) {
 
 func (s *Server) finalizeConversationRun(convID string, h *agent.RunHandle, phase agent.RunPhase) {
 	outcome := runOutcome(string(phase), phase == agent.PhaseFailed)
-	if phase == agent.PhaseFailed {
-		if snap := h.Snapshot(); strings.Contains(strings.ToLower(snap.Error), "abort") {
-			outcome = "aborted"
-		}
+	if phase == agent.PhaseFailed && h.Aborted() {
+		outcome = "aborted"
 	}
 	result := ""
 	if snap := h.Snapshot(); snap.Error != "" {

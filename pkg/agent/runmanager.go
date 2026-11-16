@@ -938,6 +938,12 @@ func (h *RunHandle) Abort() error {
 		return ErrRunFinished
 	}
 	if p == PhasePlanReview {
+		// The soft /abort ends the run through the review gate, not through
+		// cancel — set the same flag so Aborted() tells the two endings apart
+		// (a deliberate stop must not surface as 失败).
+		h.mu.Lock()
+		h.aborted = true
+		h.mu.Unlock()
 		return h.submitAt(PhasePlanReview, "/abort", false)
 	}
 	h.mu.Lock()
@@ -945,6 +951,17 @@ func (h *RunHandle) Abort() error {
 	h.mu.Unlock()
 	h.cancel()
 	return nil
+}
+
+// Aborted reports whether the run was ended by the user's Abort action (as
+// opposed to an error, a budget stop, or a process-level pause). The server
+// reads it to phrase the run-finished summary — sniffing the error text for
+// "abort" misses a plain "context canceled" and shows the user 失败 for their
+// own deliberate stop.
+func (h *RunHandle) Aborted() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.aborted
 }
 
 // Pause saves and stops a running (or question-waiting) run.
