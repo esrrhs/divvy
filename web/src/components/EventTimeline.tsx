@@ -1,4 +1,5 @@
 import type { StreamEvent } from '../types'
+import { formatDuration, formatOutputLen } from './ToolCallCard'
 
 const kindMeta: Record<
   string,
@@ -49,10 +50,14 @@ function summary(ev: StreamEvent): string {
       return ev.ok === false
         ? `未通过 (exit ${ev.exit_code ?? '?'})：${String(ev.command ?? '').slice(0, 80)} — ${String(ev.error ?? '').slice(0, 200) || (ev.timed_out ? '超时' : '非零退出')}`
         : `通过：${String(ev.command ?? '').slice(0, 120)}`
-    case 'tool_call':
+    case 'tool_call': {
+      const dur = formatDuration(typeof ev.duration_ms === 'number' ? ev.duration_ms : undefined)
+      const size = formatOutputLen(typeof ev.output_len === 'number' ? ev.output_len : undefined)
+      const metro = [dur, size].filter(Boolean).join(' · ')
       return `${ev.tool ?? ''}${ev.args ? ` ${String(ev.args).slice(0, 100)}` : ''}${
         ev.ok === false ? ` 失败：${ev.error}` : ''
-      }`
+      }${metro ? ` · ${metro}` : ''}`
+    }
     case 'llm_call':
       return `${ev.call_kind ? String(ev.call_kind) + ' · ' : ''}${ev.model ?? ''}${
         ev.total_tokens ? ` · ${ev.total_tokens} tok` : ''
@@ -79,6 +84,19 @@ function summary(ev: StreamEvent): string {
 
 const displayKinds = new Set(Object.keys(kindMeta))
 
+// The timeline's at-a-glance tool output: prefer the structured head, fall
+// back to the legacy markered preview (events replayed from older session
+// files only carry that). Clipped here — the conversation's tool card is
+// the deep-dive surface.
+function toolOutputPreview(ev: StreamEvent): string {
+  if (ev.kind !== 'tool_call') return ''
+  const head = typeof ev.output_head === 'string' ? ev.output_head : ''
+  const legacy = typeof ev.output_preview === 'string' ? ev.output_preview : ''
+  const raw = head || legacy
+  if (!raw) return ''
+  return raw.length > 200 ? `${raw.slice(0, 200)}…` : raw
+}
+
 export function EventTimeline({ events }: { events: StreamEvent[] }) {
   const shown = events.filter((e) => displayKinds.has(e.kind)).slice().reverse()
 
@@ -96,6 +114,7 @@ export function EventTimeline({ events }: { events: StreamEvent[] }) {
         {shown.slice(0, 500).map((ev, i) => {
           const meta = kindMeta[ev.kind] ?? { label: ev.kind, dot: 'bg-slate-600' }
           const text = summary(ev)
+          const preview = toolOutputPreview(ev)
           return (
             <li key={`${ev.seq ?? 'x'}-${i}`} className="relative">
               <span
@@ -114,6 +133,11 @@ export function EventTimeline({ events }: { events: StreamEvent[] }) {
                 <p className="mt-0.5 whitespace-pre-wrap break-words text-[11.5px] leading-relaxed text-slate-500">
                   {text}
                 </p>
+              )}
+              {preview && (
+                <pre className="mt-1 max-h-24 overflow-y-auto whitespace-pre-wrap break-words rounded border border-line/60 bg-ink-900/50 px-2 py-1 font-mono text-[10.5px] leading-relaxed text-slate-400">
+                  {preview}
+                </pre>
               )}
             </li>
           )
