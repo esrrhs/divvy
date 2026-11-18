@@ -200,6 +200,50 @@ func (s *Server) handleSetConversationKey(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, s.viewConversation(c))
 }
 
+// handleRenameConversation renames a conversation. The auto title is the
+// first request's text, which stops being descriptive the moment the
+// conversation moves on to other work; renaming is how the list stays
+// navigable. Harmless at any time — it touches nothing but the title.
+func (s *Server) handleRenameConversation(w http.ResponseWriter, r *http.Request) {
+	c, err := s.loadConv(r.PathValue("id"))
+	if err != nil {
+		writeJSON(w, statusForConvErr(err), map[string]string{"error": err.Error()})
+		return
+	}
+	var req struct {
+		Title string `json:"title"`
+	}
+	if err := decodeBody(r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	title := strings.TrimSpace(req.Title)
+	if title == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "title cannot be empty"})
+		return
+	}
+	if len([]rune(title)) > 200 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "title is longer than 200 characters"})
+		return
+	}
+	if latest, e2 := loadConversation(s.dataDir, c.ID); e2 == nil {
+		c = latest
+	}
+	secrets := s.secretsFor(c.ID)
+	s.mu.Lock()
+	c.Title = title
+	serr := saveConversation(s.dataDir, c, secrets)
+	s.mu.Unlock()
+	if serr != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": serr.Error()})
+		return
+	}
+	if latest, e2 := loadConversation(s.dataDir, c.ID); e2 == nil {
+		c = latest
+	}
+	writeJSON(w, http.StatusOK, s.viewConversation(c))
+}
+
 // handleUpdateConversationSettings switches the model/base URL of an open
 // conversation — the Cursor-style "pick another model and retry" move. The
 // next turn (a fresh postMessage or a resume) launches with the new values;

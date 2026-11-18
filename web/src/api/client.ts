@@ -246,6 +246,9 @@ export const api = {
   updateConversationSettings: (id: string, settings: { model?: string; base_url?: string }) =>
     request<Conversation>('POST', `/conversations/${id}/settings`, settings),
 
+  renameConversation: (id: string, title: string) =>
+    request<Conversation>('POST', `/conversations/${id}/rename`, { title }),
+
   cancelSteer: (id: string) => request<Conversation>('DELETE', `/conversations/${id}/steer`),
 
   searchConversationFiles: (id: string, q: string, limit = 20) =>

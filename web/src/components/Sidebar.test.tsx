@@ -34,11 +34,16 @@ describe('Sidebar conversation search', () => {
     document.body.appendChild(host)
     root = createRoot(host)
     ;(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
-    vi.spyOn(api, 'listConversations').mockResolvedValue([
+    let rows = [
       conv('a', '修登录超时', '/work/auth'),
       conv('b', 'Add 函数改加法', '/tmp/divvy-guitool'),
       conv('c', '文档整理', '/work/docs', 'paused'),
-    ])
+    ]
+    vi.spyOn(api, 'listConversations').mockImplementation(async () => rows)
+    vi.spyOn(api, 'renameConversation').mockImplementation(async (id, title) => {
+      rows = rows.map((c) => (c.id === id ? { ...c, title } : c))
+      return rows.find((c) => c.id === id)!
+    })
     useStore.setState({
       conversations: [],
       conversationsLoading: false,
@@ -107,5 +112,37 @@ describe('Sidebar conversation search', () => {
     })
     expect(host.querySelector('input')).toBeNull()
     expect(host.textContent).toContain('还没有对话')
+  })
+
+  it('renames a conversation from the hover ✎ button', async () => {
+    await act(async () => {
+      root.render(<Sidebar onNewSession={() => {}} />)
+      await Promise.resolve()
+    })
+    const clickBtn = (label: string) => {
+      const btn = [...host.querySelectorAll('button')].find(
+        (b) => (b.textContent || '').trim() === label || b.getAttribute('title') === label,
+      )
+      if (!btn) throw new Error(`button ${label} missing`)
+      act(() => btn.dispatchEvent(new MouseEvent('click', { bubbles: true })))
+    }
+
+    // The ✎ is hover-revealed but always clickable in jsdom.
+    clickBtn('重命名对话')
+    const input = [...host.querySelectorAll('input')].find((i) => i.title === '回车保存，Esc 取消') as HTMLInputElement
+    expect(input.value).toBe('修登录超时')
+
+    const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!
+    act(() => {
+      set.call(input, '登录修复：超时分支')
+      input.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    await act(async () => {
+      input.closest('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    expect(api.renameConversation).toHaveBeenCalledWith('a', '登录修复：超时分支')
+    expect(visibleTitles()).toContain('登录修复：超时分支')
   })
 })

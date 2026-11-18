@@ -146,3 +146,51 @@ func TestConversationSettingsUpdate_Guards(t *testing.T) {
 		t.Fatalf("unexpected error: %s", rec.Body.String())
 	}
 }
+
+// TestConversationRename covers the sidebar rename: values persist (redacted
+// on save like every title), empty/overlong titles are refused, and the view
+// comes back with the new name.
+func TestConversationRename(t *testing.T) {
+	data := t.TempDir()
+	m := agent.NewRunManager()
+	defer m.Shutdown(0)
+	s, err := New(m, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := newConversation(t.TempDir(), ConversationSettings{AgentMode: agent.AgentLoopDirect}, "自动标题")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := saveConversation(data, c, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	rename := func(body string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest("POST", "http://localhost/", strings.NewReader(body))
+		req.SetPathValue("id", c.ID)
+		rec := httptest.NewRecorder()
+		s.handleRenameConversation(rec, req)
+		return rec
+	}
+
+	if rec := rename(`{"title":"登录修复：超时分支"}`); rec.Code != http.StatusOK {
+		t.Fatalf("rename failed: %d %s", rec.Code, rec.Body.String())
+	}
+	latest, err := loadConversation(data, c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest.Title != "登录修复：超时分支" {
+		t.Fatalf("title not persisted: %q", latest.Title)
+	}
+
+	if rec := rename(`{"title":"   "}`); rec.Code != http.StatusBadRequest {
+		t.Fatalf("empty title must 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+	long := strings.Repeat("长", 201)
+	if rec := rename(`{"title":"` + long + `"}`); rec.Code != http.StatusBadRequest {
+		t.Fatalf("overlong title must 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+}

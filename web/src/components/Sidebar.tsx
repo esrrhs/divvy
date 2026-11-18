@@ -38,10 +38,13 @@ function ConversationItem({ row }: { row: Conversation }) {
   const openConversation = useStore((s) => s.openConversation)
   const resumeConversation = useStore((s) => s.resumeConversation)
   const deleteConversation = useStore((s) => s.deleteConversation)
+  const renameConversation = useStore((s) => s.renameConversation)
   const active = row.id === currentId
   const kind = rowKind(row)
   const [resuming, setResuming] = useState(false)
   const [deleting, setDeleting] = useState(false)
+  const [renaming, setRenaming] = useState(false)
+  const [titleDraft, setTitleDraft] = useState('')
 
   const kindLabel: Record<Filter, string> = {
     all: '',
@@ -89,10 +92,47 @@ function ConversationItem({ row }: { row: Conversation }) {
           {deleting ? <SpinnerIcon width={12} height={12} /> : <TrashIcon width={12} height={12} />}
         </button>
       )}
-      <button onClick={() => void openConversation(row.id)} className="block w-full text-left">
-        <div className="line-clamp-2 pr-5 text-[12.5px] leading-snug text-slate-200">
-          {row.title || shortWorkdir(row.workdir) || '(无标题)'}
-        </div>
+      {renaming ? (
+        <form
+          className="py-1"
+          onSubmit={async (e) => {
+            e.preventDefault()
+            const title = titleDraft.trim()
+            if (!title) return
+            const ok = await renameConversation(row.id, title)
+            if (ok) setRenaming(false)
+          }}
+        >
+          <input
+            autoFocus
+            className="input w-full py-1 text-[12px]"
+            value={titleDraft}
+            maxLength={200}
+            onChange={(e) => setTitleDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Escape') setRenaming(false)
+            }}
+            onBlur={() => setRenaming(false)}
+            title="回车保存，Esc 取消"
+          />
+          <p className="mt-1 text-[10px] text-slate-600">回车保存 · Esc 取消</p>
+        </form>
+      ) : (
+        <>
+          <button
+            onClick={() => {
+              setTitleDraft(row.title || '')
+              setRenaming(true)
+            }}
+            title="重命名对话"
+            className="absolute right-7 top-1.5 rounded p-0.5 text-slate-600 opacity-0 transition hover:bg-ink-700 hover:text-brand-200 focus:opacity-100 group-hover:opacity-100"
+          >
+            ✎
+          </button>
+          <button onClick={() => void openConversation(row.id)} className="block w-full text-left">
+            <div className="line-clamp-2 pr-9 text-[12.5px] leading-snug text-slate-200">
+              {row.title || shortWorkdir(row.workdir) || '(无标题)'}
+            </div>
         <div className="mt-1 flex items-center justify-between text-[11px] text-slate-500">
           <span className="truncate font-mono" title={row.workdir}>
             {shortWorkdir(row.workdir)}
@@ -102,7 +142,9 @@ function ConversationItem({ row }: { row: Conversation }) {
             <span>{timeAgo(row.updated_at)}</span>
           </span>
         </div>
-      </button>
+          </button>
+        </>
+      )}
 
       {kind === 'paused' && (
         <button

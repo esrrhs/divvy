@@ -130,6 +130,7 @@ interface AppState {
   cancelQueue: () => Promise<boolean>
   cancelSteer: () => Promise<boolean>
   updateConversationSettings: (settings: { model?: string; base_url?: string }) => Promise<boolean>
+  renameConversation: (id: string, title: string) => Promise<boolean>
   loadTurnChanges: (sessionId?: string) => Promise<void>
   applyTurnHunks: (payload: ApplyHunkRequest, sessionId?: string) => Promise<boolean>
   rollbackTurn: (sessionId: string) => Promise<boolean>
@@ -478,6 +479,25 @@ export const useStore = create<AppState>((set, get) => ({
         actionError: null,
       })
       await get().refreshConversations()
+      return true
+    } catch (e) {
+      applyActionError(get, set, e)
+      return false
+    }
+  },
+
+  // Rename from the sidebar: touches only the title, safe at any time. Most
+  // renames target a conversation that is NOT open — the list must update
+  // regardless of navigation state; only the on-screen copy is conv-scoped.
+  renameConversation: async (id, title) => {
+    try {
+      const conversation = await api.renameConversation(id, title)
+      const conversations = mergeConversation(get().conversations, conversation)
+      set({
+        conversations,
+        ...(get().currentConvId === id ? { conversation } : {}),
+        actionError: null,
+      })
       return true
     } catch (e) {
       applyActionError(get, set, e)
