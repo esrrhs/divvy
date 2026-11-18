@@ -286,6 +286,15 @@ export function clampSplitRatio(raw: number): number {
   return Math.min(0.7, Math.max(0.2, raw))
 }
 
+// The conversation/session row ratio (chat above, tree+event timeline
+// below). The floor keeps the composer and message scroller usable; the
+// ceiling keeps the event timeline readable — it collapsed to a ~30px strip
+// when the conversation's natural height ate the whole column.
+export function clampRowSplitRatio(raw: number): number {
+  if (!Number.isFinite(raw)) return 0.6
+  return Math.min(0.75, Math.max(0.3, raw))
+}
+
 // The AI-edit dialog's free position, as offsets from the viewport's top and
 // right edges. Clamped so the panel can never be dragged fully off-screen;
 // 8px keeps a grip visible for dragging it back.

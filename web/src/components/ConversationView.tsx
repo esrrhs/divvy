@@ -617,7 +617,7 @@ export function ConversationView() {
           : '描述要做的修改。每轮会自动带上项目结构和当前打开的文件（选区也会带上，可点 × 去掉）；用 @ 可强制附加指定文件或目录'
 
   return (
-    <div className="flex min-h-0 shrink-0 flex-col border-b border-line">
+    <div className="flex min-h-0 flex-1 flex-col border-b border-line">
       <div className="shrink-0 border-b border-line bg-ink-850/70 px-4 py-2">
         <div className="flex items-center gap-2 text-[12px] text-slate-400">
           <span className="truncate font-mono text-[11.5px] text-slate-300" title={conv.workdir}>
@@ -630,7 +630,15 @@ export function ConversationView() {
             工作日志 {conv.work_log?.length ?? 0}/8 轮
           </span>
         </div>
-        <p className="mt-1 text-[11px] leading-snug text-slate-600">{conv.context_note}</p>
+        {/* The note is the same boilerplate on every conversation; unclamped
+            it wrapped to ~6 lines and, as a shrink-0 header, pushed the
+            composer past the row divider onto the session pane. */}
+        <p
+          className="mt-1 line-clamp-3 text-[11px] leading-snug text-slate-600"
+          title={conv.context_note}
+        >
+          {conv.context_note}
+        </p>
       </div>
 
         {conv.pending_rollback && (
@@ -666,7 +674,11 @@ export function ConversationView() {
           </div>
         )}
 
-      <div ref={scroller} className="max-h-[34vh] min-h-[96px] space-y-2 overflow-y-auto px-4 py-3">
+      {/* The height allocation comes from the row divider above (CenterMain):
+          the scroller flexes to fill its share instead of capping at 34vh,
+          which used to leave the event timeline a ~30px strip. The 56px floor
+          keeps a sliver of the last message visible at extreme ratios. */}
+      <div ref={scroller} className="min-h-[56px] flex-1 space-y-2 overflow-y-auto px-4 py-3">
         {(!conv.messages || conv.messages.length === 0) && (
           <p className="py-4 text-center text-[12.5px] text-slate-600">
             在下方输入需求，divvy 会在此项目里规划并执行修改。不必每次 @，需要精确指定时再用 @。结束后可继续提修改，不必重填模型信息。

@@ -1,7 +1,7 @@
 import { useMemo, useRef, useState } from 'react'
 import { useStore } from '../store'
 import type { StreamEvent } from '../types'
-import { clampSplitRatio } from '../lib/conversation'
+import { clampRowSplitRatio, clampSplitRatio } from '../lib/conversation'
 import { compactTokens, treeStats } from '../lib/tree'
 import { ProjectForm } from './ProjectForm'
 import { ConversationView } from './ConversationView'
@@ -143,6 +143,10 @@ function SessionView() {
 // Persisted conversation/viewer width ratio for the split layout.
 const SPLIT_KEY = 'divvy.splitRatio'
 
+// Persisted conversation/session height ratio (chat above, tree + event
+// timeline below).
+const ROW_KEY = 'divvy.rowSplitRatio'
+
 function initialSplitRatio(): number {
   try {
     const raw = Number(localStorage.getItem(SPLIT_KEY) ?? '')
@@ -152,13 +156,25 @@ function initialSplitRatio(): number {
   }
 }
 
+function initialRowSplitRatio(): number {
+  try {
+    const raw = Number(localStorage.getItem(ROW_KEY) ?? '')
+    return clampRowSplitRatio(raw || Number.NaN)
+  } catch {
+    return 0.6
+  }
+}
+
 export function CenterMain() {
   const currentId = useStore((s) => s.currentId)
   const currentConvId = useStore((s) => s.currentConvId)
   const fileView = useStore((s) => s.fileView)
   const [splitRatio, setSplitRatio] = useState(initialSplitRatio)
+  const [rowRatio, setRowRatio] = useState(initialRowSplitRatio)
   const splitRowRef = useRef<HTMLDivElement | null>(null)
   const dragStart = useRef<{ x: number; ratio: number } | null>(null)
+  const rowColRef = useRef<HTMLDivElement | null>(null)
+  const rowDragStart = useRef<{ y: number; ratio: number } | null>(null)
 
   // The divider is the width allocation knob: drag it, or nudge with arrow
   // keys. The ratio lives in localStorage so a reload keeps the layout.
@@ -201,6 +217,50 @@ export function CenterMain() {
     })
   }
 
+  // The row divider is the height allocation knob between the conversation
+  // and the session pane (tree + event timeline). The conversation's natural
+  // height used to eat the whole column whenever messages accumulated,
+  // squeezing the event timeline to a ~30px strip where entries were
+  // unreadable.
+  function startRowDrag(e: React.MouseEvent) {
+    e.preventDefault()
+    const col = rowColRef.current
+    if (!col) return
+    rowDragStart.current = { y: e.clientY, ratio: rowRatio }
+    const onMove = (ev: MouseEvent) => {
+      const h = col.getBoundingClientRect().height
+      const start = rowDragStart.current
+      if (!start || h <= 0) return
+      setRowRatio(clampRowSplitRatio(start.ratio + (ev.clientY - start.y) / h))
+    }
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+      setRowRatio((r) => {
+        try {
+          localStorage.setItem(ROW_KEY, String(r))
+        } catch {
+          // Private-mode storage: the layout just won't persist.
+        }
+        return r
+      })
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+  }
+
+  function nudgeRow(delta: number) {
+    setRowRatio((r) => {
+      const next = clampRowSplitRatio(r + delta)
+      try {
+        localStorage.setItem(ROW_KEY, String(next))
+      } catch {
+        // Same as above: persistence is best effort.
+      }
+      return next
+    })
+  }
+
   if (!currentConvId && !currentId) {
     return (
       <div className="flex flex-1 items-start justify-center overflow-y-auto px-6 py-10">
@@ -219,6 +279,51 @@ export function CenterMain() {
     )
   }
 
+  // Conversation above, tree + event timeline below, with a draggable height
+  // divider. Shared by the plain center pane and the split layout's left
+  // column so the timeline keeps a usable height in both.
+  function chatAndSessionStack() {
+    return (
+      <div ref={rowColRef} className="flex min-h-0 flex-1 flex-col">
+        {currentConvId && (
+          <>
+            <div
+              className="flex min-h-0 flex-col overflow-hidden"
+              style={{ flex: `0 0 ${rowRatio * 100}%` }}
+            >
+              <ConversationView />
+            </div>
+            <div
+              role="separator"
+              aria-orientation="horizontal"
+              aria-label="调整对话与执行面板高度"
+              tabIndex={0}
+              title="拖动调整高度；↑/↓ 微调"
+              // z-10 keeps the 4px strip grabbable even when the conversation's
+              // content minimum (header + composer) briefly paints over it on
+              // short viewports.
+              className="relative z-10 h-1 shrink-0 cursor-row-resize bg-ink-800 hover:bg-brand-700/70 focus:bg-brand-700/70 focus:outline-none"
+              onMouseDown={startRowDrag}
+              onKeyDown={(e) => {
+                if (e.key === 'ArrowUp') {
+                  e.preventDefault()
+                  nudgeRow(-0.02)
+                }
+                if (e.key === 'ArrowDown') {
+                  e.preventDefault()
+                  nudgeRow(0.02)
+                }
+              }}
+            />
+          </>
+        )}
+        <div className="flex min-h-0 flex-1 flex-col">
+          {currentId || currentConvId ? <SessionView /> : null}
+        </div>
+      </div>
+    )
+  }
+
   // Chat and editor coexist — the Cursor layout. Opening a file used to
   // replace the conversation entirely, which threw the composer (and with it
   // the auto-context chip and the whole loop) off screen: to send a message
@@ -232,8 +337,7 @@ export function CenterMain() {
           className="flex min-h-0 min-w-0 flex-col border-r border-line"
           style={{ width: `${splitRatio * 100}%` }}
         >
-          <ConversationView />
-          {currentId || currentConvId ? <SessionView /> : null}
+          {chatAndSessionStack()}
         </div>
         <div
           role="separator"
@@ -267,10 +371,5 @@ export function CenterMain() {
     return <FileViewer sessionId={fileView.sessionId} path={fileView.path} />
   }
 
-  return (
-    <div className="flex min-h-0 flex-1 flex-col">
-      {currentConvId && <ConversationView />}
-      {currentId || currentConvId ? <SessionView /> : null}
-    </div>
-  )
+  return chatAndSessionStack()
 }

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import type { CodeSelection } from '../types'
 import {
   autoContext,
+  clampRowSplitRatio,
   clampSplitRatio,
   composeState,
   conversationRowKind,
@@ -228,5 +229,15 @@ describe('clampSplitRatio', () => {
     expect(clampSplitRatio(0.95)).toBe(0.7)
     expect(clampSplitRatio(Number.NaN)).toBe(0.4)
     expect(clampSplitRatio(Number.POSITIVE_INFINITY)).toBe(0.4)
+  })
+})
+
+describe('clampRowSplitRatio', () => {
+  it('keeps the chat and the session timeline both usable', () => {
+    expect(clampRowSplitRatio(0.6)).toBe(0.6)
+    expect(clampRowSplitRatio(0.05)).toBe(0.3)
+    expect(clampRowSplitRatio(0.95)).toBe(0.75)
+    expect(clampRowSplitRatio(Number.NaN)).toBe(0.6)
+    expect(clampRowSplitRatio(Number.POSITIVE_INFINITY)).toBe(0.6)
   })
 })
