@@ -1041,4 +1041,39 @@ describe('ConversationView attachment chips open the viewer', () => {
     expect(update).toHaveBeenCalledTimes(1)
     expect(host.textContent).toContain('qwen3.8:27b')
   })
+
+  it('model replies offer a hover 复制 that copies the raw text', async () => {
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText: vi.fn(async () => undefined) },
+    })
+    const reply = conv('a', 'sess-a', {
+      messages: [
+        {
+          id: 'm1',
+          role: 'assistant',
+          kind: 'model_reply',
+          text: '修复完成：把 **a-b** 改为 a+b',
+          created_at: '',
+        },
+      ],
+    })
+    vi.spyOn(api, 'getConversation').mockImplementation(async () => reply)
+    await useStore.getState().openConversation('a')
+    await act(async () => {
+      root.render(<ConversationView />)
+      await Promise.resolve()
+    })
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    const btn = [...host.querySelectorAll('button')].find((b) => (b.textContent || '').trim() === '复制')
+    expect(btn).toBeTruthy()
+    await act(async () => {
+      btn!.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    expect(navigator.clipboard.writeText).toHaveBeenCalledWith('修复完成：把 **a-b** 改为 a+b')
+    expect(host.textContent).toContain('已复制')
+  })
 })

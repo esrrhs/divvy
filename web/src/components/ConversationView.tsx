@@ -3,6 +3,7 @@ import { api } from '../api/client'
 import {
   autoContext,
   composeState,
+  copyToClipboard,
   mentionQuery,
   messageKindMeta,
   outcomeMeta,
@@ -396,6 +397,7 @@ function MessageBubble({
     return <ToolCallCard tool={msg.tool} />
   }
   const meta = messageKindMeta(msg.kind)
+  const [copied, setCopied] = useState(false)
   return (
     <div className={`group rounded-md border px-3 py-2 ${meta.cls}`}>
       <div className="flex items-baseline gap-2">
@@ -408,6 +410,23 @@ function MessageBubble({
             onClick={() => onResend(msg.text)}
           >
             编辑重发
+          </button>
+        )}
+        {msg.kind === 'model_reply' && (
+          <button
+            type="button"
+            className={`shrink-0 text-[10px] text-slate-600 transition-opacity hover:text-brand-200 ${
+              copied ? 'opacity-100 text-emerald-400/90' : 'opacity-0 group-hover:opacity-100'
+            }`}
+            title="复制这条回复的原文"
+            onClick={async () => {
+              if (await copyToClipboard(msg.text)) {
+                setCopied(true)
+                setTimeout(() => setCopied(false), 1200)
+              }
+            }}
+          >
+            {copied ? '已复制' : '复制'}
           </button>
         )}
         {msg.session_id && (

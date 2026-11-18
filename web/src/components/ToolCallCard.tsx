@@ -1,6 +1,16 @@
 import { useState } from 'react'
 import type { ToolActivity } from '../types'
+import { copyToClipboard } from '../lib/conversation'
 import { ChevronRightIcon } from './icons'
+
+// What 复制 puts on the clipboard: the output as recorded (head, gap, tail)
+// — the most useful text when pasting into a report or a follow-up prompt.
+// A tool with no output copies the args instead.
+function cardCopyText(t: ToolActivity): string {
+  const out = [t.output_head, t.output_tail].filter(Boolean).join('\n⋯\n')
+  if (out) return out
+  return t.args ?? ''
+}
 
 // formatDuration keeps the header compact: sub-second calls read as ms,
 // everything else as seconds with one decimal (a 5-minute build is still
@@ -32,9 +42,17 @@ function hasGap(t: ToolActivity): boolean {
 // structured field existed.
 export function ToolCallCard({ tool }: { tool: ToolActivity }) {
   const [open, setOpen] = useState(false)
+  const [copied, setCopied] = useState(false)
   const failed = !tool.ok
   const dur = formatDuration(tool.duration_ms)
   const len = formatOutputLen(tool.output_len)
+
+  async function copy() {
+    if (await copyToClipboard(cardCopyText(tool))) {
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1200)
+    }
+  }
 
   return (
     <div
@@ -59,6 +77,16 @@ export function ToolCallCard({ tool }: { tool: ToolActivity }) {
       </button>
       {open && (
         <div className="mt-2 space-y-2 border-t border-line pt-2">
+          <div className="flex justify-end">
+            <button
+              type="button"
+              className="text-[10px] text-slate-600 hover:text-brand-200"
+              title="复制工具输出（无输出时复制参数）"
+              onClick={() => void copy()}
+            >
+              {copied ? '已复制' : '复制输出'}
+            </button>
+          </div>
           {tool.error && (
             <p className="whitespace-pre-wrap break-words font-mono text-[11.5px] leading-relaxed text-rose-300">
               {tool.error}

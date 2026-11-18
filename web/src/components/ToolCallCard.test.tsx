@@ -98,4 +98,57 @@ describe('ToolCallCard', () => {
     expect(host.textContent).toContain('exit status 1: build failed')
     expect((host.firstElementChild as HTMLElement).className).toContain('border-rose-900')
   })
+
+  it('复制输出 copies the recorded output (head+tail) to the clipboard', async () => {
+    const written: string[] = []
+    const stub = async (text: string) => {
+      written.push(text)
+      return true
+    }
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText: stub },
+    })
+    try {
+      const tail = 'ok\ntail line'
+      render({
+        tool: 'execute',
+        ok: true,
+        output_head: 'h'.repeat(600),
+        output_tail: tail,
+        output_len: 2012,
+        duration_ms: 12000,
+      })
+      toggle()
+      const btn = [...host.querySelectorAll('button')].find((b) => (b.textContent || '').trim() === '复制输出')
+      expect(btn).toBeTruthy()
+      await act(async () => {
+        btn!.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      })
+      expect(written).toHaveLength(1)
+      expect(written[0]).toContain(tail)
+      expect(host.textContent).toContain('已复制')
+    } finally {
+      delete (navigator as { clipboard?: unknown }).clipboard
+    }
+  })
+
+  it('copies args when the tool recorded no output', async () => {
+    const written: string[] = []
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText: async (text: string) => void written.push(text) },
+    })
+    try {
+      render({ tool: 'read_file', ok: true, args: '{"path":"a.go"}' })
+      toggle()
+      const btn = [...host.querySelectorAll('button')].find((b) => (b.textContent || '').trim() === '复制输出')
+      await act(async () => {
+        btn!.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      })
+      expect(written).toEqual(['{"path":"a.go"}'])
+    } finally {
+      delete (navigator as { clipboard?: unknown }).clipboard
+    }
+  })
 })

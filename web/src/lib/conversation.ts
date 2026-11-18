@@ -271,6 +271,18 @@ export function wholeFileRange(content: string): CodeSpan {
   return { start_line: 1, end_line: Math.max(n, 1) }
 }
 
+// Shared clipboard helper for the message actions (copy a model reply, copy
+// tool output). Best effort: environments without the async clipboard API
+// (jsdom, some webviews) report failure instead of throwing.
+export async function copyToClipboard(text: string): Promise<boolean> {
+  try {
+    await navigator.clipboard?.writeText(text)
+    return true
+  } catch {
+    return false
+  }
+}
+
 export function lineRangeFromOffsets(content: string, start: number, end: number): CodeSpan {
   const from = Math.max(0, Math.min(start, end, content.length))
   let to = Math.max(0, Math.min(Math.max(start, end), content.length))
