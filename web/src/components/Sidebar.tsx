@@ -125,6 +125,7 @@ function ConversationItem({ row }: { row: Conversation }) {
 export function Sidebar({ onNewSession }: { onNewSession: () => void }) {
   const [tab, setTab] = useState<'sessions' | 'files' | 'search'>('sessions')
   const [filter, setFilter] = useState<Filter>('all')
+  const [query, setQuery] = useState('')
   const conversations = useStore((s) => s.conversations)
   const loading = useStore((s) => s.conversationsLoading)
   const refresh = useStore((s) => s.refreshConversations)
@@ -133,10 +134,20 @@ export function Sidebar({ onNewSession }: { onNewSession: () => void }) {
     void refresh()
   }, [refresh])
 
-  const filtered = useMemo(
-    () => (filter === 'all' ? conversations : conversations.filter((r) => rowKind(r) === filter)),
-    [conversations, filter],
-  )
+  // Search composes with the phase filter: title or project path, case
+  // insensitive. With a dozen conversations from a few days of work this is
+  // the fastest way back to "the one where I fixed X".
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase()
+    return conversations
+      .filter((r) => filter === 'all' || rowKind(r) === filter)
+      .filter((r) => {
+        if (!q) return true
+        return (
+          (r.title || '').toLowerCase().includes(q) || (r.workdir || '').toLowerCase().includes(q)
+        )
+      })
+  }, [conversations, filter, query])
 
   return (
     <aside className="flex h-full w-[264px] shrink-0 flex-col border-r border-line bg-ink-850">
@@ -190,6 +201,31 @@ export function Sidebar({ onNewSession }: { onNewSession: () => void }) {
               </button>
             ))}
           </div>
+          {conversations.length > 0 && (
+            <div className="relative px-3 pb-2">
+              <SearchIcon
+                width={12}
+                height={12}
+                className="pointer-events-none absolute left-5 top-1/2 -translate-y-1/2 text-slate-600"
+              />
+              <input
+                className="input w-full py-1 pl-7 pr-6 text-[11.5px]"
+                placeholder="搜索对话（标题 / 项目路径）"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+              />
+              {query && (
+                <button
+                  type="button"
+                  className="absolute right-5 top-1/2 -translate-y-1/2 rounded px-1 text-slate-600 hover:text-slate-300"
+                  title="清除搜索"
+                  onClick={() => setQuery('')}
+                >
+                  ×
+                </button>
+              )}
+            </div>
+          )}
           <div className="flex-1 space-y-1 overflow-y-auto px-2 pb-3">
             {conversations.length === 0 && !loading && (
               <p className="px-2 py-6 text-center text-[12px] leading-relaxed text-slate-600">
@@ -199,7 +235,9 @@ export function Sidebar({ onNewSession }: { onNewSession: () => void }) {
               </p>
             )}
             {conversations.length > 0 && filtered.length === 0 && (
-              <p className="px-2 py-6 text-center text-[12px] text-slate-600">该筛选下没有对话。</p>
+              <p className="px-2 py-6 text-center text-[12px] text-slate-600">
+                {query.trim() ? `没有匹配「${query.trim()}」的对话。` : '该筛选下没有对话。'}
+              </p>
             )}
             {filtered.map((row) => (
               <ConversationItem key={row.id} row={row} />
