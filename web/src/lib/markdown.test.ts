@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { langToFileExt, parseInline, parseMarkdown } from './markdown'
+import { fencePathHint, langToFileExt, parseInline, parseMarkdown } from './markdown'
 
 describe('parseMarkdown', () => {
   it('splits fenced code blocks with their language tag', () => {
@@ -76,5 +76,21 @@ describe('clampDialogPos', () => {
     expect(clampDialogPos(-50, -50, 540, 400, 1280, 720).top).toBe(8)
     expect(clampDialogPos(5000, 5000, 540, 400, 1280, 720).right).toBe(1280 - 540 - 8)
     expect(clampDialogPos(Number.NaN, Number.NaN, 540, 400, 1280, 720)).toEqual({ top: 8, right: 8 })
+  })
+})
+
+describe('fence meta and path hints', () => {
+  it('captures the info string after the language', () => {
+    const blocks = parseMarkdown('```go math/math.go\nfunc A() {}\n```')
+    expect(blocks[0]).toMatchObject({ kind: 'code', lang: 'go', meta: 'math/math.go' })
+    expect((parseMarkdown('```go\nfunc A() {}\n```')[0] as { meta?: string }).meta).toBeUndefined()
+  })
+
+  it('fencePathHint extracts path-looking tokens only', () => {
+    expect(fencePathHint('go math/math.go')).toBe('math/math.go')
+    expect(fencePathHint('go:math/math.go')).toBe('math/math.go')
+    expect(fencePathHint('json')).toBe('')
+    expect(fencePathHint('go -x')).toBe('')
+    expect(fencePathHint('')).toBe('')
   })
 })

@@ -276,6 +276,10 @@ type fsWriteRequest struct {
 	Path         string `json:"path"`
 	Content      string `json:"content"`
 	BaseHash     string `json:"base_hash"`
+	// Create allows writing a file that does not exist yet (code-block
+	// "apply" from a model reply). Existing files always require the
+	// base_hash conflict check.
+	Create       bool   `json:"create"`
 	Conversation string `json:"conversation"`
 	Session      string `json:"session"`
 }
@@ -300,7 +304,7 @@ func (s *Server) handleFSWrite(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "path is required"})
 		return
 	}
-	if strings.TrimSpace(req.BaseHash) == "" {
+	if strings.TrimSpace(req.BaseHash) == "" && !req.Create {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "base_hash is required to prevent overwriting a file changed outside this editor"})
 		return
 	}
@@ -363,7 +367,24 @@ func (s *Server) handleFSWrite(w http.ResponseWriter, r *http.Request) {
 	info, err := os.Lstat(real)
 	if err != nil {
 		if os.IsNotExist(err) {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "file not found"})
+			if !req.Create {
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": "file not found"})
+				return
+			}
+			// New file: no baseline exists to compare against, so the
+			// base_hash check is skipped by design (Create relaxes it
+			// above). confinedRealPath already validated the parent dir.
+			if err := os.WriteFile(real, []byte(req.Content), 0644); err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"path":     filepath.ToSlash(req.Path),
+				"size":     len(req.Content),
+				"hash":     fileSHA256([]byte(req.Content)),
+				"editable": true,
+				"created":  true,
+			})
 			return
 		}
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})

@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -217,5 +218,69 @@ func TestFS_BinaryAndOversizedRejected(t *testing.T) {
 	status, _ = fsGet(t, ts.URL+"/api/fs/file?token=test-token&path=.")
 	if status != http.StatusBadRequest {
 		t.Fatalf("directory as file status=%d", status)
+	}
+}
+
+func fsPutBody(t *testing.T, tsURL, body string) (int, []byte) {
+	t.Helper()
+	req, err := http.NewRequest("PUT", tsURL+"/api/fs/file?token=test-token", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	out, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp.StatusCode, out
+}
+
+// TestFS_WriteCreate makes the code-block apply flow possible: a write with
+// create=true and no base hash creates a missing file, while the same write
+// against an existing file still demands the conflict-checked hash.
+func TestFS_WriteCreate(t *testing.T) {
+	work := t.TempDir()
+	os.WriteFile(filepath.Join(work, "exists.txt"), []byte("old\n"), 0644)
+	_, ts := fsTestServer(t, work)
+
+	os.MkdirAll(filepath.Join(work, "new"), 0755) // the sandbox requires the parent to exist
+	status, body := fsPutBody(t, ts.URL, `{"path":"new/created.txt","content":"fresh\n","base_hash":"","create":true}`)
+	if status != http.StatusOK {
+		t.Fatalf("create status=%d body=%s", status, body)
+	}
+	got, err := os.ReadFile(filepath.Join(work, "new", "created.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "fresh\n" {
+		t.Fatalf("created content=%q", got)
+	}
+
+	// Existing file without a hash: the hash check refuses it even with
+	// create=true — create only relaxes the missing-baseline case.
+	status, body = fsPutBody(t, ts.URL, `{"path":"exists.txt","content":"x","base_hash":"","create":true}`)
+	if status != http.StatusConflict {
+		t.Fatalf("existing without hash must conflict, status=%d body=%s", status, body)
+	}
+	if !strings.Contains(string(body), "已被外部修改") {
+		t.Fatalf("unexpected error: %s", body)
+	}
+
+	// Create against an existing file with the right hash still works.
+	h := fileSHA256([]byte("old\n"))
+	status, body = fsPutBody(t, ts.URL, fmt.Sprintf(`{"path":"exists.txt","content":"new\n","base_hash":%q,"create":true}`, h))
+	if status != http.StatusOK {
+		t.Fatalf("existing with hash status=%d body=%s", status, body)
+	}
+	got, err = os.ReadFile(filepath.Join(work, "exists.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "new\n" {
+		t.Fatalf("existing content=%q", got)
 	}
 }

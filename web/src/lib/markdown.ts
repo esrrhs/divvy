@@ -11,7 +11,7 @@ export type InlineSpan =
   | { t: 'bold'; s: string }
 
 export type MarkdownBlock =
-  | { kind: 'code'; lang: string; code: string }
+  | { kind: 'code'; lang: string; meta?: string; code: string }
   | { kind: 'p'; spans: InlineSpan[] }
   | { kind: 'h'; level: number; spans: InlineSpan[] }
   | { kind: 'li'; spans: InlineSpan[] }
@@ -50,6 +50,7 @@ export function parseMarkdown(text: string): MarkdownBlock[] {
   const lines = (text ?? '').split('\n')
   let inCode = false
   let codeLang = ''
+  let codeMeta = ''
   let codeLines: string[] = []
 
   for (const raw of lines) {
@@ -58,19 +59,23 @@ export function parseMarkdown(text: string): MarkdownBlock[] {
       if (close) {
         inCode = false
         flushPar()
-        blocks.push({ kind: 'code', lang: codeLang, code: codeLines.join('\n') })
+        blocks.push({ kind: 'code', lang: codeLang, meta: codeMeta || undefined, code: codeLines.join('\n') })
         codeLines = []
         codeLang = ''
+        codeMeta = ''
         continue
       }
       codeLines.push(raw)
       continue
     }
-    const fence = raw.match(/^\s*```(\s*([\w+#.-]+))?\s*$/)
+    const fence = raw.match(/^\s*```(\s*([\w+#.-]+))?(\s+([^\s].*?))?\s*$/)
     if (fence) {
       flushPar()
       inCode = true
       codeLang = (fence[2] ?? '').toLowerCase()
+      // Everything after the language token rides along as meta (e.g.
+      // "```go math/math.go") so the UI can offer to apply the block to it.
+      codeMeta = (fence[4] ?? '').trim()
       continue
     }
     const h = raw.match(/^(#{1,6})\s+(.*)$/)
@@ -106,7 +111,7 @@ export function parseMarkdown(text: string): MarkdownBlock[] {
   // turn its tail into garbled paragraphs.
   if (inCode) {
     flushPar()
-    blocks.push({ kind: 'code', lang: codeLang, code: codeLines.join('\n') })
+    blocks.push({ kind: 'code', lang: codeLang, meta: codeMeta || undefined, code: codeLines.join('\n') })
   }
   flushPar()
   return blocks
@@ -167,4 +172,17 @@ export function langToFileExt(lang: string): string {
     diff: '.diff',
   }
   return map[l] ?? '.txt'
+}
+
+/** Pull a path-looking token out of a fence info string ("go math/math.go",
+ * "go:math/math.go"). Empty when the meta carries no usable path — the apply
+ * picker then starts from a blank search instead of a guess. */
+export function fencePathHint(meta: string): string {
+  const t = (meta ?? '').trim()
+  if (!t) return ''
+  const tok = t
+    .replace(/^[\w+#.-]+[: ]\s*/, '')
+    .split(/\s+/)[0]
+  if (!tok || !/[\\/]/.test(tok) && !/\.[A-Za-z0-9]+$/.test(tok)) return ''
+  return tok
 }

@@ -146,12 +146,13 @@ export const api = {
     path: string,
     content: string,
     baseHash: string,
-    opts?: { session?: string; conversation?: string },
+    opts?: { session?: string; conversation?: string; create?: boolean },
   ) =>
     request<FsWriteResponse>('PUT', '/fs/file', {
       path,
       content,
       base_hash: baseHash,
+      ...(opts?.create ? { create: true } : {}),
       ...(opts?.session ? { session: opts.session } : {}),
       ...(opts?.conversation ? { conversation: opts.conversation } : {}),
     }),

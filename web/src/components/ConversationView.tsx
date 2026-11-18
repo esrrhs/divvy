@@ -16,7 +16,7 @@ import {
 import { useStore } from '../store'
 import type { CodeSelection, ConvMessage, FileRef, MessageMode, TurnChange, TurnChangesResponse } from '../types'
 import { FileDiffList } from './FileDiffView'
-import { ModelMarkdown } from './ModelMarkdown'
+import { ModelMarkdown, type CodeBlockActions } from './ModelMarkdown'
 import { ToolCallCard } from './ToolCallCard'
 import { SpinnerIcon } from './icons'
 
@@ -378,11 +378,13 @@ function MessageBubble({
   convId,
   onOpenRef,
   onResend,
+  codeActions,
 }: {
   msg: ConvMessage
   convId: string
   onOpenRef?: (r: FileRef) => void
   onResend?: (text: string) => void
+  codeActions?: CodeBlockActions
 }) {
   if (msg.kind === 'run_finished') {
     return <ResultCard msg={msg} convId={convId} />
@@ -413,7 +415,7 @@ function MessageBubble({
         )}
       </div>
       {msg.kind === 'model_reply' ? (
-        <ModelMarkdown text={msg.text} />
+        <ModelMarkdown text={msg.text} codeActions={codeActions} />
       ) : (
         <p className="mt-1 whitespace-pre-wrap break-words text-[12.5px] leading-relaxed">{msg.text}</p>
       )}
@@ -569,6 +571,37 @@ export function ConversationView() {
   // its target turn's result card and itself. Earlier markers render as
   // plain notices; only the newest restore defines the fold.
   const [foldOpen, setFoldOpen] = useState(false)
+  // Code-block "apply to file" wiring for model replies: conversation-scoped
+  // search for the picker, and a confined whole-file write that keeps the
+  // hash conflict check for existing files and creates missing ones.
+  const codeActions: CodeBlockActions | undefined = conv
+    ? {
+        search: (q: string) =>
+          api.searchConversationFiles(conv.id, q, 8).then((r) => r.entries ?? []),
+        write: async (path: string, content: string) => {
+          const sid = conv.current_session_id || undefined
+          let baseHash = ''
+          try {
+            const f = await api.fsFile(path, sid, conv.id)
+            baseHash = f.hash ?? ''
+          } catch {
+            baseHash = ''
+          }
+          try {
+            await api.fsWrite(path, content, baseHash, {
+              session: sid,
+              conversation: conv.id,
+              create: baseHash === '',
+            })
+          } catch (e) {
+            return e instanceof Error ? e.message : String(e)
+          }
+          // An open viewer of that path must re-read from disk.
+          useStore.setState((s) => ({ fileReloadNonce: s.fileReloadNonce + 1 }))
+          return null
+        },
+      }
+    : undefined
   let fold: { target: number; marker: number } | null = null
   {
     const markerIdx = visibleMessages.reduce(
@@ -867,6 +900,7 @@ export function ConversationView() {
             key={m.id}
             msg={m}
             convId={conv.id}
+            codeActions={codeActions}
             onResend={(t) => {
               // Prefill the composer with an earlier request for an edited
               // rerun; sending goes through the normal new-turn path, so no
