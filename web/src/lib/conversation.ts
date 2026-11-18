@@ -285,3 +285,23 @@ export function clampSplitRatio(raw: number): number {
   if (!Number.isFinite(raw)) return 0.4
   return Math.min(0.7, Math.max(0.2, raw))
 }
+
+// The AI-edit dialog's free position, as offsets from the viewport's top and
+// right edges. Clamped so the panel can never be dragged fully off-screen;
+// 8px keeps a grip visible for dragging it back.
+export function clampDialogPos(
+  top: number,
+  right: number,
+  panelW: number,
+  panelH: number,
+  vw: number,
+  vh: number,
+): { top: number; right: number } {
+  const w = Math.min(Math.max(panelW, 0), Math.max(vw - 16, 0))
+  const h = Math.min(Math.max(panelH, 0), Math.max(vh - 16, 0))
+  const maxTop = Math.max(vh - h - 8, 8)
+  const maxRight = Math.max(vw - w - 8, 8)
+  const t = Number.isFinite(top) ? Math.min(Math.max(top, 8), maxTop) : 8
+  const rr = Number.isFinite(right) ? Math.min(Math.max(right, 8), maxRight) : 8
+  return { top: t, right: rr }
+}

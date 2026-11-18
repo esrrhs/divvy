@@ -414,3 +414,113 @@ describe('AiEditDialog', () => {
     expect(bodies[1].history ?? []).toHaveLength(0)
   })
 })
+
+describe('AiEditDialog docking', () => {
+  let root: Root
+  let host: HTMLElement
+  // This file's jsdom environment ships a localStorage object without working
+  // methods, so the docking tests run against a Map-backed stub.
+  const store: Record<string, string> = {}
+
+  beforeEach(() => {
+    for (const k of Object.keys(store)) delete store[k]
+    vi.stubGlobal('localStorage', {
+      getItem: (k: string) => (k in store ? store[k] : null),
+      setItem: (k: string, v: string) => {
+        store[k] = String(v)
+      },
+      removeItem: (k: string) => {
+        delete store[k]
+      },
+    })
+    host = document.createElement('div')
+    document.body.appendChild(host)
+    root = createRoot(host)
+    ;(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
+    useStore.setState({
+      currentConvId: 'conv-a',
+      actionError: null,
+      fileReloadNonce: 0,
+      aiEditOpen: true,
+      aiEditPath: 'pkg/a.go',
+      aiEditSelection: { start_line: 2, end_line: 3 },
+      aiEditResult: null,
+      aiEditStreaming: '',
+      aiEditBusy: false,
+      aiEditApplied: null,
+      aiEditHistory: [],
+      aiEditUndoDepth: 0,
+    })
+  })
+
+  afterEach(() => {
+    act(() => root.unmount())
+    host.remove()
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+  })
+
+  async function render() {
+    await act(async () => {
+      root.render(<AiEditDialog />)
+      await Promise.resolve()
+    })
+  }
+
+  function header(): HTMLElement {
+    const h = [...host.querySelectorAll('div')].find((d) => (d.textContent ?? '').includes('AI 改写') && (d.className ?? '').includes('cursor-move'))
+    if (!h) throw new Error('drag header missing')
+    return h
+  }
+
+  function panel(): HTMLElement {
+    const p = host.querySelector('.pointer-events-auto') as HTMLElement
+    if (!p) throw new Error('panel missing')
+    return p
+  }
+
+  it('stays docked until dragged, then follows the pointer and persists', async () => {
+    await render()
+    expect(panel().style.position).toBe('')
+
+    // Drag the header: mousedown, move, up.
+    const h = header()
+    await act(async () => {
+      h.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, button: 0, clientX: 1000, clientY: 300 }))
+      window.dispatchEvent(new MouseEvent('mousemove', { clientX: 800, clientY: 200 }))
+      window.dispatchEvent(new MouseEvent('mouseup', { clientX: 800, clientY: 200 }))
+    })
+    expect(panel().style.position).toBe('absolute')
+    expect(panel().style.right).toBeTruthy()
+    expect(localStorage.getItem('divvy.aiEditPos')).toBeTruthy()
+
+    // A remount restores the persisted position.
+    await act(async () => {
+      root.unmount()
+    })
+    root = createRoot(host)
+    await act(async () => {
+      root.render(<AiEditDialog />)
+      await Promise.resolve()
+    })
+    expect(panel().style.position).toBe('absolute')
+    expect(panel().style.right).toBeTruthy()
+  })
+
+  it('double-click on the header returns the dialog to the docked spot', async () => {
+    await render()
+    const h = header()
+    await act(async () => {
+      h.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, button: 0, clientX: 1000, clientY: 300 }))
+      window.dispatchEvent(new MouseEvent('mousemove', { clientX: 700, clientY: 150 }))
+      window.dispatchEvent(new MouseEvent('mouseup', { clientX: 700, clientY: 150 }))
+    })
+    expect(panel().style.position).toBe('absolute')
+
+    await act(async () => {
+      h.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))
+    })
+    expect(panel().style.position).toBe('')
+    expect(localStorage.getItem('divvy.aiEditPos')).toBeFalsy()
+  })
+})

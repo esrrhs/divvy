@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useStore } from '../store'
 import type { AiEditProposal, AiEditResponse, AiEditTarget, DiffHunkLine } from '../types'
+import { clampDialogPos } from '../lib/conversation'
 import { SpinnerIcon, XIcon } from './icons'
 
 const QUICK: { label: string; text: string }[] = [
@@ -168,6 +169,75 @@ export function AiEditDialog() {
     return () => window.removeEventListener('keydown', onKey)
   })
 
+  // Free position (offsets from the viewport's top/right edges). null = the
+  // docked default (right-centered). Persisted so the chosen spot survives a
+  // reload; the header drag handle and double-click manage it.
+  const [pos, setPos] = useState<{ top: number; right: number } | null>(() => {
+    try {
+      const raw = JSON.parse(localStorage.getItem('divvy.aiEditPos') ?? 'null') as {
+        top?: number
+        right?: number
+      } | null
+      if (!raw || typeof raw.top !== 'number' || typeof raw.right !== 'number') return null
+      return clampDialogPos(raw.top, raw.right, 540, 300, window.innerWidth, window.innerHeight)
+    } catch {
+      return null
+    }
+  })
+  const panelRef = useRef<HTMLDivElement | null>(null)
+  const dragStart = useRef<{ x: number; y: number; top: number; right: number } | null>(null)
+
+  function startDrag(e: React.MouseEvent) {
+    if (e.button !== 0) return
+    e.preventDefault()
+    const rect = panelRef.current?.getBoundingClientRect()
+    if (!rect) return
+    const base = pos ?? { top: rect.top, right: window.innerWidth - rect.right }
+    dragStart.current = { x: e.clientX, y: e.clientY, top: base.top, right: base.right }
+    const onMove = (ev: MouseEvent) => {
+      const st = dragStart.current
+      if (!st) return
+      const next = clampDialogPos(
+        st.top + (ev.clientY - st.y),
+        st.right - (ev.clientX - st.x),
+        rect.width,
+        rect.height,
+        window.innerWidth,
+        window.innerHeight,
+      )
+      setPos(next)
+    }
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+      setPos((p) => {
+        try {
+          localStorage.setItem('divvy.aiEditPos', JSON.stringify(p))
+        } catch {
+          // Private-mode storage: the position just won't persist.
+        }
+        return p
+      })
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+  }
+
+  function resetPos() {
+    try {
+      localStorage.removeItem('divvy.aiEditPos')
+    } catch {
+      // Some environments ship a localStorage shim without removeItem;
+      // an empty value reads back as garbage and is treated as docked.
+      try {
+        localStorage.setItem('divvy.aiEditPos', '')
+      } catch {
+        // Best effort either way.
+      }
+    }
+    setPos(null)
+  }
+
   if (!open) return null
 
   const headerRange = multi
@@ -184,9 +254,20 @@ export function AiEditDialog() {
     // The dialog floats on the right instead of covering the screen: the point
     // of the rewrite is to judge it in the file, and a full-screen modal hides
     // exactly that.
-    <div className="fixed inset-0 z-50 flex items-center justify-end p-3 pointer-events-none">
-      <div className="pointer-events-auto flex max-h-[92vh] w-full max-w-[540px] flex-col overflow-hidden rounded-xl border border-brand-800/50 bg-ink-850 shadow-2xl">
-        <div className="flex items-center gap-2 border-b border-line bg-brand-950/30 px-4 py-2.5">
+    <div
+      className={`fixed inset-0 z-50 pointer-events-none ${pos ? '' : 'flex items-center justify-end p-3'}`}
+    >
+      <div
+        ref={panelRef}
+        className="pointer-events-auto flex max-h-[92vh] w-full max-w-[540px] flex-col overflow-hidden rounded-xl border border-brand-800/50 bg-ink-850 shadow-2xl"
+        style={pos ? { position: 'absolute', top: pos.top, right: pos.right } : undefined}
+      >
+        <div
+          className="flex cursor-move select-none items-center gap-2 border-b border-line bg-brand-950/30 px-4 py-2.5"
+          onMouseDown={startDrag}
+          onDoubleClick={resetPos}
+          title="拖动移动对话框（不遮挡查看器工具条）；双击回到停靠位置"
+        >
           <span className={`h-2 w-2 rounded-full ${busy ? 'animate-pulse bg-brand-400' : 'bg-brand-700'}`} />
           <h3 className="text-[13px] font-semibold text-brand-200">AI 改写</h3>
           <span className="ml-auto flex items-center gap-2 font-mono text-[11px] text-slate-500">

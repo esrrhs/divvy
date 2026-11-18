@@ -68,3 +68,13 @@ describe('langToFileExt', () => {
     expect(langToFileExt('brainfuck')).toBe('.txt')
   })
 })
+import { clampDialogPos } from './conversation'
+
+describe('clampDialogPos', () => {
+  it('keeps the panel reachable at the viewport edges', () => {
+    expect(clampDialogPos(100, 100, 540, 400, 1280, 720)).toEqual({ top: 100, right: 100 })
+    expect(clampDialogPos(-50, -50, 540, 400, 1280, 720).top).toBe(8)
+    expect(clampDialogPos(5000, 5000, 540, 400, 1280, 720).right).toBe(1280 - 540 - 8)
+    expect(clampDialogPos(Number.NaN, Number.NaN, 540, 400, 1280, 720)).toEqual({ top: 8, right: 8 })
+  })
+})
