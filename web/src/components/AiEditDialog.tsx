@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useStore } from '../store'
-import type { AiEditProposal, AiEditResponse, AiEditTarget, DiffHunkLine } from '../types'
+import type { AiEditProposal, AiEditResponse, AiEditTarget, AiEditTurn, DiffHunkLine } from '../types'
 import { clampDialogPos } from '../lib/conversation'
 import { SpinnerIcon, XIcon } from './icons'
 
@@ -16,6 +16,62 @@ function hunkLineClass(type: string): string {
   if (type === 'add') return 'bg-emerald-950/40 text-emerald-200'
   if (type === 'remove') return 'bg-rose-950/40 text-rose-200'
   return 'text-slate-400'
+}
+
+// The multi-turn transcript: what the user asked each round and what the
+// model produced, per file with its apply state. Follow-up rounds ride on
+// this context server-side (buildAiEditPrompt pastes the prior turns), so
+// showing it here keeps the inline-edit conversation legible.
+function AiEditHistoryList({ turns }: { turns: AiEditTurn[] }) {
+  const [openIdx, setOpenIdx] = useState<number | null>(null)
+  return (
+    <div className="mb-3 rounded border border-line bg-ink-900/60">
+      <div className="flex items-center gap-2 border-b border-line px-2.5 py-1 text-[10.5px] uppercase tracking-wider text-slate-600">
+        多轮上下文
+        <span className="ml-auto normal-case text-slate-600">后续轮会带着这些指令与产出</span>
+      </div>
+      {turns.map((t, i) => {
+        const files =
+          t.files && t.files.length > 0
+            ? t.files
+            : t.code
+              ? [{ path: t.path || '', code: t.code, applied: t.applied }]
+              : []
+        const open = openIdx === i
+        return (
+          <div key={i} className="border-b border-line/60 last:border-b-0">
+            <button
+              type="button"
+              className="flex w-full items-center gap-2 px-2.5 py-1.5 text-left hover:bg-ink-800/60"
+              onClick={() => setOpenIdx(open ? null : i)}
+              title={open ? '收起这一轮的产出' : '展开这一轮的产出'}
+            >
+              <span className="shrink-0 font-mono text-[10px] text-brand-300">第 {i + 1} 轮</span>
+              <span className="min-w-0 flex-1 truncate text-[11.5px] text-slate-300">{t.instruction}</span>
+              <span className="shrink-0 text-[10px] text-slate-600">{open ? '收起' : '展开'}</span>
+            </button>
+            {open && (
+              <div className="px-2.5 pb-2">
+                {files.map((f, j) => (
+                  <div key={j} className="mt-1 overflow-hidden rounded border border-line/60 bg-ink-950/70">
+                    <div className="flex items-center gap-2 px-2 py-0.5 font-mono text-[10px] text-slate-500">
+                      <span className="truncate">{f.path || '（当前文件）'}</span>
+                      <span className={`ml-auto shrink-0 ${f.applied ? 'text-emerald-400' : 'text-amber-400/80'}`}>
+                        {f.applied ? '已应用' : '待应用'}
+                      </span>
+                    </div>
+                    <pre className="max-h-40 overflow-auto whitespace-pre px-2 pb-1.5 font-mono text-[10.5px] leading-[1.5] text-slate-400">
+                      {f.code}
+                    </pre>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )
+      })}
+    </div>
+  )
 }
 
 function marker(type: string): string {
@@ -314,6 +370,8 @@ export function AiEditDialog() {
                   上一次改写仍可撤销（还有 {undoDepth} 次），⌘/Ctrl+Z 继续退回。
                 </p>
               )}
+
+              {history.length > 0 && <AiEditHistoryList turns={history} />}
 
               <div className="mb-3">
                 <textarea

@@ -523,4 +523,47 @@ describe('AiEditDialog docking', () => {
     expect(panel().style.position).toBe('')
     expect(localStorage.getItem('divvy.aiEditPos')).toBeFalsy()
   })
+
+  it('多轮上下文 transcript renders prior turns with expandable code', async () => {
+    await render()
+    // Seeded inside this test: two prior rounds for the open dialog.
+    await act(async () => {
+      useStore.setState({
+        aiEditHistory: [
+          {
+            instruction: '加文档注释',
+            code: 'func A() int { // doc }',
+            path: 'pkg/a.go',
+            applied: true,
+            files: [{ path: 'pkg/a.go', code: 'func A() int { // doc }', applied: true }],
+          },
+          {
+            instruction: '再补一个超时分支',
+            code: 'func A() int { ... timeout ... }',
+            path: 'pkg/a.go',
+            files: [{ path: 'pkg/a.go', code: 'func A() int { ... timeout ... }', applied: false }],
+          },
+        ],
+      })
+      await Promise.resolve()
+    })
+    expect(host.textContent).toContain('多轮上下文')
+    expect(host.textContent).toContain('第 1 轮')
+    expect(host.textContent).toContain('加文档注释')
+    expect(host.textContent).toContain('再补一个超时分支')
+    // Collapsed: the produced code is hidden until a turn is expanded.
+    expect(host.textContent).not.toContain('// doc }')
+
+    const rows = [...host.querySelectorAll('button')].filter((b) => (b.textContent || '').includes('第 2 轮'))
+    await act(async () => {
+      rows[0].dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    expect(host.textContent).toContain('... timeout ...')
+    expect(host.textContent).toContain('待应用')
+
+    await act(async () => {
+      rows[0].dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    expect(host.textContent).not.toContain('... timeout ...')
+  })
 })
