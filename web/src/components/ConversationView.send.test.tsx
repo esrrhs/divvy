@@ -1126,4 +1126,38 @@ describe('ConversationView attachment chips open the viewer', () => {
     expect(clickSpy).toHaveBeenCalled()
     expect(revoke).toHaveBeenCalledWith('blob:mock')
   })
+
+  it('hides 开始 rows once their result card exists, keeps running ones visible', async () => {
+    const withTools = conv('a', 'sess-a', {
+      messages: [
+        { id: 't1', role: 'system', kind: 'tool_activity', text: '开始 write_file hello.txt', outcome: 'write_file', session_id: 'sess-a', created_at: '' },
+        { id: 't2', role: 'system', kind: 'tool_activity', text: 'write_file ok', outcome: 'write_file', session_id: 'sess-a', created_at: '', tool: { tool: 'write_file', ok: true, args: '{"path":"hello.txt"}', output_head: 'wrote hello.txt', output_len: 18, duration_ms: 31 } },
+        { id: 't3', role: 'system', kind: 'tool_activity', text: '开始 run_bash go test', outcome: 'run_bash', session_id: 'sess-a', created_at: '' },
+      ],
+    })
+    vi.spyOn(api, 'getConversation').mockImplementation(async () => withTools)
+    await useStore.getState().openConversation('a')
+    await act(async () => {
+      root.render(<ConversationView />)
+      await Promise.resolve()
+    })
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    // The finished call: flat start row hidden, card present (collapsed).
+    expect(host.textContent).not.toContain('开始 write_file')
+    expect(host.textContent).toContain('18 B')
+    expect(host.textContent).toContain('31ms')
+    // Expanding the card shows the recorded args.
+    const cardBtn = [...host.querySelectorAll('button')].find((b) =>
+      [...b.querySelectorAll('span')].some((s) => s.textContent?.trim() === 'write_file'),
+    )
+    await act(async () => {
+      cardBtn!.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    expect(host.textContent).toContain('"path":"hello.txt"')
+    // The still-running call keeps its flat row.
+    expect(host.textContent).toContain('开始 run_bash go test')
+  })
 })

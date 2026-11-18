@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 'react'
+import { useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from 'react'
 import { api } from '../api/client'
 import {
   autoContext,
@@ -649,6 +649,27 @@ export function ConversationView() {
         },
       }
     : undefined
+  // "开始 <tool>" flat rows are the running phase of a tool call; once the
+  // result card exists they are noise (Cursor shows one card that goes from
+  // running to done). Hide a start row when a same-session, same-tool result
+  // card appears later in the transcript.
+  const hiddenToolStarts = useMemo(() => {
+    const hide = new Set<number>()
+    visibleMessages.forEach((m, i) => {
+      if (m.kind !== 'tool_activity' || m.tool || !m.session_id) return
+      const tool = m.outcome
+      for (let j = i + 1; j < visibleMessages.length; j++) {
+        const n = visibleMessages[j]
+        if (n.kind !== 'tool_activity' || n.session_id !== m.session_id) continue
+        if (n.tool) {
+          if (n.tool.tool === tool) hide.add(i)
+          break
+        }
+        if (n.outcome === tool) break // another start for the same tool: keep both
+      }
+    })
+    return hide
+  }, [visibleMessages])
   let fold: { target: number; marker: number } | null = null
   {
     const markerIdx = visibleMessages.reduce(
@@ -1031,6 +1052,7 @@ export function ConversationView() {
         {visibleMessages.map((m, i) => {
           const inFold = fold && i > fold.target && i < fold.marker
           if (inFold && !foldOpen) return null
+          if (hiddenToolStarts.has(i)) return null
           if (fold && i === fold.marker) {
             return (
               <CheckpointMarker
