@@ -1340,7 +1340,11 @@ func (s *Server) forwardDirectEvents(convID string, evs <-chan map[string]any) {
 			c.appendMessage("system", kindToolActivity, formatToolStart(ev), sid, evString(ev["tool"]), secrets)
 			_ = saveConversation(s.dataDir, c, secrets)
 		case "tool_call":
-			c.appendMessage("system", kindToolActivity, formatToolActivity(ev), sid, evString(ev["tool"]), secrets)
+			msg := c.appendMessage("system", kindToolActivity, formatToolActivity(ev), sid, evString(ev["tool"]), secrets)
+			if ta := toolActivityFromEvent(ev); ta != nil {
+				msg.Tool = ta
+				c.Messages[len(c.Messages)-1] = msg
+			}
 			_ = saveConversation(s.dataDir, c, secrets)
 		case "ask_pending":
 			q := evString(ev["question"])
@@ -1463,4 +1467,44 @@ func formatToolActivity(ev map[string]any) string {
 func evString(v any) string {
 	s, _ := v.(string)
 	return s
+}
+
+// evFloat reads a number from an event field. Live fan-out carries native
+// Go ints (Record builds the map directly); JSON round-trips (SSE replay,
+// tests) carry float64.
+func evFloat(v any) float64 {
+	switch n := v.(type) {
+	case float64:
+		return n
+	case int:
+		return float64(n)
+	case int64:
+		return float64(n)
+	}
+	return 0
+}
+
+// toolActivityFromEvent lifts the clipped fields of a tool_call event into
+// the structured card form stored on the conversation message. The event's
+// output_head/output_tail are marker-free; the flat Text keeps the older
+// markered preview so old UIs and tests keep reading the same line.
+func toolActivityFromEvent(ev map[string]any) *ToolActivity {
+	tool := evString(ev["tool"])
+	if tool == "" {
+		return nil
+	}
+	ok := true
+	if v, isBool := ev["ok"].(bool); isBool {
+		ok = v
+	}
+	return &ToolActivity{
+		Tool:       tool,
+		Args:       evString(ev["args"]),
+		OK:         ok,
+		Error:      evString(ev["error"]),
+		OutputHead: evString(ev["output_head"]),
+		OutputTail: evString(ev["output_tail"]),
+		OutputLen:  int(evFloat(ev["output_len"])),
+		DurationMS: int64(evFloat(ev["duration_ms"])),
+	}
 }

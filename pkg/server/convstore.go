@@ -85,6 +85,26 @@ type ConvMessage struct {
 	CreatedAt   time.Time           `json:"created_at"`
 	Attachments []fileRef           `json:"attachments,omitempty"`
 	Changes     []turnChangeSummary `json:"changes,omitempty"`
+	// Tool carries the structured form of a tool_call for kind
+	// tool_activity messages, so the UI renders a status/duration card with
+	// expandable output instead of the clipped flat line. Nil for non-tool
+	// messages and for tool rows recorded before this field existed.
+	Tool *ToolActivity `json:"tool,omitempty"`
+}
+
+// ToolActivity mirrors the clipped fields of a tool_call event. The values
+// are already secret-scrubbed: Record scrubs every event field before
+// fan-out, and saveConversation redacts the full payload again on the way
+// to disk.
+type ToolActivity struct {
+	Tool       string `json:"tool"`
+	Args       string `json:"args,omitempty"`
+	OK         bool   `json:"ok"`
+	Error      string `json:"error,omitempty"`
+	OutputHead string `json:"output_head,omitempty"`
+	OutputTail string `json:"output_tail,omitempty"`
+	OutputLen  int    `json:"output_len,omitempty"`
+	DurationMS int64  `json:"duration_ms,omitempty"`
 }
 
 const (

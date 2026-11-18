@@ -14,6 +14,7 @@ import { useStore } from '../store'
 import type { CodeSelection, ConvMessage, FileRef, MessageMode, TurnChange, TurnChangesResponse } from '../types'
 import { FileDiffList } from './FileDiffView'
 import { ModelMarkdown } from './ModelMarkdown'
+import { ToolCallCard } from './ToolCallCard'
 import { SpinnerIcon } from './icons'
 
 function refLabel(r: FileRef): string {
@@ -303,6 +304,12 @@ function MessageBubble({
 }) {
   if (msg.kind === 'run_finished') {
     return <ResultCard msg={msg} convId={convId} />
+  }
+  // Finished tool calls with the structured payload render as status cards
+  // with expandable output; rows recorded before that field existed keep
+  // the flat bubble below.
+  if (msg.kind === 'tool_activity' && msg.tool) {
+    return <ToolCallCard tool={msg.tool} />
   }
   const meta = messageKindMeta(msg.kind)
   return (

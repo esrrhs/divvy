@@ -97,3 +97,9 @@ export const SearchIcon = (p: IconProps) => (
     <path d="M16 16l6 6" />
   </svg>
 )
+
+export const ChevronRightIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M9 6l6 6-6 6" />
+  </svg>
+)

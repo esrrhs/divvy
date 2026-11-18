@@ -296,3 +296,57 @@ func resolvedTempDir(t *testing.T) string {
 	}
 	return dir
 }
+
+// TestToolCallEvent_SplitsHeadAndTail checks the tool_call record's
+// structured output fields: long outputs keep both ends without overlap,
+// short ones stay whole in output_head, and the legacy markered preview is
+// untouched.
+func TestToolCallEvent_SplitsHeadAndTail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.jsonl")
+	rec, err := NewEventRecorder(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	long := strings.Repeat("a", evOutputHead+evOutputTail) + "TAIL-MARKER-" + strings.Repeat("b", 50)
+	rec.ToolCall("n1", "execute", map[string]any{"command": "go test ./..."}, long, nil, time.Now())
+
+	short := "hello\nworld"
+	rec.ToolCall("n1", "read_file", map[string]any{"path": "x"}, short, nil, time.Now())
+	rec.ToolCall("n1", "write_file", map[string]any{"path": "y"}, "boom", context.DeadlineExceeded, time.Now())
+
+	events := eventsOfKind(readEventStream(t, path), "tool_call")
+	if len(events) != 3 {
+		t.Fatalf("want 3 tool_call events, got %d", len(events))
+	}
+
+	ev := events[0]
+	head, tail := ev.str("output_head"), ev.str("output_tail")
+	if len(head) != evOutputHead || !strings.HasPrefix(long, head) {
+		t.Fatalf("head is not the first %d bytes (len=%d)", evOutputHead, len(head))
+	}
+	if len(tail) != evOutputTail || !strings.HasSuffix(long, tail) {
+		t.Fatalf("tail is not the last %d bytes (len=%d)", evOutputTail, len(tail))
+	}
+	if strings.Contains(head, "TAIL-MARKER") || !strings.Contains(tail, "TAIL-MARKER") {
+		t.Fatal("tail must hold the end of a long output, head must not duplicate it")
+	}
+	if p := ev.str("output_preview"); !strings.Contains(p, "+862 chars") {
+		t.Fatalf("legacy output_preview lost its truncation marker: %q", p[len(p)-20:])
+	}
+
+	ev = events[1]
+	if got := ev.str("output_head"); got != short {
+		t.Fatalf("short output must stay whole in output_head, got %q", got)
+	}
+	if ev.str("output_tail") != "" {
+		t.Fatal("short output must not produce a tail")
+	}
+
+	ev = events[2]
+	if ev.str("error") != context.DeadlineExceeded.Error() {
+		t.Fatalf("error not recorded: %q", ev.str("error"))
+	}
+	if v, ok := ev["ok"].(bool); !ok || v {
+		t.Fatal("failed call must record ok=false")
+	}
+}

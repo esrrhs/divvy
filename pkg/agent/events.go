@@ -219,6 +219,8 @@ const (
 	evRespPreview    = 300
 	evArgsChars      = 800
 	evOutputChars    = 400
+	evOutputHead     = 600
+	evOutputTail     = 600
 	evVerifyTail     = 1200
 	evReasonChars    = 1500
 	evMaxSummaries   = 24 // first 2 + last 20 messages summarized per call
@@ -645,5 +647,27 @@ func (r *EventRecorder) ToolCall(nodeID, tool string, args map[string]any, out s
 			fields["output_preview"] = p
 		}
 	}
+	// Structured head/tail for the UI's tool card: marker-free so the card
+	// can render its own truncation gap. Outputs that fit head+tail are kept
+	// whole in output_head; longer ones are split so the card never shows
+	// the same bytes twice.
+	head, tail := splitOutput(out)
+	if head != "" {
+		fields["output_head"] = head
+	}
+	if tail != "" {
+		fields["output_tail"] = tail
+	}
 	r.Record("tool_call", nodeID, fields)
+}
+
+// splitOutput cuts a tool result into the head/tail pair recorded on the
+// tool_call event. Long outputs keep both ends — build errors live at the
+// tail, banners at the head — and the middle is dropped.
+func splitOutput(s string) (head, tail string) {
+	s = strings.TrimSpace(s)
+	if len(s) <= evOutputHead+evOutputTail {
+		return s, ""
+	}
+	return s[:evOutputHead], s[len(s)-evOutputTail:]
 }

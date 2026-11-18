@@ -351,6 +351,20 @@ export interface TurnChangeSummary {
 
 export type MessageMode = 'start' | 'queue' | 'takeover' | 'steer'
 
+// Structured form of one finished tool call, lifted from the tool_call
+// event by the server. Present only on kind 'tool_activity' messages
+// recorded after this field existed; older rows stay flat text.
+export interface ToolActivity {
+  tool: string
+  args?: string
+  ok: boolean
+  error?: string
+  output_head?: string
+  output_tail?: string
+  output_len?: number
+  duration_ms?: number
+}
+
 export interface ConvMessage {
   id: string
   role: 'user' | 'system' | 'assistant'
@@ -361,6 +375,7 @@ export interface ConvMessage {
   created_at: string
   attachments?: FileRef[]
   changes?: TurnChangeSummary[]
+  tool?: ToolActivity
 }
 
 export interface PendingRollback {
