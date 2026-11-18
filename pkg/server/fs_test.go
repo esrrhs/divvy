@@ -284,3 +284,23 @@ func TestFS_WriteCreate(t *testing.T) {
 		t.Fatalf("existing content=%q", got)
 	}
 }
+
+// TestFS_WriteCreateMissingParent gives the honest missing-parent error for
+// a create-write into a directory that does not exist yet (the sandbox
+// requires the parent; the old path mislabeled it as a symlink escape).
+func TestFS_WriteCreateMissingParent(t *testing.T) {
+	work := t.TempDir()
+	os.WriteFile(filepath.Join(work, "keep.txt"), []byte("x"), 0644)
+	_, ts := fsTestServer(t, work)
+
+	status, body := fsPutBody(t, ts.URL, `{"path":"scratch/applied.go","content":"x","base_hash":"","create":true}`)
+	if status != http.StatusBadRequest {
+		t.Fatalf("missing parent status=%d body=%s", status, body)
+	}
+	if !strings.Contains(string(body), "父目录不存在") {
+		t.Fatalf("unexpected error: %s", body)
+	}
+	if _, err := os.Stat(filepath.Join(work, "scratch")); !os.IsNotExist(err) {
+		t.Fatal("no directory may be created by a refused write")
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io/fs"
 	"net/http"
 	"os"
@@ -25,6 +26,11 @@ const (
 )
 
 var errPathEscaped = errors.New("path escapes workspace via symlink")
+
+// errParentMissing marks a create-write whose immediate parent directory
+// does not exist. It maps to a plain-language error instead of the symlink
+// escape message, which was misleading for that case.
+var errParentMissing = errors.New("parent directory does not exist")
 
 // fsEntry is one directory listing row.
 type fsEntry struct {
@@ -361,6 +367,12 @@ func (s *Server) handleFSWrite(w http.ResponseWriter, r *http.Request) {
 	}
 	real, err := confinedRealPath(sb.Root, resolved)
 	if err != nil {
+		if errors.Is(err, errParentMissing) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": "父目录不存在：应用只能写入已存在的目录，请先在查看器或对话轮里创建目录",
+			})
+			return
+		}
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
 		return
 	}
@@ -514,9 +526,13 @@ func confinedRealPath(root, resolved string) (string, error) {
 		return targetReal, nil
 	}
 	// Target absent (creation probes are rejected later as 404): validate
-	// its existing parent instead.
+	// its existing parent instead. A missing parent is not an escape — it
+	// gets its own error so a create-write fails with usable guidance.
 	parentReal, err := filepath.EvalSymlinks(filepath.Dir(resolved))
-	if err != nil || !isWithin(parentReal, rootReal) {
+	if err != nil {
+		return "", fmt.Errorf("%w: %s", errParentMissing, filepath.Dir(resolved))
+	}
+	if !isWithin(parentReal, rootReal) {
 		return "", errPathEscaped
 	}
 	return resolved, nil
