@@ -169,6 +169,9 @@ func (s *Server) configFromParams(p sessionParams) agent.Config {
 	if strings.TrimSpace(p.AgentMode) != "" {
 		cfg.AgentLoop = p.AgentMode
 	}
+	if cfg.AgentLoop == agent.AgentLoopDirect {
+		cfg.NativeTools = true
+	}
 	if p.BudgetTokens > 0 {
 		cfg.BudgetTokens = p.BudgetTokens
 	}

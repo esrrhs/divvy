@@ -30,7 +30,7 @@ func TestProjectRules_EmptyWorkspace(t *testing.T) {
 	if got := loadProjectRules(sb, ""); got != "" {
 		t.Fatalf("empty workspace should produce no rules block, got %q", got)
 	}
-	if strings.Contains(directSystemGuide(sb, ""), "PROJECT RULES") {
+	if strings.Contains(directSystemGuide(sb, "", false), "PROJECT RULES") {
 		t.Fatal("direct prompt should not announce rules when the project ships none")
 	}
 }
@@ -100,7 +100,7 @@ func TestProjectRules_InjectedIntoEveryLoopPrompt(t *testing.T) {
 		t.Fatal(err)
 	}
 	const rule = "Always run go test ./... before finishing."
-	if !strings.Contains(directSystemGuide(sb, ""), rule) {
+	if !strings.Contains(directSystemGuide(sb, "", false), rule) {
 		t.Fatal("direct prompt must carry project rules")
 	}
 	if !strings.Contains(workerSystemFor(false, "")+projectRulesBlock(sb, ""), rule) {

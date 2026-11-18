@@ -1001,3 +1001,144 @@ func TestConversation_DirectProtocolStreamHidesJSONAndCrossChunkKey(t *testing.T
 		}
 	}
 }
+
+func nativeConvTC(id, name string, args map[string]any) llm.ToolCall {
+	b, _ := json.Marshal(args)
+	return llm.ToolCall{ID: id, Type: "function", Function: llm.ToolFunction{Name: name, Arguments: string(b)}}
+}
+
+// TestConversation_DirectOffersNativeToolsAndRunsSameTurnCalls is the Web
+// direct-loop gap: configForConversation never sets NativeTools, so the
+// product path sends no tool_calls schema and real models stay on JSON
+// one-action turns. A scripted model that emits two native writes in one
+// reply must have both applied, and every request must carry tool defs.
+// Guided conversations must stay on the JSON-default (no tool defs).
+func TestConversation_DirectOffersNativeToolsAndRunsSameTurnCalls(t *testing.T) {
+	work, data := t.TempDir(), t.TempDir()
+	var (
+		mu       sync.Mutex
+		minTools = -1
+		step     int
+	)
+	client := &llm.ScriptedClient{Handle: func(ctx context.Context, req llm.Request) (*llm.Response, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if minTools < 0 || len(req.Tools) < minTools {
+			minTools = len(req.Tools)
+		}
+		joined := joinMsgs(req)
+		if strings.Contains(joined, "Write c.txt") {
+			if _, err := os.Stat(filepath.Join(work, "c.txt")); err != nil {
+				return jsonAct(tools.ToolWriteFile, map[string]any{"path": "c.txt", "content": "gamma"}), nil
+			}
+			return jsonAct(tools.ToolFinish, map[string]any{"summary": "wrote c.txt via JSON fallback"}), nil
+		}
+		step++
+		if len(req.Tools) == 0 {
+			// Reproduce the wiring gap: do not still write the files.
+			return jsonAct(tools.ToolFinish, map[string]any{"summary": "no tools offered"}), nil
+		}
+		if step == 1 {
+			return &llm.Response{ToolCalls: []llm.ToolCall{
+				nativeConvTC("w1", tools.ToolWriteFile, map[string]any{"path": "a.txt", "content": "alpha"}),
+				nativeConvTC("w2", tools.ToolWriteFile, map[string]any{"path": "b.txt", "content": "beta"}),
+			}}, nil
+		}
+		return jsonAct(tools.ToolFinish, map[string]any{"summary": "wrote a.txt and b.txt in one native turn"}), nil
+	}}
+	ts := apiServerWithClient(t, work, data, func(agent.Config) llm.Client { return client })
+	status, resp := apiDo(t, http.MethodPost, apiBase(ts)+"/conversations?token=test-token", map[string]any{
+		"workdir": work, "model": "scripted", "base_url": "http://127.0.0.1:9/v1",
+		"api_key": testSecretKey, "agent_mode": "direct", "isolate": false,
+		"message": "Write a.txt and b.txt.",
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("create status=%d resp=%v", status, resp)
+	}
+	id := anyString(resp["id"])
+	got := waitConvDone(t, ts, id)
+	sid := anyString(got["current_session_id"])
+	if anyString(got["run_phase"]) == string(agent.PhaseFailed) {
+		t.Fatalf("direct turn failed: %v", got)
+	}
+	mu.Lock()
+	toolsSeen := minTools
+	mu.Unlock()
+	if toolsSeen <= 0 {
+		t.Fatalf("Web direct conversation did not offer native tool definitions (min tools=%d)", toolsSeen)
+	}
+	for _, name := range []string{"a.txt", "b.txt"} {
+		raw, err := os.ReadFile(filepath.Join(work, name))
+		if err != nil {
+			t.Fatalf("same-turn native write missing %s: %v", name, err)
+		}
+		if strings.TrimSpace(string(raw)) == "" {
+			t.Fatalf("%s was empty", name)
+		}
+	}
+
+	status, resp = apiDo(t, http.MethodPost, apiBase(ts)+"/conversations/"+id+"/messages?token=test-token", map[string]any{
+		"text": "Write c.txt",
+		"mode": "start",
+	})
+	if status >= 300 {
+		t.Fatalf("JSON fallback follow-up status=%d %v", status, resp)
+	}
+	got = waitConvDoneAfter(t, ts, id, sid)
+	if anyString(got["run_phase"]) == string(agent.PhaseFailed) {
+		t.Fatalf("JSON fallback turn failed: %v", got)
+	}
+	raw, err := os.ReadFile(filepath.Join(work, "c.txt"))
+	if err != nil {
+		t.Fatalf("JSON fallback write missing c.txt: %v", err)
+	}
+	if strings.TrimSpace(string(raw)) != "gamma" {
+		t.Fatalf("c.txt content=%q", raw)
+	}
+}
+
+func TestConversation_GuidedDoesNotEnableNativeTools(t *testing.T) {
+	work, data := t.TempDir(), t.TempDir()
+	var (
+		mu        sync.Mutex
+		saw       bool
+		toolCount = -1
+	)
+	client := &llm.ScriptedClient{Handle: func(ctx context.Context, req llm.Request) (*llm.Response, error) {
+		mu.Lock()
+		if !saw {
+			saw = true
+			toolCount = len(req.Tools)
+		}
+		mu.Unlock()
+		// Stop the guided run immediately; we only care about the first request.
+		return nil, context.Canceled
+	}}
+	ts := apiServerWithClient(t, work, data, func(agent.Config) llm.Client { return client })
+	status, resp := apiDo(t, http.MethodPost, apiBase(ts)+"/conversations?token=test-token", map[string]any{
+		"workdir": work, "model": "scripted", "base_url": "http://127.0.0.1:9/v1",
+		"api_key": testSecretKey, "agent_mode": "guided", "isolate": false,
+		"message": "Plan a tiny change.",
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("create status=%d resp=%v", status, resp)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		ok := saw
+		mu.Unlock()
+		if ok {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !saw {
+		t.Fatal("guided conversation never called the model")
+	}
+	if toolCount != 0 {
+		t.Fatalf("guided default must not attach native tool definitions, got %d", toolCount)
+	}
+}

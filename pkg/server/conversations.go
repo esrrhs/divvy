@@ -693,6 +693,9 @@ func (s *Server) configForConversation(c *Conversation) (agent.Config, error) {
 		cfg.AgentLoop = agent.AgentLoopDirect
 		cfg.TranscriptPath = conversationDirectPath(s.dataDir, c.ID)
 		cfg.Stream = true
+		// Direct conversations use the native tool-call loop (JSON remains
+		// a fallback in collectActions). Guided stays on the JSON default.
+		cfg.NativeTools = true
 	}
 	if cfg.RequiresAPIKey() && strings.TrimSpace(cfg.APIKey) == "" {
 		return cfg, errConvNeedKey("当前模型需要 API key。服务重启后密钥不会保留，请在本对话中重新填写（不会写入历史）。")

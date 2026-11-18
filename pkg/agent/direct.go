@@ -487,6 +487,18 @@ func (d *DirectAgent) contextBudget() int {
 	return directDefaultContextChars
 }
 
+// requestBudget is the character estimate used to build the next model
+// request. A per-conversation cap learned from a provider context-limit
+// rejection, if any, is applied so later steps in the same run stay on the
+// smaller window. This is not a token count.
+func (d *DirectAgent) requestBudget() int {
+	budget := d.contextBudget()
+	if d.st != nil && d.st.ContextCharsCap > 0 && d.st.ContextCharsCap < budget {
+		return d.st.ContextCharsCap
+	}
+	return budget
+}
+
 func (d *DirectAgent) maxSteps() int {
 	if d.o.cfg.DirectSteps > 0 {
 		return d.o.cfg.DirectSteps
@@ -517,7 +529,8 @@ func (d *DirectAgent) Run(ctx context.Context) (runErr error) {
 		return err
 	}
 	d.applySandboxPolicy()
-	system := llm.Message{Role: llm.RoleSystem, Content: directSystemGuide(d.o.sandbox, d.o.cfg.DataDir)}
+	d.st = st
+	system := llm.Message{Role: llm.RoleSystem, Content: directSystemGuide(d.o.sandbox, d.o.cfg.DataDir, d.nativeToolsEnabled())}
 	switch {
 	case st == nil || len(st.Messages) < 2:
 		st = &directState{Version: 1, Messages: []llm.Message{system, {Role: llm.RoleUser, Content: d.openingPrompt()}}}
@@ -543,7 +556,7 @@ func (d *DirectAgent) Run(ctx context.Context) (runErr error) {
 			if st.InFlight.ID == "" {
 				st.InFlight.ID = inferOpenToolCallID(st.Messages, st.InFlight.Name)
 			}
-			st.Messages = append(st.Messages, inFlightRecoveryMessage(st.InFlight, d.o.cfg.NativeTools))
+			st.Messages = append(st.Messages, inFlightRecoveryMessage(st.InFlight, d.nativeToolsEnabled()))
 			d.o.events.Record("direct_inflight_recovered", d.o.tree.RootID, map[string]any{
 				"tool": st.InFlight.Name,
 			})
@@ -677,13 +690,13 @@ func (d *DirectAgent) loop(ctx context.Context) error {
 	maxSteps := d.maxSteps()
 	nodeID := d.o.tree.RootID
 	var native []llm.Tool
-	if d.o.cfg.NativeTools {
+	if d.nativeToolsEnabled() {
 		native = nativeToolDefs(d.toolSandbox())
 		native = append(native, directPlanNativeTool())
 		native = append(native, d.mcpToolDefs()...)
 	}
 	// Cache the base prompt once per turn; the plan block changes every step.
-	d.systemGuide = directSystemGuide(d.toolSandbox(), d.o.cfg.DataDir) + d.mcpGuide()
+	d.systemGuide = directSystemGuide(d.toolSandbox(), d.o.cfg.DataDir, d.nativeToolsEnabled()) + d.mcpGuide()
 
 	if d.st.PendingApproval {
 		if err := d.reviewAndMaybeMerge(ctx, d.st.Summary); err != nil {
@@ -731,9 +744,9 @@ func (d *DirectAgent) loop(ctx context.Context) error {
 		if len(d.st.Messages) > 0 && d.st.Messages[0].Role == llm.RoleSystem {
 			d.st.Messages[0].Content = d.systemGuide + directPlanBlock(d.st.Plan)
 		}
-		window, dropped := directRequestWindow(d.st.Messages, d.contextBudget())
+		window, dropped := directRequestWindow(d.st.Messages, d.requestBudget())
 		if dropped > 0 {
-			d.o.log.Infof("direct context trimmed %d earlier messages (budget %d chars); system prompt and the original request were kept, and the full transcript is on disk", dropped, d.contextBudget())
+			d.o.log.Infof("direct context trimmed %d earlier messages (budget %d chars, a character estimate not a token count); system prompt and the original request were kept, and the full transcript is on disk", dropped, d.requestBudget())
 		}
 
 		reqTimeout := d.o.cfg.RequestTimeout
@@ -747,10 +760,14 @@ func (d *DirectAgent) loop(ctx context.Context) error {
 		req := llm.Request{
 			Model:       d.o.cfg.Model,
 			Messages:    window,
-			Tools:       native,
 			Temperature: d.o.cfg.Temperature,
 			MaxTokens:   d.o.cfg.MaxTokens,
 			Stream:      d.o.cfg.Stream,
+		}
+		// Re-evaluate every step: a mid-turn JSON fallback must not keep
+		// sending the tools slice captured at loop start.
+		if d.nativeToolsEnabled() {
+			req.Tools = native
 		}
 		var view protocolView
 		redact := newStreamRedactor(d.o.events.Secrets())
@@ -772,7 +789,7 @@ func (d *DirectAgent) loop(ctx context.Context) error {
 				}
 			}
 		}
-		resp, err := d.o.chat(stepCtx, "direct", nodeID, req)
+		resp, err := d.chatDirect(stepCtx, nodeID, req)
 		if cancel != nil {
 			cancel()
 		}
@@ -1040,7 +1057,7 @@ func (d *DirectAgent) applyActions(ctx context.Context, nodeID string, actions [
 			}
 		}
 
-		if d.o.cfg.NativeTools && act.ID != "" {
+		if d.nativeToolsEnabled() && act.ID != "" {
 			d.st.Messages = append(d.st.Messages, llm.Message{
 				Role: llm.RoleTool, ToolCallID: act.ID, Name: act.Name, Content: out,
 			})
@@ -1532,7 +1549,7 @@ func (d *DirectAgent) applyPolicyToSandbox(sb *tools.Sandbox) {
 	}
 }
 
-func directSystemGuide(sb *tools.Sandbox, dataDir string) string {
+func directSystemGuide(sb *tools.Sandbox, dataDir string, native bool) string {
 	dyn := ""
 	if sb != nil {
 		dyn = sb.DynamicToolDescriptions()
@@ -1573,7 +1590,7 @@ func directSystemGuide(sb *tools.Sandbox, dataDir string) string {
 		b.WriteString("\n")
 		b.WriteString(dyn)
 	}
-	b.WriteString("\n\nOUTPUT a single JSON object per turn: {\"thought\":\"...\",\"action\":\"tool_name\",\"args\":{...}} or use native tool calls when they are provided. Prefer one tool per reply unless you are finishing.")
+	b.WriteString(directOutputGuide(native))
 	return b.String()
 }
 
@@ -1611,8 +1628,15 @@ func directSystemFor(web bool, dynamicTools string) string {
 		b.WriteString("\n")
 		b.WriteString(dynamicTools)
 	}
-	b.WriteString("\n\nOUTPUT a single JSON object per turn: {\"thought\":\"...\",\"action\":\"tool_name\",\"args\":{...}} or use native tool calls when they are provided. Prefer one tool per reply unless you are finishing.")
+	b.WriteString(directOutputGuide(false))
 	return b.String()
+}
+
+func directOutputGuide(native bool) string {
+	if native {
+		return "\n\nPrefer native tool calls when they are provided; you may call multiple independent tools in one reply. If a tool in that reply fails, do not also finish — wait for the result and repair. JSON fallback remains available: {\"thought\":\"...\",\"action\":\"tool_name\",\"args\":{...}}."
+	}
+	return "\n\nOUTPUT a single JSON object per turn: {\"thought\":\"...\",\"action\":\"tool_name\",\"args\":{...}} or use native tool calls when they are provided. Prefer one tool per reply unless you are finishing."
 }
 
 func (d *DirectAgent) resumePendingActions(ctx context.Context, nodeID string) (finished bool, summary string, err error) {
@@ -1627,7 +1651,7 @@ func (d *DirectAgent) resumePendingActions(ctx context.Context, nodeID string) (
 
 func (d *DirectAgent) appendAskResult(id, answer string) {
 	content := "User answer:\n" + answer
-	if d.o.cfg.NativeTools && id != "" {
+	if d.nativeToolsEnabled() && id != "" {
 		d.st.Messages = append(d.st.Messages, llm.Message{
 			Role: llm.RoleTool, ToolCallID: id, Name: "ask", Content: content,
 		})
@@ -1637,7 +1661,7 @@ func (d *DirectAgent) appendAskResult(id, answer string) {
 }
 
 func (d *DirectAgent) appendToolOutcome(act taggedAction, content string) {
-	if d.o.cfg.NativeTools && act.ID != "" {
+	if d.nativeToolsEnabled() && act.ID != "" {
 		d.st.Messages = append(d.st.Messages, llm.Message{
 			Role: llm.RoleTool, ToolCallID: act.ID, Name: act.Name, Content: content,
 		})
@@ -1655,10 +1679,16 @@ func (d *DirectAgent) skipRemaining(rest []taggedAction, reason string) {
 }
 
 // directRequestWindow is the model-facing slice of a direct transcript: the
-// system prompt and original user request are always kept (the same contract
-// as trimHistory / solo compose), then as much of a tool-group-safe tail as
-// fits the character budget. Dropped turns stay on disk; a short note tells
-// the model they were omitted from this request only.
+// system prompt, the original user request, and the latest user instruction
+// (follow-up, mid-loop inject, or ask answer, including native RoleTool
+// answers) are always kept, then as much of a tool-group-safe tail as fits
+// the remaining character budget. Earlier user instructions are not pinned
+// forever; when they are dropped, a bounded historical digest keeps their
+// semantics. The digest also records omitted reads and last-observed command
+// results, and is rebuilt from the transcript on every request (no extra
+// model call). Head, the latest instruction group, and the digest stay even
+// when they exceed the numeric budget; that overflow is stated in the digest
+// instead of being reported as a budget-compliant window.
 func directRequestWindow(msgs []llm.Message, budget int) (window []llm.Message, dropped int) {
 	if budget < 0 {
 		budget = 0
@@ -1673,36 +1703,625 @@ func directRequestWindow(msgs []llm.Message, budget int) (window []llm.Message, 
 	if head >= len(msgs) {
 		return msgs, 0
 	}
+	pinned := make([]bool, len(msgs))
 	used := 0
 	for i := 0; i < head; i++ {
 		used += messageChars(msgs[i])
 	}
-	body := msgs[head:]
-	tail, dropped := tailWithinChars(body, budget-used)
-	if dropped == 0 {
-		out := make([]llm.Message, 0, head+len(tail))
-		out = append(out, msgs[:head]...)
-		out = append(out, tail...)
-		return out, 0
+	latest := -1
+	for i := head; i < len(msgs); i++ {
+		if isDirectUserInstruction(msgs[i]) {
+			latest = i
+		}
 	}
-	note := llm.Message{Role: llm.RoleUser, Content: directTrimNote(dropped)}
-	tail, dropped = tailWithinChars(body, budget-used-messageChars(note))
-	if dropped == 0 {
-		out := make([]llm.Message, 0, head+len(tail))
-		out = append(out, msgs[:head]...)
-		out = append(out, tail...)
-		return out, 0
+	if latest >= 0 {
+		start, end := instructionKeepRange(msgs, latest)
+		for i := start; i < end; i++ {
+			if i < head || isDirectCompactionNote(msgs[i]) {
+				continue
+			}
+			if !pinned[i] {
+				pinned[i] = true
+				used += messageChars(msgs[i])
+			}
+		}
 	}
-	note.Content = directTrimNote(dropped)
-	out := make([]llm.Message, 0, head+1+len(tail))
-	out = append(out, msgs[:head]...)
-	out = append(out, note)
-	out = append(out, tail...)
+	unpinned := make([]llm.Message, 0, len(msgs)-head)
+	unpinnedOrig := make([]int, 0, len(msgs)-head)
+	for i := head; i < len(msgs); i++ {
+		if pinned[i] || isDirectCompactionNote(msgs[i]) {
+			continue
+		}
+		unpinned = append(unpinned, msgs[i])
+		unpinnedOrig = append(unpinnedOrig, i)
+	}
+
+	pickTail := func(reserve int) (drop int, kept map[int]bool) {
+		tail, drop := tailWithinChars(unpinned, budget-used-reserve)
+		kept = make(map[int]bool, head+len(pinned)+len(tail))
+		for i := 0; i < head; i++ {
+			kept[i] = true
+		}
+		for i, p := range pinned {
+			if p {
+				kept[i] = true
+			}
+		}
+		if len(tail) > 0 {
+			start := len(unpinned) - len(tail)
+			for i := start; i < len(unpinned); i++ {
+				kept[unpinnedOrig[i]] = true
+			}
+		}
+		return drop, kept
+	}
+
+	dropped, kept := pickTail(0)
+	if dropped == 0 {
+		return assembleDirectWindow(msgs, head, pinned, nil, nil), 0
+	}
+	note := llm.Message{Role: llm.RoleUser, Content: renderDirectWorkMemory(msgs, kept, dropped)}
+	for pass := 0; pass < 3; pass++ {
+		dropped, kept = pickTail(messageChars(note))
+		if dropped == 0 {
+			return assembleDirectWindow(msgs, head, pinned, nil, nil), 0
+		}
+		next := renderDirectWorkMemory(msgs, kept, dropped)
+		if next == note.Content {
+			break
+		}
+		note.Content = next
+	}
+	out := assembleDirectWindow(msgs, head, pinned, &note, kept)
+	if n := directWindowChars(out); n > budget {
+		note.Content = note.Content + fmt.Sprintf("\nThis request is %d characters against a configured budget of %d; the system prompt, original request, and latest user instruction cannot be compressed further.", n, budget)
+		out = assembleDirectWindow(msgs, head, pinned, &note, kept)
+	}
 	return out, dropped
+}
+
+func directWindowChars(msgs []llm.Message) int {
+	n := 0
+	for _, m := range msgs {
+		n += messageChars(m)
+	}
+	return n
+}
+
+// isDirectUserInstruction reports a later user instruction that must not be
+// silently forgotten: follow-ups, mid-loop injects, and genuine ask answers
+// in both JSON (RoleUser) and native (RoleTool) form. Skipped, denied,
+// failed, canceled, or empty ask tool results are not user instructions and
+// must not take the latest-instruction slot.
+func isDirectUserInstruction(m llm.Message) bool {
+	if isDirectCompactionNote(m) {
+		return false
+	}
+	if isPinnedDirectUserMessage(m) {
+		return true
+	}
+	return isDirectUserAnswer(m)
+}
+
+// isDirectUserAnswer reports a real user reply to ask, as written by
+// appendAskResult. Native answers are RoleTool; JSON answers are RoleUser.
+// The "User answer:" prefix is required so "Not executed:" / "ERROR:" ask
+// results are not mistaken for a new human instruction.
+func isDirectUserAnswer(m llm.Message) bool {
+	if m.Role != llm.RoleUser && m.Role != llm.RoleTool {
+		return false
+	}
+	if !strings.HasPrefix(m.Content, "User answer:\n") {
+		return false
+	}
+	return strings.TrimSpace(strings.TrimPrefix(m.Content, "User answer:\n")) != ""
+}
+
+// instructionKeepRange is the inclusive-exclusive slice that must stay with
+// an instruction so a native ask answer does not orphan its tool_call.
+func instructionKeepRange(msgs []llm.Message, idx int) (start, end int) {
+	if idx < 0 || idx >= len(msgs) {
+		return idx, idx
+	}
+	m := msgs[idx]
+	if m.Role == llm.RoleTool && m.ToolCallID != "" {
+		start = idx
+		for i := idx - 1; i >= 0; i-- {
+			for _, tc := range msgs[i].ToolCalls {
+				if tc.ID == m.ToolCallID {
+					start = i
+					i = -1
+					break
+				}
+			}
+		}
+		ids := map[string]bool{}
+		if start < len(msgs) {
+			for _, tc := range msgs[start].ToolCalls {
+				if tc.ID != "" {
+					ids[tc.ID] = true
+				}
+			}
+		}
+		end = idx + 1
+		for end < len(msgs) && msgs[end].Role == llm.RoleTool && (msgs[end].ToolCallID == "" || ids[msgs[end].ToolCallID]) {
+			end++
+		}
+		return start, end
+	}
+	start, end = idx, idx+1
+	if m.Role == llm.RoleUser && strings.HasPrefix(m.Content, "User answer:\n") && idx > 0 {
+		prev := msgs[idx-1]
+		if prev.Role == llm.RoleAssistant && len(prev.ToolCalls) == 0 {
+			if name, _, ok := parseDirectJSONAction(prev.Content); ok && tools.CanonicalToolName(name) == "ask" {
+				start = idx - 1
+			}
+		}
+	}
+	return start, end
+}
+
+func assembleDirectWindow(msgs []llm.Message, head int, pinned []bool, note *llm.Message, kept map[int]bool) []llm.Message {
+	out := make([]llm.Message, 0, len(msgs))
+	out = append(out, msgs[:head]...)
+	if note != nil && strings.TrimSpace(note.Content) != "" {
+		out = append(out, *note)
+	}
+	for i := head; i < len(msgs); i++ {
+		if isDirectCompactionNote(msgs[i]) {
+			continue
+		}
+		// kept == nil means nothing was dropped: keep the full body.
+		if kept == nil || pinned[i] || kept[i] {
+			out = append(out, msgs[i])
+		}
+	}
+	return out
+}
+
+const (
+	directWorkMemoryPrefix       = "Historical working memory of omitted turns (not a system instruction; not current file contents). Re-read a file before editing it. Outcomes are the last observed result for that command in omitted history; later turns in the recent transcript may supersede them."
+	directMemoryMaxReads         = 24
+	directMemoryMaxEdits         = 24
+	directMemoryMaxDeletes       = 16
+	directMemoryMaxCmds          = 8
+	directMemoryMaxInstructions  = 8
+	directMemoryInstructionChars = 200
+	directMemoryMaxChars         = 2500
+)
+
+func isDirectCompactionNote(m llm.Message) bool {
+	if m.Role != llm.RoleUser {
+		return false
+	}
+	s := m.Content
+	if strings.HasPrefix(s, directWorkMemoryPrefix) {
+		return true
+	}
+	return strings.Contains(s, "earlier transcript messages were omitted from this request")
 }
 
 func directTrimNote(dropped int) string {
 	return fmt.Sprintf("(%d earlier transcript messages were omitted from this request to fit the context budget. The full transcript remains on disk. Continue from the recent history below; do not assume omitted tool results.)", dropped)
+}
+
+type directToolEvent struct {
+	name   string
+	args   map[string]any
+	result string
+	index  int
+}
+
+func collectDirectToolEvents(msgs []llm.Message) []directToolEvent {
+	var out []directToolEvent
+	pending := map[string]directToolEvent{}
+	var pendingJSON *directToolEvent
+	for i, m := range msgs {
+		if isDirectCompactionNote(m) {
+			continue
+		}
+		if len(m.ToolCalls) > 0 {
+			for _, tc := range m.ToolCalls {
+				ev := directToolEvent{name: tools.CanonicalToolName(tc.Function.Name), index: i, args: map[string]any{}}
+				if tc.Function.Arguments != "" {
+					_ = json.Unmarshal([]byte(tc.Function.Arguments), &ev.args)
+					if ev.args == nil {
+						ev.args = map[string]any{}
+					}
+				}
+				if tc.ID != "" {
+					pending[tc.ID] = ev
+				} else {
+					pendingJSON = &ev
+				}
+			}
+		} else if m.Role == llm.RoleAssistant && strings.TrimSpace(m.Content) != "" {
+			if name, args, ok := parseDirectJSONAction(m.Content); ok {
+				ev := directToolEvent{name: tools.CanonicalToolName(name), args: args, index: i}
+				pendingJSON = &ev
+			}
+		}
+		switch m.Role {
+		case llm.RoleTool:
+			ev, ok := pending[m.ToolCallID]
+			if !ok {
+				ev = directToolEvent{name: tools.CanonicalToolName(m.Name), args: map[string]any{}}
+			}
+			if ev.name == "" {
+				ev.name = tools.CanonicalToolName(m.Name)
+			}
+			ev.result = m.Content
+			ev.index = i
+			out = append(out, ev)
+			delete(pending, m.ToolCallID)
+		case llm.RoleUser:
+			name, result, ok := parseDirectJSONToolResult(m.Content)
+			if !ok {
+				continue
+			}
+			ev := directToolEvent{name: tools.CanonicalToolName(name), result: result, index: i, args: map[string]any{}}
+			if pendingJSON != nil && (pendingJSON.name == ev.name || pendingJSON.name == "") {
+				ev.args = pendingJSON.args
+				if pendingJSON.name != "" {
+					ev.name = pendingJSON.name
+				}
+				pendingJSON = nil
+			}
+			out = append(out, ev)
+		}
+	}
+	return out
+}
+
+func parseDirectJSONAction(s string) (string, map[string]any, bool) {
+	var payload struct {
+		Action string         `json:"action"`
+		Args   map[string]any `json:"args"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(s)), &payload); err != nil || strings.TrimSpace(payload.Action) == "" {
+		return "", nil, false
+	}
+	if payload.Args == nil {
+		payload.Args = map[string]any{}
+	}
+	return payload.Action, payload.Args, true
+}
+
+func parseDirectJSONToolResult(s string) (name, result string, ok bool) {
+	const prefix = "Tool "
+	const mid = " result:\n"
+	if !strings.HasPrefix(s, prefix) {
+		return "", "", false
+	}
+	rest := s[len(prefix):]
+	idx := strings.Index(rest, mid)
+	if idx <= 0 {
+		return "", "", false
+	}
+	return rest[:idx], rest[idx+len(mid):], true
+}
+
+func pathsFromToolArgs(args map[string]any) []string {
+	var out []string
+	if p, ok := stringFromArgs(args, "path"); ok && strings.TrimSpace(p) != "" {
+		out = append(out, p)
+	}
+	if raw, ok := args["paths"]; ok {
+		switch v := raw.(type) {
+		case []string:
+			out = append(out, v...)
+		case []any:
+			for _, x := range v {
+				if s, ok := x.(string); ok && strings.TrimSpace(s) != "" {
+					out = append(out, s)
+				}
+			}
+		}
+	}
+	return out
+}
+
+type memPathFact struct {
+	path                  string
+	last                  int
+	read, edited, deleted bool
+}
+
+type memCmdFact struct {
+	command  string
+	last     int
+	code     int
+	hasCode  bool
+	timedOut bool
+	errored  bool
+}
+
+func renderDirectWorkMemory(msgs []llm.Message, kept map[int]bool, dropped int) string {
+	paths := map[string]*memPathFact{}
+	cmds := map[string]*memCmdFact{}
+	touch := func(p string, idx int) *memPathFact {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			return nil
+		}
+		f, ok := paths[p]
+		if !ok {
+			f = &memPathFact{path: p}
+			paths[p] = f
+		}
+		f.last = idx
+		return f
+	}
+	for _, ev := range collectDirectToolEvents(msgs) {
+		switch ev.name {
+		case tools.ToolReadFile:
+			if !toolSideEffectCommitted(ev.name, ev.result) {
+				continue
+			}
+			for _, p := range pathsFromToolArgs(ev.args) {
+				if f := touch(p, ev.index); f != nil {
+					f.read = true
+				}
+			}
+		case tools.ToolWriteFile, tools.ToolReplaceLines:
+			if !toolSideEffectCommitted(ev.name, ev.result) {
+				continue
+			}
+			for _, p := range pathsFromToolArgs(ev.args) {
+				if f := touch(p, ev.index); f != nil {
+					f.edited = true
+					f.deleted = false
+				}
+			}
+		case tools.ToolDeletePath:
+			if !toolSideEffectCommitted(ev.name, ev.result) {
+				continue
+			}
+			for _, p := range pathsFromToolArgs(ev.args) {
+				if f := touch(p, ev.index); f != nil {
+					f.deleted = true
+				}
+			}
+		case tools.ToolMovePath:
+			if !toolSideEffectCommitted(ev.name, ev.result) {
+				continue
+			}
+			from, _ := stringFromArgs(ev.args, "from")
+			to, _ := stringFromArgs(ev.args, "to")
+			if f := touch(from, ev.index); f != nil {
+				f.deleted = true
+			}
+			if f := touch(to, ev.index); f != nil {
+				f.edited = true
+				f.deleted = false
+			}
+		case tools.ToolRunBash:
+			if strings.HasPrefix(strings.TrimSpace(ev.result), "Not executed:") {
+				continue
+			}
+			cmd, _ := stringFromArgs(ev.args, "command")
+			cmd = truncate(strings.TrimSpace(cmd), 120)
+			if cmd == "" {
+				continue
+			}
+			c, ok := cmds[cmd]
+			if !ok {
+				c = &memCmdFact{command: cmd}
+				cmds[cmd] = c
+			}
+			c.last = ev.index
+			c.timedOut = strings.Contains(ev.result, "timed_out: true")
+			c.errored = strings.HasPrefix(strings.TrimSpace(ev.result), "ERROR:")
+			var code int
+			if _, err := fmt.Sscanf(strings.TrimSpace(ev.result), "exit_code: %d", &code); err == nil {
+				c.code = code
+				c.hasCode = true
+			}
+		}
+	}
+
+	isOmitted := func(idx int) bool { return kept == nil || !kept[idx] }
+
+	var reads, edits, deletes []memPathFact
+	for _, f := range paths {
+		if !isOmitted(f.last) {
+			continue
+		}
+		switch {
+		case f.deleted:
+			deletes = append(deletes, *f)
+		default:
+			if f.read {
+				reads = append(reads, *f)
+			}
+			if f.edited {
+				edits = append(edits, *f)
+			}
+		}
+	}
+	var cmdList []memCmdFact
+	for _, c := range cmds {
+		if isOmitted(c.last) {
+			cmdList = append(cmdList, *c)
+		}
+	}
+	byLast := func(a, b int) int {
+		if a != b {
+			return b - a // newest first
+		}
+		return 0
+	}
+	slices.SortFunc(reads, func(a, b memPathFact) int {
+		if n := byLast(a.last, b.last); n != 0 {
+			return n
+		}
+		return strings.Compare(a.path, b.path)
+	})
+	slices.SortFunc(edits, func(a, b memPathFact) int {
+		if n := byLast(a.last, b.last); n != 0 {
+			return n
+		}
+		return strings.Compare(a.path, b.path)
+	})
+	slices.SortFunc(deletes, func(a, b memPathFact) int {
+		if n := byLast(a.last, b.last); n != 0 {
+			return n
+		}
+		return strings.Compare(a.path, b.path)
+	})
+	slices.SortFunc(cmdList, func(a, b memCmdFact) int {
+		if n := byLast(a.last, b.last); n != 0 {
+			return n
+		}
+		return strings.Compare(a.command, b.command)
+	})
+
+	trimPaths := func(in []memPathFact, max int) ([]string, int) {
+		total := len(in)
+		if max > 0 && len(in) > max {
+			in = in[:max]
+		}
+		names := make([]string, 0, len(in))
+		for _, f := range in {
+			names = append(names, f.path)
+		}
+		return names, total
+	}
+
+	var b strings.Builder
+	b.WriteString(directWorkMemoryPrefix)
+	b.WriteByte('\n')
+	fmt.Fprintf(&b, "%d earlier transcript messages were omitted from this request to fit the context budget. The full transcript remains on disk.\n", dropped)
+	if names, total := trimPaths(reads, directMemoryMaxReads); len(names) > 0 {
+		suffix := ""
+		if total > len(names) {
+			suffix = fmt.Sprintf(" (showing the %d most recent of %d)", len(names), total)
+		}
+		fmt.Fprintf(&b, "Read%s: %s\n", suffix, strings.Join(names, ", "))
+	}
+	if names, total := trimPaths(edits, directMemoryMaxEdits); len(names) > 0 {
+		suffix := ""
+		if total > len(names) {
+			suffix = fmt.Sprintf(" (showing the %d most recent of %d)", len(names), total)
+		}
+		fmt.Fprintf(&b, "Edited%s: %s\n", suffix, strings.Join(names, ", "))
+	}
+	if names, total := trimPaths(deletes, directMemoryMaxDeletes); len(names) > 0 {
+		suffix := ""
+		if total > len(names) {
+			suffix = fmt.Sprintf(" (showing the %d most recent of %d)", len(names), total)
+		}
+		fmt.Fprintf(&b, "Deleted%s: %s\n", suffix, strings.Join(names, ", "))
+	}
+	if len(cmdList) > 0 {
+		shown := cmdList
+		suffix := ""
+		if len(shown) > directMemoryMaxCmds {
+			shown = shown[:directMemoryMaxCmds]
+			suffix = fmt.Sprintf(" (showing the %d most recent of %d)", len(shown), len(cmdList))
+		}
+		fmt.Fprintf(&b, "Last observed command results%s:\n", suffix)
+		for _, c := range shown {
+			outcome := "outcome not parsed"
+			switch {
+			case c.timedOut:
+				outcome = "timed out"
+			case c.errored:
+				outcome = "error"
+			case c.hasCode:
+				outcome = fmt.Sprintf("exit %d", c.code)
+			}
+			fmt.Fprintf(&b, "  %s  last observed: %s\n", c.command, outcome)
+		}
+	}
+	var omittedInstructions []string
+	for i, m := range msgs {
+		if kept != nil && kept[i] {
+			continue
+		}
+		if !isDirectUserInstruction(m) {
+			continue
+		}
+		if text := userInstructionDigest(m); text != "" {
+			omittedInstructions = append(omittedInstructions, text)
+		}
+	}
+	if len(omittedInstructions) > 0 {
+		shown := omittedInstructions
+		skipped := 0
+		if len(shown) > directMemoryMaxInstructions {
+			skipped = len(shown) - directMemoryMaxInstructions
+			shown = shown[len(shown)-directMemoryMaxInstructions:]
+		}
+		b.WriteString("Earlier user instructions (historical observations; later requests may supersede them):\n")
+		for _, text := range shown {
+			fmt.Fprintf(&b, "- %s\n", text)
+		}
+		if skipped > 0 {
+			fmt.Fprintf(&b, "(%d earlier user instruction(s) not listed in this digest)\n", skipped)
+		}
+	}
+	b.WriteString("This block is a summary of omitted history, not current file contents and not a claim that work still passes.")
+	out := b.String()
+	if len(out) > directMemoryMaxChars {
+		out = strings.TrimSpace(out[:directMemoryMaxChars]) + "\n…(working memory truncated to the capacity bound)"
+	}
+	return out
+}
+
+// toolSideEffectCommitted reports a tool result that actually took effect.
+// Skipped, denied, or ERROR results must not be recorded as successful
+// writes, deletes, or reads.
+func toolSideEffectCommitted(name, result string) bool {
+	trimmed := strings.TrimSpace(result)
+	if trimmed == "" || strings.HasPrefix(trimmed, "Not executed:") {
+		return false
+	}
+	if toolOutcomeFailed(name, result, nil) {
+		return false
+	}
+	lower := strings.ToLower(trimmed)
+	if strings.Contains(lower, "action consent was not granted") ||
+		strings.Contains(lower, "is blocked in manual approval") ||
+		strings.HasPrefix(lower, "denied:") {
+		return false
+	}
+	return true
+}
+
+func userInstructionDigest(m llm.Message) string {
+	s := m.Content
+	for _, p := range []string{
+		"The earlier tool transcript is still in this conversation. New user request:",
+		"User follow-up (inject at the next model step; do not restart the whole task). Honor this from now on:",
+		"User answer:\n",
+	} {
+		if rest, ok := strings.CutPrefix(s, p); ok {
+			s = rest
+			break
+		}
+	}
+	return truncate(strings.TrimSpace(s), directMemoryInstructionChars)
+}
+
+// isPinnedDirectUserMessage reports later user instructions that must survive
+// compaction. JSON tool results also use RoleUser ("Tool X result:"), so only
+// distinctive instruction prefixes are pinned, never every user message.
+func isPinnedDirectUserMessage(m llm.Message) bool {
+	if m.Role != llm.RoleUser {
+		return false
+	}
+	s := m.Content
+	switch {
+	case strings.HasPrefix(s, "The earlier tool transcript is still in this conversation. New user request:"):
+		return true
+	case strings.HasPrefix(s, "User follow-up (inject at the next model step"):
+		return true
+	case strings.HasPrefix(s, "User answer:\n"):
+		return strings.TrimSpace(strings.TrimPrefix(s, "User answer:\n")) != ""
+	default:
+		return false
+	}
 }
 
 // toolOutcomeFailed reports a tool result the model must react to before
@@ -1837,6 +2456,297 @@ func directProjectMap(sb *tools.Sandbox, maxEntries, maxDepth int) string {
 	return strings.Join(lines, "\n")
 }
 
+func (d *DirectAgent) nativeToolsEnabled() bool {
+	if d == nil || d.o == nil {
+		return false
+	}
+	if d.st != nil && d.st.JSONFallback {
+		return false
+	}
+	return d.o.cfg.NativeTools
+}
+
+func (d *DirectAgent) enableJSONFallback() {
+	if d.st == nil {
+		d.st = &directState{Version: 1}
+	}
+	d.st.JSONFallback = true
+	d.systemGuide = directSystemGuide(d.toolSandbox(), d.o.cfg.DataDir, false) + d.mcpGuide()
+	if len(d.st.Messages) > 0 && d.st.Messages[0].Role == llm.RoleSystem {
+		d.st.Messages[0].Content = d.systemGuide + directPlanBlock(d.st.Plan)
+	}
+	_ = d.persist()
+}
+
+func hasNativeToolHistory(msgs []llm.Message) bool {
+	for _, m := range msgs {
+		if m.Role == llm.RoleTool || len(m.ToolCalls) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// chatDirect sends the model request and, when the provider clearly rejects
+// the tools field before any tool has run, retries once with a consistent
+// JSON-action protocol. The fallback is remembered on this conversation only.
+func (d *DirectAgent) chatDirect(ctx context.Context, nodeID string, req llm.Request) (*llm.Response, error) {
+	accepted := false
+	if req.OnToken != nil {
+		orig := req.OnToken
+		req.OnToken = func(delta string) {
+			if delta != "" {
+				accepted = true
+			}
+			orig(delta)
+		}
+	}
+	resp, err := d.o.chat(ctx, "direct", nodeID, req)
+	if err != nil && llm.ToolsUnsupported(err) && ctx.Err() == nil && !accepted && !outputAccepted(resp) {
+		if d.st != nil && d.st.JSONFallback {
+			return resp, err
+		}
+		if d.st != nil && hasNativeToolHistory(d.st.Messages) {
+			return resp, fmt.Errorf("%w", ErrJSONFallbackUnsafe)
+		}
+		d.o.log.Warnf("provider rejected native tool definitions; retrying this conversation with JSON actions")
+		d.enableJSONFallback()
+		window, _ := directRequestWindow(d.st.Messages, d.requestBudget())
+		req.Messages = window
+		req.Tools = nil
+		resp, err = d.o.chat(ctx, "direct", nodeID, req)
+	}
+	if err == nil || !llm.ContextLengthExceeded(err) {
+		return resp, err
+	}
+	if ctx.Err() != nil {
+		return resp, ctx.Err()
+	}
+	if accepted || outputAccepted(resp) {
+		return resp, err
+	}
+	return d.retryShrunkContext(ctx, nodeID, req, err)
+}
+
+func outputAccepted(resp *llm.Response) bool {
+	if resp == nil {
+		return false
+	}
+	return strings.TrimSpace(resp.Content) != "" || len(resp.ToolCalls) > 0
+}
+
+const directContextShrinkMax = 3
+
+func shrinkContextCharCap(sent, budget int) int {
+	cap := sent * 2 / 3
+	if budget > 0 && budget < sent {
+		if alt := budget * 2 / 3; alt < cap {
+			cap = alt
+		}
+	}
+	if cap >= sent {
+		cap = sent - 1
+	}
+	if cap < 0 {
+		cap = 0
+	}
+	return cap
+}
+
+func (d *DirectAgent) retryShrunkContext(ctx context.Context, nodeID string, req llm.Request, first error) (*llm.Response, error) {
+	prevCap := 0
+	if d.st != nil {
+		prevCap = d.st.ContextCharsCap
+	}
+	restore := func() {
+		if d.st != nil {
+			d.st.ContextCharsCap = prevCap
+		}
+	}
+	sent := directWindowChars(req.Messages)
+	lastErr := first
+	for attempt := 1; attempt <= directContextShrinkMax; attempt++ {
+		if err := ctx.Err(); err != nil {
+			restore()
+			return nil, err
+		}
+		cap := shrinkContextCharCap(sent, d.requestBudget())
+		window, ok := d.buildShrunkRequestWindow(cap, sent)
+		if !ok {
+			restore()
+			return nil, fmt.Errorf("%w", ErrContextUnshrinkable)
+		}
+		if d.st != nil {
+			d.st.ContextCharsCap = cap
+		}
+		d.o.log.Warnf("provider rejected the request as over the context limit; retrying with a smaller character-budgeted window (character estimate only, not a token count)")
+		req.Messages = window
+		resp, err := d.o.chat(ctx, "direct", nodeID, req)
+		if err == nil {
+			_ = d.persist()
+			return resp, nil
+		}
+		if ctx.Err() != nil {
+			restore()
+			return resp, ctx.Err()
+		}
+		if !llm.ContextLengthExceeded(err) || outputAccepted(resp) {
+			restore()
+			return resp, err
+		}
+		lastErr = err
+		sent = directWindowChars(window)
+	}
+	restore()
+	return nil, fmt.Errorf("%w: %v", ErrContextUnshrinkable, lastErr)
+}
+
+func (d *DirectAgent) buildShrunkRequestWindow(budget, previous int) ([]llm.Message, bool) {
+	if d == nil || d.st == nil || previous <= 0 {
+		return nil, false
+	}
+	window, _ := directRequestWindow(d.st.Messages, budget)
+	window = compactRequestToolResults(window, budget, previous)
+	if directWindowChars(window) >= previous {
+		return nil, false
+	}
+	return window, true
+}
+
+const directOmittedResultPrefix = "Omitted from this model request:"
+
+func compactRequestToolResults(window []llm.Message, budget, previous int) []llm.Message {
+	out := copyRequestMessages(window)
+	target := budget
+	if target >= previous {
+		target = previous - 1
+	}
+	if target < 0 {
+		target = 0
+	}
+	for directWindowChars(out) > target {
+		idx, best := -1, 0
+		for i, m := range out {
+			if !isCompactableRequestMessage(out, i) || requestMessageAlreadyOmitted(m) {
+				continue
+			}
+			if n := messageChars(m); n > best {
+				best, idx = n, i
+			}
+		}
+		if idx < 0 || best < 48 {
+			break
+		}
+		out[idx] = omitRequestMessage(out[idx])
+	}
+	return out
+}
+
+func copyRequestMessages(msgs []llm.Message) []llm.Message {
+	out := make([]llm.Message, len(msgs))
+	for i, m := range msgs {
+		out[i] = m
+		if len(m.ToolCalls) > 0 {
+			out[i].ToolCalls = append([]llm.ToolCall(nil), m.ToolCalls...)
+		}
+	}
+	return out
+}
+
+func isCompactableRequestMessage(msgs []llm.Message, i int) bool {
+	if i <= 1 {
+		return false
+	}
+	m := msgs[i]
+	if isDirectCompactionNote(m) || isDirectUserInstruction(m) || isDirectUserAnswer(m) {
+		return false
+	}
+	if m.Role == llm.RoleSystem {
+		return false
+	}
+	if m.Role == llm.RoleTool {
+		return true
+	}
+	if m.Role == llm.RoleUser {
+		_, _, ok := parseDirectJSONToolResult(m.Content)
+		return ok
+	}
+	if m.Role == llm.RoleAssistant {
+		for _, tc := range m.ToolCalls {
+			if len(tc.Function.Arguments) >= 200 {
+				return true
+			}
+		}
+		if name, args, ok := parseDirectJSONAction(m.Content); ok {
+			if tools.CanonicalToolName(name) == tools.ToolWriteFile || tools.CanonicalToolName(name) == tools.ToolReplaceLines {
+				if c, _ := stringFromArgs(args, "content"); len(c) >= 200 {
+					return true
+				}
+				if c, _ := stringFromArgs(args, "new_string"); len(c) >= 200 {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func requestMessageAlreadyOmitted(m llm.Message) bool {
+	if strings.Contains(m.Content, directOmittedResultPrefix) {
+		return true
+	}
+	for _, tc := range m.ToolCalls {
+		if strings.Contains(tc.Function.Arguments, directOmittedResultPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func omitRequestMessage(m llm.Message) llm.Message {
+	out := m
+	if len(m.ToolCalls) > 0 {
+		out.ToolCalls = append([]llm.ToolCall(nil), m.ToolCalls...)
+		for i, tc := range out.ToolCalls {
+			n := len(tc.Function.Arguments)
+			if n < 200 || strings.Contains(tc.Function.Arguments, directOmittedResultPrefix) {
+				continue
+			}
+			out.ToolCalls[i].Function.Arguments = fmt.Sprintf(`{"_note":"%s original %s arguments were %d characters and are not reproduced here. This is not the original tool input. The full call remains in the on-disk transcript."}`, directOmittedResultPrefix, tc.Function.Name, n)
+		}
+		return out
+	}
+	name := strings.TrimSpace(m.Name)
+	body := m.Content
+	if m.Role == llm.RoleUser {
+		if nm, rest, ok := parseDirectJSONToolResult(m.Content); ok {
+			name = nm
+			body = rest
+		}
+	}
+	if name == "" {
+		name = "tool"
+	}
+	note := fmt.Sprintf("%s %s result was %d characters and is not reproduced here. This note is not the original tool output or file contents. The full result remains in the on-disk transcript.", directOmittedResultPrefix, name, len(body))
+	if m.Role == llm.RoleUser {
+		out.Content = fmt.Sprintf("Tool %s result:\n%s", name, note)
+	} else {
+		out.Content = note
+	}
+	return out
+}
+
+// ErrJSONFallbackUnsafe is returned when the provider rejects native tool
+// definitions but the transcript already contains native tool_call history,
+// so a JSON-action retry would be protocol-incompatible.
+var ErrJSONFallbackUnsafe = errors.New("provider rejected native tool calls, but this conversation already has native tool-call history and cannot safely fall back to JSON actions")
+
+// ErrContextUnshrinkable is returned when the provider rejects a request as
+// over its context limit and the remaining system prompt, original request,
+// and latest user instruction cannot be reduced further, or shrink retries
+// have been exhausted.
+var ErrContextUnshrinkable = errors.New("provider rejected the request as over the context limit, and the remaining system prompt, original request, and latest user instruction cannot be shrunk further")
+
 // directState is the crash-safe transcript for one conversation (or session).
 type directState struct {
 	Version         int                `json:"version"`
@@ -1853,6 +2763,14 @@ type directState struct {
 	// Plan is the model-maintained task list for this turn. It survives
 	// resume, resets when a new follow-up starts, and gates finish.
 	Plan []directPlanItem `json:"plan,omitempty"`
+	// JSONFallback is set when this conversation learned that the current
+	// provider rejects native tool definitions. Later steps and follow-ups
+	// stay on JSON actions so we do not retry tools on every turn.
+	JSONFallback bool `json:"json_fallback,omitempty"`
+	// ContextCharsCap is a character-budget ceiling learned from a provider
+	// context-length rejection in this conversation. 0 means use the
+	// configured estimate. It is not a token count.
+	ContextCharsCap int `json:"context_chars_cap,omitempty"`
 	// Observed maps workspace-relative paths to the sha256 of the content
 	// the model has seen, carried across turns so the stale-read gate still
 	// refuses an edit anchored on a version that has since changed. Keyed

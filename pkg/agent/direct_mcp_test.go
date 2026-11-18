@@ -122,7 +122,7 @@ func TestDirectMCPConfigFailureFailsOpen(t *testing.T) {
 	}
 	// The point is that setupMCP returned; a malformed config must not panic
 	// or prevent the loop from starting with built-in tools.
-	if !strings.Contains(directSystemGuide(d.o.sandbox, data), "run_bash") {
+	if !strings.Contains(directSystemGuide(d.o.sandbox, data, false), "run_bash") {
 		t.Fatal("built-in tools should still be described")
 	}
 }

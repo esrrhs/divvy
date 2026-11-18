@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -131,6 +132,12 @@ func (c *OpenAIClient) Chat(ctx context.Context, req Request) (*Response, error)
 		if cerr := ctx.Err(); cerr != nil {
 			return nil, cerr
 		}
+		// Meaningful streamed output (text or tool-call fragments) has
+		// already been delivered. Do not resend the request as a stream
+		// or non-stream retry; the caller must see the failure.
+		if errors.Is(err, ErrStreamInterrupted) {
+			return nil, err
+		}
 		if !retryable(err) {
 			if stream {
 				useStream = false
@@ -230,6 +237,7 @@ func (c *OpenAIClient) readStream(r io.Reader, onToken func(string)) (*Response,
 	toolCalls := map[int]*ToolCall{}
 	finish := ""
 	usage := Usage{}
+	var meaningful, sawDone bool
 
 	for sc.Scan() {
 		line := sc.Text()
@@ -241,6 +249,7 @@ func (c *OpenAIClient) readStream(r io.Reader, onToken func(string)) (*Response,
 		}
 		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if data == "[DONE]" {
+			sawDone = true
 			break
 		}
 		var chunk apiResponse
@@ -259,6 +268,7 @@ func (c *OpenAIClient) readStream(r io.Reader, onToken func(string)) (*Response,
 		}
 		deltaText := decodeContent(ch.Delta.Content)
 		if deltaText != "" {
+			meaningful = true
 			content.WriteString(deltaText)
 			if c.OnToken != nil {
 				c.OnToken(deltaText)
@@ -269,15 +279,20 @@ func (c *OpenAIClient) readStream(r io.Reader, onToken func(string)) (*Response,
 		}
 		// Some providers send the full message in stream mode.
 		if full := decodeContent(ch.Message.Content); full != "" && content.Len() == 0 {
+			meaningful = true
 			content.WriteString(full)
 		}
 		if len(ch.Message.ToolCalls) > 0 && len(toolCalls) == 0 {
+			meaningful = true
 			for i, tc := range ch.Message.ToolCalls {
 				cp := tc
 				toolCalls[i] = &cp
 			}
 		}
 		for _, tc := range ch.Delta.ToolCalls {
+			if tc.ID != "" || tc.Function.Name != "" || tc.Function.Arguments != "" {
+				meaningful = true
+			}
 			cur, ok := toolCalls[tc.Index]
 			if !ok {
 				cur = &ToolCall{ID: tc.ID, Type: tc.Type}
@@ -296,7 +311,13 @@ func (c *OpenAIClient) readStream(r io.Reader, onToken func(string)) (*Response,
 		}
 	}
 	if err := sc.Err(); err != nil {
+		if meaningful {
+			return nil, fmt.Errorf("%w: %v", ErrStreamInterrupted, err)
+		}
 		return nil, err
+	}
+	if meaningful && !sawDone && finish == "" {
+		return nil, fmt.Errorf("%w: incomplete SSE stream", ErrStreamInterrupted)
 	}
 
 	out := &Response{
@@ -374,6 +395,14 @@ func mergeExtraJSON(body []byte, extra string) ([]byte, error) {
 	}
 	return json.Marshal(base)
 }
+
+// ErrStreamInterrupted is returned when a streaming response already
+// delivered meaningful output (non-empty text or a tool-call fragment)
+// and then failed or ended without a complete SSE protocol. Callers must
+// not automatically resend the same request. Usage-only chunks and empty
+// deltas are not meaningful output. This does not claim exactly-once
+// delivery; it only prevents a silent replay after output was observed.
+var ErrStreamInterrupted = errors.New("stream interrupted after output was already delivered")
 
 type httpError struct {
 	status int
