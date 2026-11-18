@@ -852,4 +852,37 @@ describe('ConversationView attachment chips open the viewer', () => {
     expect(useStore.getState().fileView?.path).toBe('math/other.go')
     expect(useStore.getState().fileView?.line).toBeUndefined()
   })
+
+  it('编辑重发 prefills the composer with an earlier request and focuses it', async () => {
+    vi.spyOn(api, 'getConversation').mockImplementation(async (id) =>
+      conv(id, `sess-${id}`, {
+        messages: [
+          { id: 'm1', role: 'user', kind: 'user', text: '把登录改成 OAuth', created_at: '' },
+          { id: 'm2', role: 'system', kind: 'notice', text: '执行结束：已完成。', created_at: '' },
+        ],
+      }),
+    )
+    await useStore.getState().openConversation('a')
+    await act(async () => {
+      root.render(<ConversationView />)
+      await Promise.resolve()
+    })
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    const btn = [...host.querySelectorAll('button')].find((b) => b.textContent === '编辑重发')
+    expect(btn).toBeTruthy()
+    await act(async () => {
+      btn!.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    await new Promise((r) => setTimeout(r, 0))
+
+    const ta = host.querySelector('textarea') as HTMLTextAreaElement
+    expect(ta.value).toBe('把登录改成 OAuth')
+    expect(document.activeElement).toBe(ta)
+
+    // Non-user rows must not offer the affordance.
+    expect([...host.querySelectorAll('button')].filter((b) => b.textContent === '编辑重发')).toHaveLength(1)
+  })
 })

@@ -297,10 +297,12 @@ function MessageBubble({
   msg,
   convId,
   onOpenRef,
+  onResend,
 }: {
   msg: ConvMessage
   convId: string
   onOpenRef?: (r: FileRef) => void
+  onResend?: (text: string) => void
 }) {
   if (msg.kind === 'run_finished') {
     return <ResultCard msg={msg} convId={convId} />
@@ -313,9 +315,19 @@ function MessageBubble({
   }
   const meta = messageKindMeta(msg.kind)
   return (
-    <div className={`rounded-md border px-3 py-2 ${meta.cls}`}>
+    <div className={`group rounded-md border px-3 py-2 ${meta.cls}`}>
       <div className="flex items-baseline gap-2">
         <span className="text-[10.5px] font-medium uppercase tracking-wider text-slate-500">{meta.label}</span>
+        {msg.kind === 'user' && onResend && (
+          <button
+            type="button"
+            className="shrink-0 text-[10px] text-slate-600 opacity-0 transition-opacity hover:text-brand-200 group-hover:opacity-100"
+            title="把这条需求填回输入框，改完重发（作为新一轮执行；不回滚已完成的修改）"
+            onClick={() => onResend(msg.text)}
+          >
+            编辑重发
+          </button>
+        )}
         {msg.session_id && (
           <span className="ml-auto truncate font-mono text-[10px] text-slate-700">{msg.session_id}</span>
         )}
@@ -689,6 +701,13 @@ export function ConversationView() {
             key={m.id}
             msg={m}
             convId={conv.id}
+            onResend={(t) => {
+              // Prefill the composer with an earlier request for an edited
+              // rerun; sending goes through the normal new-turn path, so no
+              // workspace rollback is involved.
+              setText(t)
+              area.current?.focus()
+            }}
             onOpenRef={(r) => {
               if (!conv) return
               // Selections and file refs alike jump to the file in the split
