@@ -445,6 +445,12 @@ export function ConversationView() {
   const recoverRollback = useStore((s) => s.recoverRollback)
   const [text, setText] = useState('')
   const [recovering, setRecovering] = useState(false)
+  // Mid-conversation model switch (Cursor's composer model picker).
+  const updateConversationSettings = useStore((s) => s.updateConversationSettings)
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [settingsBusy, setSettingsBusy] = useState(false)
+  const [modelDraft, setModelDraft] = useState('')
+  const [baseDraft, setBaseDraft] = useState('')
   const [askText, setAskText] = useState('')
   const [askBusy, setAskBusy] = useState(false)
   const [apiKey, setApiKey] = useState('')
@@ -822,12 +828,70 @@ export function ConversationView() {
             {shortWorkdir(conv.workdir)}
           </span>
           {conv.settings.model && (
-            <span className="truncate font-mono text-[11px] text-slate-500">{conv.settings.model}</span>
+            <span className="truncate font-mono text-[11px] text-slate-500" title={conv.settings.base_url}>
+              {conv.settings.model}
+            </span>
           )}
+          <button
+            type="button"
+            className="shrink-0 text-[10.5px] text-slate-600 hover:text-brand-200"
+            title="切换模型 / Base URL：下一轮运行生效（运行中不可改）"
+            onClick={() => {
+              setSettingsOpen((o) => !o)
+              setModelDraft(conv.settings.model ?? '')
+              setBaseDraft(conv.settings.base_url ?? '')
+            }}
+          >
+            换模型
+          </button>
           <span className="ml-auto text-[11px] text-slate-600">
             工作日志 {conv.work_log?.length ?? 0}/8 轮
           </span>
         </div>
+        {settingsOpen && (
+          <div className="mt-1.5 rounded border border-line bg-ink-900/70 px-3 py-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <label className="flex items-center gap-1.5 text-[11px] text-slate-500">
+                模型
+                <input
+                  className="input w-44 py-1 font-mono text-[11.5px]"
+                  value={modelDraft}
+                  placeholder="gpt-4o-mini / qwen3.8:27b"
+                  onChange={(e) => setModelDraft(e.target.value)}
+                />
+              </label>
+              <label className="flex min-w-[200px] flex-1 items-center gap-1.5 text-[11px] text-slate-500">
+                Base URL
+                <input
+                  className="input min-w-0 flex-1 py-1 font-mono text-[11.5px]"
+                  value={baseDraft}
+                  placeholder="http://127.0.0.1:11434/v1"
+                  onChange={(e) => setBaseDraft(e.target.value)}
+                />
+              </label>
+              <button
+                type="button"
+                className="btn-primary px-2.5 py-1 text-[11px]"
+                disabled={settingsBusy || (!modelDraft.trim() && !baseDraft.trim())}
+                onClick={async () => {
+                  setSettingsBusy(true)
+                  const ok = await updateConversationSettings({
+                    model: modelDraft.trim(),
+                    base_url: baseDraft.trim(),
+                  })
+                  setSettingsBusy(false)
+                  if (ok) setSettingsOpen(false)
+                }}
+              >
+                {settingsBusy ? '保存中…' : '保存'}
+              </button>
+              <button type="button" className="btn px-2 py-1 text-[11px]" onClick={() => setSettingsOpen(false)}>
+                取消
+              </button>
+            </div>
+            <p className="mt-1 text-[10.5px] text-slate-600">下一轮运行使用新模型/Base URL；当前轮执行中不可改，暂停后可换模型续跑。</p>
+          </div>
+        )}
         {/* The note is the same boilerplate on every conversation; unclamped
             it wrapped to ~6 lines and, as a shrink-0 header, pushed the
             composer past the row divider onto the session pane. */}

@@ -129,6 +129,7 @@ interface AppState {
   postMessage: (text: string, opts?: { apiKey?: string; paths?: string[]; selections?: CodeSelection[]; mode?: 'start' | 'queue' | 'takeover' | 'steer' }) => Promise<boolean>
   cancelQueue: () => Promise<boolean>
   cancelSteer: () => Promise<boolean>
+  updateConversationSettings: (settings: { model?: string; base_url?: string }) => Promise<boolean>
   loadTurnChanges: (sessionId?: string) => Promise<void>
   applyTurnHunks: (payload: ApplyHunkRequest, sessionId?: string) => Promise<boolean>
   rollbackTurn: (sessionId: string) => Promise<boolean>
@@ -455,6 +456,31 @@ export const useStore = create<AppState>((set, get) => ({
       return true
     } catch (e) {
       if (isIntendedConv(get(), id)) set({ actionError: errorText(e) })
+      return false
+    }
+  },
+
+  // Mid-conversation model/base-URL switch (Cursor's composer model picker):
+  // the next turn launches with the new values; the server refuses while a
+  // run executes and records the change in the transcript.
+  updateConversationSettings: async (settings) => {
+    const id = get().currentConvId
+    if (!id) {
+      set({ actionError: '没有打开的对话' })
+      return false
+    }
+    try {
+      const conversation = await api.updateConversationSettings(id, settings)
+      if (!isIntendedConv(get(), id)) return true
+      set({
+        conversation,
+        conversations: mergeConversation(get().conversations, conversation),
+        actionError: null,
+      })
+      await get().refreshConversations()
+      return true
+    } catch (e) {
+      applyActionError(get, set, e)
       return false
     }
   },

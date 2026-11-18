@@ -200,6 +200,74 @@ func (s *Server) handleSetConversationKey(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, s.viewConversation(c))
 }
 
+// handleUpdateConversationSettings switches the model/base URL of an open
+// conversation — the Cursor-style "pick another model and retry" move. The
+// next turn (a fresh postMessage or a resume) launches with the new values;
+// changing them while a run is executing would only confuse which model
+// produced what, so that is refused. The key is untouched: it lives in
+// process memory keyed by conversation and follows the same rules as before.
+func (s *Server) handleUpdateConversationSettings(w http.ResponseWriter, r *http.Request) {
+	c, err := s.loadConv(r.PathValue("id"))
+	if err != nil {
+		writeJSON(w, statusForConvErr(err), map[string]string{"error": err.Error()})
+		return
+	}
+	var req struct {
+		Model   string `json:"model"`
+		BaseURL string `json:"base_url"`
+	}
+	if err := decodeBody(r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	model := strings.TrimSpace(req.Model)
+	baseURL := strings.TrimSpace(req.BaseURL)
+	if model == "" && baseURL == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "model and base_url cannot both be empty"})
+		return
+	}
+	if baseURL != "" && !strings.HasPrefix(baseURL, "http://") && !strings.HasPrefix(baseURL, "https://") {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "base_url must start with http:// or https://"})
+		return
+	}
+	if latest, e2 := loadConversation(s.dataDir, c.ID); e2 == nil {
+		c = latest
+	}
+	phase, _ := s.conversationRun(c)
+	if activeRunPhase(phase) {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "当前轮还在执行，不能切换模型；等本轮结束或暂停后再换"})
+		return
+	}
+	if phase == string(agent.PhaseLeafApproval) {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "当前正在审批，不能切换模型"})
+		return
+	}
+	secrets := s.secretsFor(c.ID)
+	s.mu.Lock()
+	changed := []string{}
+	if model != "" && model != c.Settings.Model {
+		changed = append(changed, "模型 → "+model)
+		c.Settings.Model = model
+	}
+	if baseURL != "" && baseURL != c.Settings.BaseURL {
+		changed = append(changed, "Base URL → "+baseURL)
+		c.Settings.BaseURL = baseURL
+	}
+	if len(changed) > 0 {
+		c.appendMessage("system", kindNotice, "已切换 "+strings.Join(changed, "，")+"。下一轮运行使用新设置。", c.CurrentSessionID, "model_switched", secrets)
+	}
+	serr := saveConversation(s.dataDir, c, secrets)
+	s.mu.Unlock()
+	if serr != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": serr.Error()})
+		return
+	}
+	if latest, e2 := loadConversation(s.dataDir, c.ID); e2 == nil {
+		c = latest
+	}
+	writeJSON(w, http.StatusOK, s.viewConversation(c))
+}
+
 func (s *Server) handleResumeConversation(w http.ResponseWriter, r *http.Request) {
 	var req postMessageRequest
 	if r.ContentLength > 0 {

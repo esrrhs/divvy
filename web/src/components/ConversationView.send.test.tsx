@@ -997,4 +997,48 @@ describe('ConversationView attachment chips open the viewer', () => {
     expect((host.querySelector('textarea') as HTMLTextAreaElement).value).toBe('/bogus')
     expect(host.textContent).toContain('可用：/pause /resume /abort /undo')
   })
+
+  it('换模型 switches the conversation model from the header row', async () => {
+    // refreshConversations replaces the on-screen conversation from the list
+    // response, so the list mock must track the switched model.
+    let latest = conv('a', 'sess-a', {
+      settings: { isolate: true, git_commit: false, web: false, browser: false, agent_mode: 'direct', model: 'phi4-mini:latest', base_url: 'http://127.0.0.1:11434/v1' },
+    })
+    vi.spyOn(api, 'getConversation').mockImplementation(async () => latest)
+    vi.spyOn(api, 'listConversations').mockImplementation(async () => [latest])
+    const update = vi.spyOn(api, 'updateConversationSettings').mockImplementation(async () => {
+      latest = { ...latest, settings: { ...latest.settings, model: 'qwen3.8:27b' } }
+      return latest
+    })
+    await useStore.getState().openConversation('a')
+    await act(async () => {
+      root.render(<ConversationView />)
+      await Promise.resolve()
+    })
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    const button = (label: string) => [...host.querySelectorAll('button')].find((b) => (b.textContent || '').trim() === label)
+    await act(async () => {
+      button('换模型')?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    const modelInput = [...host.querySelectorAll('input')].find((i) => i.value === 'phi4-mini:latest')
+    expect(modelInput).toBeTruthy()
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(modelInput!, 'qwen3.8:27b')
+      modelInput!.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    await act(async () => {
+      button('保存')!.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    expect(api.updateConversationSettings).toHaveBeenCalledWith('a', { model: 'qwen3.8:27b', base_url: 'http://127.0.0.1:11434/v1' })
+    expect(host.textContent).toContain('qwen3.8:27b')
+    expect(update).toHaveBeenCalledTimes(1)
+    expect(host.textContent).toContain('qwen3.8:27b')
+  })
 })

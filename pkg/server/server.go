@@ -170,6 +170,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/conversations/{id}", s.handleDeleteConversation)
 	mux.HandleFunc("POST /api/conversations/{id}/messages", s.handlePostMessage)
 	mux.HandleFunc("POST /api/conversations/{id}/key", s.handleSetConversationKey)
+	mux.HandleFunc("POST /api/conversations/{id}/settings", s.handleUpdateConversationSettings)
 	mux.HandleFunc("POST /api/conversations/{id}/resume", s.handleResumeConversation)
 	mux.HandleFunc("DELETE /api/conversations/{id}/queue", s.handleCancelQueue)
 	mux.HandleFunc("DELETE /api/conversations/{id}/steer", s.handleCancelSteer)
