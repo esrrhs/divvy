@@ -527,9 +527,30 @@ export function ConversationView() {
     setRecovering(convHasOp(convId, 'recover'))
   }
 
+  // Stick-to-bottom: while new messages or stream deltas land, the view
+  // follows the tail — unless the user scrolled up to read history, in which
+  // case autoscroll stands down (a floating ↓ jumps back). Streaming yanks
+  // made history unreadable mid-run.
+  const stickToBottom = useRef(true)
+  const [showJump, setShowJump] = useState(false)
+  function onScrollerScroll() {
+    const el = scroller.current
+    if (!el) return
+    const near = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+    stickToBottom.current = near
+    setShowJump(!near)
+  }
+  function jumpToLatest() {
+    const el = scroller.current
+    if (!el) return
+    stickToBottom.current = true
+    setShowJump(false)
+    el.scrollTop = el.scrollHeight
+  }
+
   useEffect(() => {
     const el = scroller.current
-    if (el) el.scrollTop = el.scrollHeight
+    if (el && stickToBottom.current) el.scrollTop = el.scrollHeight
     // `messages` is guarded too: a server that (still) reports null for a
     // fresh conversation must not unmount the whole app here.
   }, [conv?.messages?.length, conv?.id, conv?.live_assistant, conv?.pending_ask, live?.live_assistant, live?.pending_ask])
@@ -761,6 +782,11 @@ export function ConversationView() {
       setPaths([])
       setPicker(null)
       setAutoDropped(false)
+      // The user's own message must be visible: re-stick after sending.
+      stickToBottom.current = true
+      setShowJump(false)
+      const el = scroller.current
+      if (el) el.scrollTop = el.scrollHeight
     }
   }
 
@@ -940,7 +966,19 @@ export function ConversationView() {
           the scroller flexes to fill its share instead of capping at 34vh,
           which used to leave the event timeline a ~30px strip. The 56px floor
           keeps a sliver of the last message visible at extreme ratios. */}
-      <div ref={scroller} className="min-h-[56px] flex-1 space-y-2 overflow-y-auto px-4 py-3">
+      <div ref={scroller} onScroll={onScrollerScroll} className="relative min-h-[56px] flex-1 space-y-2 overflow-y-auto px-4 py-3">
+        {showJump && (
+          <div className="sticky bottom-2 z-10 flex justify-end">
+            <button
+              type="button"
+              onClick={jumpToLatest}
+              className="flex items-center gap-1 rounded-full border border-brand-600/60 bg-ink-800 px-2.5 py-1 text-[11px] text-brand-200 shadow-lg shadow-black/30"
+              title="回到底部（之后继续跟随新消息）"
+            >
+              ↓ 回到底部
+            </button>
+          </div>
+        )}
         {(!conv.messages || conv.messages.length === 0) && (
           <p className="py-4 text-center text-[12.5px] text-slate-600">
             在下方输入需求，divvy 会在此项目里规划并执行修改。不必每次 @，需要精确指定时再用 @。结束后可继续提修改，不必重填模型信息。
