@@ -219,6 +219,15 @@ export const api = {
       { confirm: true },
     ),
 
+  // Restore the workspace to the end state of an earlier turn by undoing
+  // every later turn's changes in reverse order (each step journaled).
+  checkpointTurn: (id: string, sessionId: string) =>
+    request<{ ok: boolean; session_id: string; restored: string[]; conversation?: Conversation }>(
+      'POST',
+      `/conversations/${id}/checkpoint/${encodeURIComponent(sessionId)}`,
+      { confirm: true },
+    ),
+
   recoverRollback: (id: string) =>
     request<{
       ok: boolean

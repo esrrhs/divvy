@@ -118,9 +118,12 @@ function ResultCard({ msg, convId }: { msg: ConvMessage; convId: string }) {
   const [error, setError] = useState<string | null>(null)
   const [busyPath, setBusyPath] = useState('')
   const rollbackTurn = useStore((s) => s.rollbackTurn)
+  const checkpointTurn = useStore((s) => s.checkpointTurn)
   const conversation = useStore((s) => s.conversation)
   const [confirmRollback, setConfirmRollback] = useState(false)
   const [rolling, setRolling] = useState(false)
+  const [confirmCheckpoint, setConfirmCheckpoint] = useState(false)
+  const [restoring, setRestoring] = useState(false)
   const summaries = msg.changes ?? []
   const alreadyRolled = !!(msg.session_id && conversation?.rolled_back_turns?.includes(msg.session_id))
   const phase = conversation?.run_phase
@@ -128,6 +131,18 @@ function ResultCard({ msg, convId }: { msg: ConvMessage; convId: string }) {
   const rollbackBlocked =
     !!pendingRollback ||
     !!(phase && ['planning', 'plan_review', 'running', 'leaf_approval', 'ask', 'paused'].includes(phase))
+  // Checkpoint target: this turn plus at least one later turn whose changes
+  // are still in the workspace. Once everything after this turn is undone,
+  // the affordance disappears on its own.
+  const rolledBack = conversation?.rolled_back_turns ?? []
+  const messages = conversation?.messages ?? []
+  const msgIdx = msg.id ? messages.findIndex((m) => m.id === msg.id) : -1
+  const hasLaterActive =
+    msgIdx >= 0 &&
+    messages.some(
+      (m, i) =>
+        i > msgIdx && m.kind === 'run_finished' && !!m.session_id && !rolledBack.includes(m.session_id),
+    )
 
   function adopt(got: TurnChangesResponse | { changes?: TurnChange[]; editable?: boolean; reason?: string }) {
     setChanges(got.changes ?? [])
@@ -236,8 +251,51 @@ function ResultCard({ msg, convId }: { msg: ConvMessage; convId: string }) {
             </button>
           )}
           {alreadyRolled && <span className="text-[11px] text-slate-500">这一轮的修改已撤销</span>}
+          {hasLaterActive && !alreadyRolled && msg.session_id && (
+            <button
+              type="button"
+              disabled={restoring || rollbackBlocked}
+              title="把工作区恢复到这一轮结束时的状态：其后的每一轮按从新到旧依次撤销（每轮独立操作日志），消息保留为折叠的历史。不会执行 git reset。"
+              className="rounded border border-line px-2 py-1 text-[11px] text-slate-300 hover:bg-ink-800 disabled:cursor-not-allowed disabled:text-slate-600"
+              onClick={() => setConfirmCheckpoint(true)}
+            >
+              恢复到此轮
+            </button>
+          )}
         </div>
       )}
+      {confirmCheckpoint && (
+        <div className="mt-2 rounded border border-amber-800/50 bg-amber-950/20 px-3 py-2 text-[12px] text-amber-100">
+          <p>
+            确认恢复到这一轮结束时的状态？其后的每一轮文件改动会按从新到旧的顺序依次撤销（每轮有独立操作日志和备份），工作区停在这一轮的结果上。被撤销轮次的消息保留为历史并折叠。若某轮涉及的文件已被外部改动，撤销会在那一轮停止且不覆盖外部修改。不会执行 git reset。执行中、审批中或暂停时不能恢复。
+          </p>
+          <div className="mt-2 flex gap-2">
+            <button
+              type="button"
+              disabled={restoring}
+              className="rounded border border-rose-800/60 bg-rose-950/40 px-2 py-1 text-[11px] text-rose-100"
+              onClick={async () => {
+                if (!msg.session_id) return
+                setRestoring(true)
+                setError(null)
+                const ok = await checkpointTurn(msg.session_id)
+                setRestoring(false)
+                if (ok) {
+                  setConfirmCheckpoint(false)
+                } else {
+                  setError(useStore.getState().actionError || '恢复失败')
+                }
+              }}
+            >
+              {restoring ? '正在恢复…' : '确认恢复'}
+            </button>
+            <button type="button" className="btn px-2 py-1 text-[11px]" onClick={() => setConfirmCheckpoint(false)}>
+              取消
+            </button>
+          </div>
+        </div>
+      )}
+      {error && <p className="mt-1.5 text-[11.5px] text-rose-300">{error}</p>}
       {confirmRollback && (
         <div className="mt-2 rounded border border-amber-800/50 bg-amber-950/20 px-3 py-2 text-[12px] text-amber-100">
           <p>
@@ -290,6 +348,25 @@ function ResultCard({ msg, convId }: { msg: ConvMessage; convId: string }) {
         </div>
       )}
     </div>
+  )
+}
+
+// The persistent boundary a checkpoint restore leaves in the transcript:
+// the undone turns' messages stay as history, folded behind this bar until
+// expanded.
+function CheckpointMarker({ count, open, onToggle }: { count: number; open: boolean; onToggle: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      className="my-1 flex w-full items-center gap-2 rounded border border-dashed border-slate-700 bg-ink-900/60 px-3 py-1.5 text-left text-[11px] text-slate-500 hover:border-slate-500 hover:text-slate-300"
+    >
+      <span className="font-mono">⏪</span>
+      <span>
+        已恢复到此轮结束时的状态——其后 {count} 条已撤销轮次的消息已折叠为历史
+      </span>
+      <span className="ml-auto shrink-0">{open ? '收起历史' : '展开历史'}</span>
+    </button>
   )
 }
 
@@ -472,12 +549,38 @@ export function ConversationView() {
   const pendingAsk = (live?.session_id && (live.session_id === conv.current_session_id || live.session_id === conv.run_session_id)
     ? live.pending_ask
     : '') || conv.pending_ask || ''
-  const liveAssistant = (live?.session_id && (live.session_id === conv.current_session_id || live.session_id === conv.run_session_id)
+  const liveAssistantRaw = (live?.session_id && (live.session_id === conv.current_session_id || live.session_id === conv.run_session_id)
     ? live.live_assistant
     : '') || conv.live_assistant || ''
+  // The run handle outlives a finished run, so the snapshot keeps the last
+  // streamed reply: once the run is terminal the real message is already in
+  // the transcript and the "live" bubble would be a stale ghost duplicating
+  // it (and leaking it out of a checkpoint fold).
+  const liveAssistant =
+    phase && ['done', 'failed', 'aborted', 'interrupted'].includes(phase) ? '' : liveAssistantRaw
   const visibleMessages = pendingAsk
     ? (conv.messages ?? []).filter((m, i, arr) => !(i === arr.length - 1 && m.kind === 'ask' && m.text === pendingAsk))
     : (conv.messages ?? [])
+  // The latest checkpoint marker folds the undone turns' messages between
+  // its target turn's result card and itself. Earlier markers render as
+  // plain notices; only the newest restore defines the fold.
+  const [foldOpen, setFoldOpen] = useState(false)
+  let fold: { target: number; marker: number } | null = null
+  {
+    const markerIdx = visibleMessages.reduce(
+      (last, m, i) => (m.kind === 'notice' && m.outcome === 'checkpoint_restored' ? i : last),
+      -1,
+    )
+    if (markerIdx > 0) {
+      const target = visibleMessages[markerIdx].session_id
+      let t = -1
+      for (let i = 0; i < markerIdx; i++) {
+        const m = visibleMessages[i]
+        if (m.kind === 'run_finished' && m.session_id === target) t = i
+      }
+      if (t >= 0 && markerIdx - t > 1) fold = { target: t, marker: markerIdx }
+    }
+  }
 
   async function submitAsk() {
     if (!askText.trim()) return
@@ -696,7 +799,20 @@ export function ConversationView() {
             在下方输入需求，divvy 会在此项目里规划并执行修改。不必每次 @，需要精确指定时再用 @。结束后可继续提修改，不必重填模型信息。
           </p>
         )}
-        {visibleMessages.map((m) => (
+        {visibleMessages.map((m, i) => {
+          const inFold = fold && i > fold.target && i < fold.marker
+          if (inFold && !foldOpen) return null
+          if (fold && i === fold.marker) {
+            return (
+              <CheckpointMarker
+                key={m.id}
+                count={fold.marker - fold.target - 1}
+                open={foldOpen}
+                onToggle={() => setFoldOpen((v) => !v)}
+              />
+            )
+          }
+          return (
           <MessageBubble
             key={m.id}
             msg={m}
@@ -719,7 +835,8 @@ export function ConversationView() {
               )
             }}
           />
-        ))}
+          )
+        })}
         {liveAssistant && (
           <div className="rounded-md border border-brand-800/40 bg-brand-950/20 px-3 py-2">
             <div className="flex items-baseline gap-2">

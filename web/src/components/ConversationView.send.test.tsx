@@ -885,4 +885,76 @@ describe('ConversationView attachment chips open the viewer', () => {
     // Non-user rows must not offer the affordance.
     expect([...host.querySelectorAll('button')].filter((b) => b.textContent === '编辑重发')).toHaveLength(1)
   })
+
+  it('恢复到此轮 folds the undone turns behind the checkpoint marker', async () => {
+    const base = conv('a', 'sess-a3', {
+      session_ids: ['sess-a1', 'sess-a2', 'sess-a3'],
+      messages: [
+        { id: 'u1', role: 'user', kind: 'user', text: '第一轮', created_at: '', session_id: 'sess-a1' },
+        { id: 'r1', role: 'system', kind: 'run_finished', text: '轮1完成', outcome: 'completed', created_at: '', session_id: 'sess-a1', changes: [{ path: 'a.go', status: 'modified' }] },
+        { id: 'u2', role: 'user', kind: 'user', text: '第二轮', created_at: '', session_id: 'sess-a2' },
+        { id: 'r2', role: 'system', kind: 'run_finished', text: '轮2完成', outcome: 'completed', created_at: '', session_id: 'sess-a2', changes: [{ path: 'b.go', status: 'modified' }] },
+        { id: 'u3', role: 'user', kind: 'user', text: '第三轮', created_at: '', session_id: 'sess-a3' },
+        { id: 'r3', role: 'system', kind: 'run_finished', text: '轮3完成', outcome: 'completed', created_at: '', session_id: 'sess-a3' },
+      ],
+    })
+    // refreshConversations replaces the on-screen conversation from the list
+    // response, so the list mock must track the checkpointed version too.
+    let latest = base
+    vi.spyOn(api, 'getConversation').mockImplementation(async () => latest)
+    vi.spyOn(api, 'listConversations').mockImplementation(async () => [latest])
+    const checkpoint = vi.spyOn(api, 'checkpointTurn').mockImplementation(async () => {
+      latest = {
+        ...base,
+        rolled_back_turns: ['sess-a2'],
+        messages: [
+          ...base.messages,
+          { id: 'cp1', role: 'system', kind: 'notice', text: '已恢复到这一轮结束时的状态：其后 1 轮的文件改动已按轮撤销。', outcome: 'checkpoint_restored', created_at: '', session_id: 'sess-a1' },
+        ],
+      }
+      return { ok: true, session_id: 'sess-a1', restored: ['sess-a2'], conversation: latest }
+    })
+    await useStore.getState().openConversation('a')
+    await act(async () => {
+      root.render(<ConversationView />)
+      await Promise.resolve()
+    })
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    // Turns 1 and 2 have later active turns; turn 3 (latest) does not.
+    const restoreBtns = [...host.querySelectorAll('button')].filter((b) => b.textContent?.trim() === '恢复到此轮')
+    expect(restoreBtns).toHaveLength(2)
+
+    // Restore to turn 1 via its confirm box.
+    await act(async () => {
+      restoreBtns[0].dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    const confirmBtn = [...host.querySelectorAll('button')].find((b) => b.textContent?.trim() === '确认恢复')
+    expect(confirmBtn).toBeTruthy()
+    await act(async () => {
+      confirmBtn!.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(api.checkpointTurn).toHaveBeenCalledWith('a', 'sess-a1')
+    const marker = [...host.querySelectorAll('button')].find((b) => (b.textContent ?? '').includes('已恢复到此轮结束时的状态'))
+    expect(marker).toBeTruthy()
+    // The undone turns' messages are folded away.
+    expect(host.textContent).not.toContain('第二轮')
+    expect(host.textContent).not.toContain('轮2完成')
+    expect(host.textContent).toContain('第一轮')
+    expect(host.textContent).toContain('轮1完成')
+
+    // Expanding reveals the folded history.
+    await act(async () => {
+      marker!.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    expect(host.textContent).toContain('第二轮')
+    expect((checkpoint as ReturnType<typeof vi.fn>).mock.calls.length).toBe(1)
+  })
 })

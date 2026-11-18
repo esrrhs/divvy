@@ -132,6 +132,7 @@ interface AppState {
   loadTurnChanges: (sessionId?: string) => Promise<void>
   applyTurnHunks: (payload: ApplyHunkRequest, sessionId?: string) => Promise<boolean>
   rollbackTurn: (sessionId: string) => Promise<boolean>
+  checkpointTurn: (sessionId: string) => Promise<boolean>
   recoverRollback: () => Promise<boolean>
   resumeConversation: (apiKey?: string) => Promise<boolean>
   deleteConversation: (id: string) => Promise<boolean>
@@ -530,6 +531,29 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
+
+  checkpointTurn: async (sessionId) => {
+    const id = get().currentConvId
+    if (!id || !sessionId) {
+      set({ actionError: '没有可恢复的轮次' })
+      return false
+    }
+    try {
+      const got = await api.checkpointTurn(id, sessionId)
+      if (get().currentConvId !== id || !isIntendedConv(get(), id)) return true
+      const conversation = got.conversation ?? get().conversation
+      set({
+        conversation,
+        turnChanges: null,
+        actionError: null,
+      })
+      if (conversation) await get().refreshConversations()
+      return true
+    } catch (e) {
+      applyActionError(get, set, e)
+      return false
+    }
+  },
 
   recoverRollback: async () => {
     const id = get().currentConvId

@@ -115,6 +115,185 @@ func (s *Server) handleRollbackTurn(w http.ResponseWriter, r *http.Request) {
 	s.writeRollbackOutcome(w, c, sid, out, aerr)
 }
 
+// handleCheckpointTurn restores the workspace to the state at the END of the
+// given turn: every later turn's file changes are rolled back in reverse
+// order. Reverse order is what makes composition safe — when turn k is
+// rolled back, all turns after it are already undone, so the workdir still
+// matches turn k's recorded result, exactly the invariant single-turn
+// rollback (planRollbackOp) checks. The undone turns keep their messages as
+// history; a checkpoint marker message splits the folded history from the
+// live thread.
+func (s *Server) handleCheckpointTurn(w http.ResponseWriter, r *http.Request) {
+	c, err := s.loadConv(r.PathValue("id"))
+	if err != nil {
+		writeJSON(w, statusForConvErr(err), map[string]string{"error": err.Error()})
+		return
+	}
+	sid := r.PathValue("sessionId")
+	idx := -1
+	for i, have := range c.SessionIDs {
+		if have == sid {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "turn not found in this conversation"})
+		return
+	}
+	var req struct {
+		Confirm bool `json:"confirm"`
+	}
+	if err := decodeBody(r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if !req.Confirm {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "confirm must be true to restore to this turn"})
+		return
+	}
+
+	unlock, lerr := s.mgr.BeginWorkdirWriteExclusive(c.WorkDir, "checkpoint:"+c.ID+":"+sid)
+	if lerr != nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "当前工作区正被另一任务或写入占用，不能恢复：" + lerr.Error()})
+		return
+	}
+	defer unlock()
+
+	if latest, e2 := loadConversation(s.dataDir, c.ID); e2 == nil {
+		c = latest
+	}
+	if ok, reason := s.turnRollbackAllowed(c); !ok {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": reason})
+		return
+	}
+	// An unfinished rollback journal must be resolved first: the loop below
+	// prepares its own journal per turn and cannot run while one is open.
+	if j, jerr := loadRollbackJournal(s.dataDir, c.ID); jerr != nil {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error":        journalUnreadableMessage(jerr.Error()),
+			"conversation": s.viewConversation(c),
+		})
+		return
+	} else if j != nil {
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error": "有未完成的撤销操作日志，请先恢复工作区后再恢复到历史轮次",
+		})
+		return
+	}
+	if reason, blocked := s.rollbackWriteBlock(c); blocked {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": reason})
+		return
+	}
+
+	later := append([]string(nil), c.SessionIDs[idx+1:]...)
+	var restored []string
+	for i := len(later) - 1; i >= 0; i-- {
+		t := later[i]
+		if containsString(c.RolledBackTurns, t) {
+			continue
+		}
+		changes, lerr := loadTurnChanges(s.dataDir, c.ID, t)
+		if lerr != nil {
+			if os.IsNotExist(lerr) {
+				continue
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": lerr.Error()})
+			return
+		}
+		if len(changes) == 0 {
+			continue
+		}
+		var plan []rollbackOp
+		for _, ch := range changes {
+			op, perr := planRollbackOp(c.WorkDir, ch)
+			if perr != nil {
+				s.finishCheckpoint(w, c, sid, restored, fmt.Errorf("%s", perr.Error()))
+				return
+			}
+			if op.skip {
+				continue
+			}
+			plan = append(plan, op)
+		}
+		if len(plan) == 0 {
+			continue
+		}
+		out, aerr := s.applyJournaledRollback(c, t, plan)
+		if aerr != nil || out == nil || !out.Completed {
+			// Stop the sequence. Any failure here compensates the files back
+			// to before this turn's rollback, so the workdir sits at the end
+			// state of the last successfully undone turn — still a coherent
+			// snapshot, just not the requested one. No marker is written.
+			if latest, e2 := loadConversation(s.dataDir, c.ID); e2 == nil {
+				c = latest
+			}
+			msg := "恢复停止"
+			if aerr != nil {
+				msg = aerr.Error()
+			} else if out != nil && out.Message != "" {
+				msg = out.Message
+			}
+			body := map[string]any{
+				"error":        msg,
+				"restored":     restored,
+				"conversation": s.viewConversation(c),
+			}
+			if out != nil {
+				body["pending"] = out.Pending
+				body["compensated"] = out.Compensated
+				body["conflicts"] = out.Conflicts
+			}
+			writeJSON(w, http.StatusConflict, body)
+			return
+		}
+		restored = append(restored, t)
+	}
+	if len(restored) == 0 {
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error": "其后的轮次没有需要撤销的文件改动，工作区已是该轮结束时的状态",
+		})
+		return
+	}
+	s.finishCheckpoint(w, c, sid, restored, nil)
+}
+
+// finishCheckpoint appends the checkpoint marker (the UI's fold boundary and
+// the persistent record of how far the restore went) and answers.
+func (s *Server) finishCheckpoint(w http.ResponseWriter, c *Conversation, sid string, restored []string, stopErr error) {
+	if latest, e2 := loadConversation(s.dataDir, c.ID); e2 == nil {
+		c = latest
+	}
+	if stopErr != nil {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error":        stopErr.Error(),
+			"restored":     restored,
+			"conversation": s.viewConversation(c),
+		})
+		return
+	}
+	secrets := s.secretsFor(c.ID)
+	s.mu.Lock()
+	notice := fmt.Sprintf("已恢复到这一轮结束时的状态：其后 %d 轮的文件改动已按轮撤销。被撤销轮次的消息保留为历史。新一轮从当前工作区继续。", len(restored))
+	c.appendMessage("system", kindNotice, notice, sid, "checkpoint_restored", secrets)
+	c.appendWorkLog(fmt.Sprintf("恢复到轮 %s：撤销其后 %d 轮的文件改动", sid, len(restored)), secrets)
+	serr := saveConversation(s.dataDir, c, secrets)
+	s.mu.Unlock()
+	if serr != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": serr.Error()})
+		return
+	}
+	if latest, e2 := loadConversation(s.dataDir, c.ID); e2 == nil {
+		c = latest
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":           true,
+		"session_id":   sid,
+		"restored":     restored,
+		"conversation": s.viewConversation(c),
+	})
+}
+
 func (s *Server) handleRecoverRollback(w http.ResponseWriter, r *http.Request) {
 	c, err := s.loadConv(r.PathValue("id"))
 	if err != nil {
