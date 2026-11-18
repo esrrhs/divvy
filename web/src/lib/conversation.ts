@@ -116,6 +116,38 @@ export function mentionQuery(text: string, cursor: number): { start: number; que
   return { start: at, query }
 }
 
+// Slash commands typed at the start of the composer: the keyboard-first twin
+// of the run-control buttons and the latest-turn rollback card. They execute
+// lifecycle actions through the store instead of posting a message; unknown
+// ones are refused so a typo never becomes a model turn.
+export interface SlashCommand {
+  name: string
+  desc: string
+}
+
+export const SLASH_COMMANDS: SlashCommand[] = [
+  { name: '/pause', desc: '暂停当前运行（之后 /resume 续跑）' },
+  { name: '/resume', desc: '续跑已暂停的轮次' },
+  { name: '/abort', desc: '中止当前运行' },
+  { name: '/undo', desc: '撤销最近一轮的文件修改（有操作日志可恢复）' },
+]
+
+// The command a composer submission refers to: null when the text is not a
+// slash submission, 'unknown' when it starts with a slash but names nothing.
+export function parseSlashCommand(text: string): string | 'unknown' | null {
+  const t = text.trim()
+  if (!t.startsWith('/')) return null
+  const name = t.split(/\s+/)[0].toLowerCase()
+  return SLASH_COMMANDS.some((c) => c.name === name) ? name : 'unknown'
+}
+
+// The hint entries for the composer's current leading slash token.
+export function slashHints(text: string): SlashCommand[] {
+  const q = text.trim().toLowerCase()
+  if (!q.startsWith('/')) return []
+  return SLASH_COMMANDS.filter((c) => c.name.startsWith(q) || q === '/')
+}
+
 export function outcomeMeta(outcome?: string): { label: string; cls: string } {
   switch (outcome) {
     case 'completed':

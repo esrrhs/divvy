@@ -957,4 +957,44 @@ describe('ConversationView attachment chips open the viewer', () => {
     expect(host.textContent).toContain('第二轮')
     expect((checkpoint as ReturnType<typeof vi.fn>).mock.calls.length).toBe(1)
   })
+
+  it('slash commands run lifecycle actions and never become messages', async () => {
+    // A paused conversation: /resume is the natural command there.
+    const pausedConv = conv('a', 'sess-a', { run_phase: 'paused' })
+    vi.spyOn(api, 'getConversation').mockImplementation(async () => pausedConv)
+    vi.spyOn(api, 'resumeConversation').mockImplementation(async () => pausedConv)
+    const post = vi.spyOn(api, 'postMessage').mockResolvedValue(pausedConv)
+    await useStore.getState().openConversation('a')
+    await act(async () => {
+      root.render(<ConversationView />)
+      await Promise.resolve()
+    })
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    const typeAndSubmit = async (message: string) => {
+      const ta = host.querySelector('textarea') as HTMLTextAreaElement
+      await act(async () => {
+        Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!.call(ta, message)
+        ta.dispatchEvent(new Event('input', { bubbles: true }))
+      })
+      await act(async () => {
+        host.querySelector('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+      })
+    }
+
+    await typeAndSubmit('/resume')
+    expect(api.resumeConversation).toHaveBeenCalledWith('a', undefined)
+    expect(post).not.toHaveBeenCalled()
+    // The composer clears on success.
+    expect((host.querySelector('textarea') as HTMLTextAreaElement).value).toBe('')
+
+    // An unknown command is refused with a hint and never sent.
+    await typeAndSubmit('/bogus')
+    expect(post).not.toHaveBeenCalled()
+    expect(useStore.getState().actionError).toContain('未知命令')
+    expect((host.querySelector('textarea') as HTMLTextAreaElement).value).toBe('/bogus')
+    expect(host.textContent).toContain('可用：/pause /resume /abort /undo')
+  })
 })

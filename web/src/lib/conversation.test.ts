@@ -13,7 +13,9 @@ import {
   mentionQuery,
   messageKindMeta,
   outcomeMeta,
+  parseSlashCommand,
   sameRelPath,
+  slashHints,
   shortWorkdir,
   lineRangeFromOffsets,
   selectionLabel,
@@ -239,5 +241,23 @@ describe('clampRowSplitRatio', () => {
     expect(clampRowSplitRatio(0.95)).toBe(0.75)
     expect(clampRowSplitRatio(Number.NaN)).toBe(0.6)
     expect(clampRowSplitRatio(Number.POSITIVE_INFINITY)).toBe(0.6)
+  })
+})
+
+describe('slash commands', () => {
+  it('parses leading commands and refuses unknown ones', () => {
+    expect(parseSlashCommand('/pause')).toBe('/pause')
+    expect(parseSlashCommand('  /PAUSE  ')).toBe('/pause')
+    expect(parseSlashCommand('/pause now')).toBe('/pause')
+    expect(parseSlashCommand('hello /pause')).toBeNull()
+    expect(parseSlashCommand('')).toBeNull()
+    expect(parseSlashCommand('/bogus')).toBe('unknown')
+  })
+
+  it('hints by prefix, all on a bare slash', () => {
+    expect(slashHints('/p').map((c) => c.name)).toEqual(['/pause'])
+    expect(slashHints('/').map((c) => c.name)).toEqual(['/pause', '/resume', '/abort', '/undo'])
+    expect(slashHints('/x')).toEqual([])
+    expect(slashHints('pause')).toEqual([])
   })
 })

@@ -6,8 +6,11 @@ import {
   mentionQuery,
   messageKindMeta,
   outcomeMeta,
+  parseSlashCommand,
   selectionLabel,
   shortWorkdir,
+  slashHints,
+  SLASH_COMMANDS,
   steerPendingText,
 } from '../lib/conversation'
 import { useStore } from '../store'
@@ -434,6 +437,7 @@ export function ConversationView() {
   const setConversationKey = useStore((s) => s.setConversationKey)
   const answer = useStore((s) => s.answer)
   const pause = useStore((s) => s.pause)
+  const abort = useStore((s) => s.abort)
   const live = useStore((s) => s.live)
   const actionError = useStore((s) => s.actionError)
   const recoverRollback = useStore((s) => s.recoverRollback)
@@ -641,6 +645,35 @@ export function ConversationView() {
     setPicker(null)
   }
 
+  // Slash commands run lifecycle actions instead of posting a message. They
+  // reuse the store paths behind the run-control buttons, so failures land
+  // in actionError and the composer keeps its text for a retry.
+  const rollbackTurn = useStore((s) => s.rollbackTurn)
+  async function runSlashCommand(cmd: string): Promise<boolean> {
+    switch (cmd) {
+      case '/pause':
+        return await pause()
+      case '/resume':
+        return await resumeConversation()
+      case '/abort':
+        return await abort()
+      case '/undo': {
+        const rolled = useStore.getState().conversation?.rolled_back_turns ?? []
+        const turns = (useStore.getState().conversation?.messages ?? []).filter(
+          (m) => m.kind === 'run_finished' && m.session_id && !rolled.includes(m.session_id),
+        )
+        const last = turns[turns.length - 1]
+        if (!last?.session_id) {
+          useStore.setState({ actionError: '没有可撤销的轮次' })
+          return false
+        }
+        return await rollbackTurn(last.session_id)
+      }
+      default:
+        return false
+    }
+  }
+
   async function send(mode?: MessageMode, e?: FormEvent) {
     e?.preventDefault()
     if (busy || !block.ok) return
@@ -649,6 +682,23 @@ export function ConversationView() {
     if (block.kind === 'paused' && resolved !== 'steer' && resolved !== 'takeover') return
     if (!text.trim()) return
     const sourceConvId = conv!.id
+    // Slash submissions never become model turns; a typo is refused here so
+    // it cannot leak into the conversation as a user message.
+    const cmd = parseSlashCommand(text)
+    if (cmd) {
+      const okCmd = cmd === 'unknown' ? false : await runSlashCommand(cmd)
+      if (!okCmd) {
+        if (cmd === 'unknown') {
+          useStore.setState({
+            actionError: `未知命令 ${text.trim().split(/\s+/)[0]}。可用：${SLASH_COMMANDS.map((c) => c.name).join(' ')}`,
+          })
+        }
+        return
+      }
+      setText('')
+      setPicker(null)
+      return
+    }
     const sentSelections = auto.selection ? [...pendingSelections, auto.selection] : pendingSelections
     const sentPaths = auto.path && !paths.some((p) => p.path === auto.path) ? [...paths.map((p) => p.path), auto.path] : paths.map((p) => p.path)
     const token = beginComposerOp(sourceConvId, 'send')
@@ -928,6 +978,22 @@ export function ConversationView() {
       )}
 
       <form onSubmit={(e) => void send(undefined, e)} className="relative border-t border-line px-4 py-2">
+        {text.trim().startsWith('/') && (
+          <div className="mt-1.5 divide-y divide-line/60 rounded border border-line bg-ink-900/80">
+            {slashHints(text).length > 0 ? (
+              slashHints(text).map((c) => (
+                <div key={c.name} className="flex items-baseline gap-2 px-3 py-1 text-[11px]">
+                  <span className="shrink-0 font-mono text-brand-200">{c.name}</span>
+                  <span className="text-slate-500">{c.desc}</span>
+                </div>
+              ))
+            ) : (
+              <div className="px-3 py-1 text-[11px] text-amber-300/80">
+                未知命令。可用：{SLASH_COMMANDS.map((c) => c.name).join(' ')}（/ 开头回车执行，不会发给模型）
+              </div>
+            )}
+          </div>
+        )}
         {!autoDropped && (auto.selection || auto.path) && (
           <div className="mt-1.5">
             <span
