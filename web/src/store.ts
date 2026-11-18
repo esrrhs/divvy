@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import { api, ApiError } from './api/client'
+import { api, ApiError, getToken } from './api/client'
 import { planFileOpen } from './lib/fileNav'
 import { EventSourceClient, type SseStatus } from './api/sse'
 import type {
@@ -217,6 +217,13 @@ interface AppState {
   connect: (id: string, token: string) => void
   disconnect: () => void
   _sse: EventSourceClient | null
+  // Which session/token the live client is bound to, and the highest event
+  // seq already folded into `events` for it. They outlive a disconnect so a
+  // reconnect to the same session (resume of the open conversation) neither
+  // duplicates replayed events nor loses the dedupe watermark.
+  _sseSessionId: string | null
+  _sseToken: string | null
+  _sseLastSeq: number
 }
 
 export const useStore = create<AppState>((set, get) => ({
@@ -245,6 +252,9 @@ export const useStore = create<AppState>((set, get) => ({
   apiError: null,
   actionError: null,
   _sse: null,
+  _sseSessionId: null,
+  _sseToken: null,
+  _sseLastSeq: 0,
   aiEditOpen: false,
   aiEditPath: null,
   aiEditSelection: null,
@@ -671,24 +681,28 @@ export const useStore = create<AppState>((set, get) => ({
       return
     }
     if (!sessionStillCurrent()) return
-    // The open file belongs to the project, not to the session: a new run
-    // (postMessage, resume) starts a new session and used to close the file
-    // the user was reading mid-loop — Cursor keeps your editor open. The
-    // per-conversation navigation paths (openConversation / onNewSession)
-    // clear these explicitly before calling, so preserving here only affects
-    // same-conversation switches. Stale disk content after a run edits the
-    // file is guarded by the baseHash 409 on save, as before.
-    set((s) => ({
-      currentId: id,
-      events: [],
-      live: null,
-      tree: null,
-      selectedNodeId: null,
-      fileView: s.fileView,
-      fileDirty: s.fileDirty,
-      pendingFileNav: s.pendingFileNav,
-      viewerSelection: s.viewerSelection,
-    }))
+    // Reopening the SAME session (resume of the conversation being watched)
+    // must not wipe the view — but it MUST drop the old stream connection:
+    // the server's resume swaps the session's event recorder, so the old
+    // subscription would go silent forever. A fresh subscribe replays the
+    // missed tail; the watermark keeps the timeline duplicate-free and the
+    // detail snapshot below keeps the phase honest while it streams.
+    const sameSession = get().currentId === id
+    if (!sameSession) {
+      set((s) => ({
+        currentId: id,
+        events: [],
+        live: null,
+        tree: null,
+        selectedNodeId: null,
+        fileView: s.fileView,
+        fileDirty: s.fileDirty,
+        pendingFileNav: s.pendingFileNav,
+        viewerSelection: s.viewerSelection,
+      }))
+    } else {
+      set({ currentId: id })
+    }
     get().disconnect()
     try {
       const detail = await api.getSession(id)
@@ -728,6 +742,11 @@ export const useStore = create<AppState>((set, get) => ({
       // is not an error. Only surface real failures.
       if (!sessionStillCurrent()) return
       set({ apiError: errorText(e) })
+    }
+    // Always (re)bind the stream — even for a same-session re-open, where
+    // App's effect does not fire because currentId did not change.
+    if (sessionStillCurrent() && get().currentId === id) {
+      get().connect(id, getToken())
     }
   },
 
@@ -1110,6 +1129,14 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   connect: (id, t) => {
+    // Idempotent per (session, token): openSession now ends with connect so a
+    // same-session re-open (resume of the conversation being watched) always
+    // has a live stream — App's effect only fires when currentId CHANGES,
+    // which is exactly the resume case where it does not.
+    if (get()._sse && get()._sseSessionId === id && get()._sseToken === t) return
+    // jsdom (and other test environments) ship no EventSource; there the
+    // store simply has no stream, exactly as before this rebinding existed.
+    if (typeof EventSource === 'undefined') return
     get().disconnect()
     const sse = new EventSourceClient(id, t, {
       onStatus: (sseStatus) => set({ sseStatus }),
@@ -1117,6 +1144,11 @@ export const useStore = create<AppState>((set, get) => ({
         // Phase snapshots piggyback on the same stream the UI will render
         // from (Task 8 consumes the tree_snapshot payloads fully).
         set((s) => {
+          // The watermark survives client swaps (disconnect → connect of the
+          // same session replays the file tail); dropping what was already
+          // folded into `events` keeps a reconnect duplicate-free.
+          if (typeof ev.seq === 'number' && ev.seq <= s._sseLastSeq) return s
+          const nextSeq = typeof ev.seq === 'number' ? ev.seq : s._sseLastSeq
           const events =
             s.events.length >= eventViewCap
               ? [...s.events.slice(s.events.length - eventViewCap + 1), ev]
@@ -1125,9 +1157,22 @@ export const useStore = create<AppState>((set, get) => ({
           // in the replay window (plan_review/leaf_approval/ask) must not
           // flash over the current state, and a stale replayed snapshot
           // must not replace the tree. The untagged subscribe snapshot and
-          // the live tail drive live/tree state.
+          // the live tail drive live/tree state — EXCEPT a replayed
+          // session_end/user_pause: those are terminal facts about the run,
+          // and after a mid-view reconnect (resume swaps the recorder) they
+          // are the only notice the phase machine ever gets that the run it
+          // was watching has ended.
           if (ev.replay) {
-            return { events }
+            if (ev.kind === 'session_end') {
+              const o = String(ev.outcome ?? '')
+              const next: RunPhase =
+                o === 'completed' ? 'done' : o === 'paused' || o === 'interrupted' ? 'paused' : 'failed'
+              return { events, live: withPhase(s.live, id, next), _sseLastSeq: nextSeq }
+            }
+            if (ev.kind === 'user_pause') {
+              return { events, live: withPhase(s.live, id, 'paused'), _sseLastSeq: nextSeq }
+            }
+            return { events, _sseLastSeq: nextSeq }
           }
           let live = s.live
           let tree = s.tree
@@ -1210,18 +1255,24 @@ export const useStore = create<AppState>((set, get) => ({
               })
             }
           }
-          return { events, live, tree, selectedNodeId }
+          return { events, live, tree, selectedNodeId, _sseLastSeq: nextSeq }
         })
       },
     })
     sse.start()
-    set({ _sse: sse })
+    // A different session starts a fresh seq space; rebinding the same one
+    // (after a disconnect) keeps the watermark for the replay guard.
+    const sameBinding = get()._sseSessionId === id
+    set({ _sse: sse, _sseSessionId: id, _sseToken: t, ...(sameBinding ? {} : { _sseLastSeq: 0 }) })
   },
 
   disconnect: () => {
     const sse = get()._sse
     if (sse) {
       sse.close()
+      // _sseSessionId/_sseLastSeq deliberately survive: they describe the
+      // last binding, and a reconnect to the same session must keep the
+      // watermark so replayed events are not folded twice.
       set({ _sse: null, sseStatus: 'closed' })
     }
   },
