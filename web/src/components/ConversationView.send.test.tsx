@@ -54,6 +54,10 @@ const sel = (text: string, path = 'pkg/a.go'): CodeSelection => ({
   draft: false,
 })
 
+function button2(host: HTMLElement, label: string) {
+  return [...host.querySelectorAll('button')].find((b) => (b.textContent || '').trim() === label)
+}
+
 describe('ConversationView send continuation', () => {
   let root: Root
   let host: HTMLElement
@@ -1075,5 +1079,51 @@ describe('ConversationView attachment chips open the viewer', () => {
     })
     expect(navigator.clipboard.writeText).toHaveBeenCalledWith('修复完成：把 **a-b** 改为 a+b')
     expect(host.textContent).toContain('已复制')
+  })
+
+  it('导出 downloads the transcript as a markdown blob', async () => {
+    const withMsg = conv('a', 'sess-a', {
+      messages: [
+        { id: 'm1', role: 'user', kind: 'user', text: '第一轮需求', created_at: '' },
+        { id: 'm2', role: 'assistant', kind: 'model_reply', text: '完成', created_at: '' },
+      ],
+    })
+    vi.spyOn(api, 'getConversation').mockImplementation(async () => withMsg)
+    vi.spyOn(api, 'exportConversation').mockImplementation(async () => ({
+      markdown: '# 导出测试\n\n## 轮次 1\n',
+      filename: '20261118-导出测试.md',
+    }))
+    const createObjectURL = vi.fn((_blob: Blob) => 'blob:mock')
+    const revoke = vi.fn()
+    Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: createObjectURL })
+    Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: revoke })
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
+    await useStore.getState().openConversation('a')
+    await act(async () => {
+      root.render(<ConversationView />)
+      await Promise.resolve()
+    })
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    await act(async () => {
+      button2(host, '导出')?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    await act(async () => {
+      await Promise.resolve()
+    })
+    expect(api.exportConversation).toHaveBeenCalledWith('a')
+    expect(createObjectURL).toHaveBeenCalledTimes(1)
+    const blob = createObjectURL.mock.calls[0]?.[0] as Blob
+    expect(blob.type).toContain('text/markdown')
+    const text = await new Promise<string>((res) => {
+      const fr = new FileReader()
+      fr.onload = () => res(String(fr.result))
+      fr.readAsText(blob)
+    })
+    expect(text).toContain('## 轮次 1')
+    expect(clickSpy).toHaveBeenCalled()
+    expect(revoke).toHaveBeenCalledWith('blob:mock')
   })
 })

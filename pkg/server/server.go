@@ -167,6 +167,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/conversations", s.handleListConversations)
 	mux.HandleFunc("POST /api/conversations", s.handleCreateConversation)
 	mux.HandleFunc("GET /api/conversations/{id}", s.handleGetConversation)
+	mux.HandleFunc("GET /api/conversations/{id}/export", s.handleExportConversation)
 	mux.HandleFunc("DELETE /api/conversations/{id}", s.handleDeleteConversation)
 	mux.HandleFunc("POST /api/conversations/{id}/messages", s.handlePostMessage)
 	mux.HandleFunc("POST /api/conversations/{id}/key", s.handleSetConversationKey)

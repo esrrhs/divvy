@@ -249,6 +249,12 @@ export const api = {
   renameConversation: (id: string, title: string) =>
     request<Conversation>('POST', `/conversations/${id}/rename`, { title }),
 
+  exportConversation: (id: string) =>
+    request<{ markdown: string; filename: string }>(
+      'GET',
+      `/conversations/${encodeURIComponent(id)}/export`,
+    ),
+
   cancelSteer: (id: string) => request<Conversation>('DELETE', `/conversations/${id}/steer`),
 
   searchConversationFiles: (id: string, q: string, limit = 20) =>

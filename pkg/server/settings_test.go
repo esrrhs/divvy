@@ -194,3 +194,72 @@ func TestConversationRename(t *testing.T) {
 		t.Fatalf("overlong title must 400, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
+
+// TestConversationExport renders the transcript as archive markdown: header
+// block, per-turn headings, per-kind labels, tool args/output fences — and a
+// 4-backtick fence so tool args containing ``` never break the block.
+func TestConversationExport(t *testing.T) {
+	data := t.TempDir()
+	m := agent.NewRunManager()
+	defer m.Shutdown(0)
+	s, err := New(m, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := newConversation("/tmp/work", ConversationSettings{AgentMode: agent.AgentLoopDirect, Model: "qwen3.8:27b"}, "导出测试")
+	if err != nil {
+		t.Fatal(err)
+	}
+	secrets := s.secretsFor(c.ID)
+	c.appendMessage("user", kindUser, "把 hello.txt 改成两行", "s1", "", secrets)
+	c.appendMessage("system", kindToolActivity, "write_file ok", "s1", "write_file", secrets)
+	c.Messages[len(c.Messages)-1].Tool = &ToolActivity{
+		Tool: "write_file", OK: true,
+		Args: `{"content":"` + "```go\nx\n```" + `"}`,
+		OutputHead: "wrote hello.txt", OutputLen: 18, DurationMS: 31,
+	}
+	c.appendMessage("assistant", kindModelReply, "**完成**：改好了", "s1", "model", secrets)
+	c.appendMessage("system", kindRunFinished, "执行结束：已完成。", "s1", "completed", secrets)
+	c.appendMessage("system", kindNotice, "已切换 模型 → qwen3.8:27b。", "", "model_switched", secrets)
+	if err := saveConversation(data, c, secrets); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest("GET", "http://localhost/", nil)
+	req.SetPathValue("id", c.ID)
+	rec := httptest.NewRecorder()
+	s.handleExportConversation(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("export failed: %d %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Markdown string `json:"markdown"`
+		Filename string `json:"filename"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	md := out.Markdown
+	for _, want := range []string{
+		"# 导出测试",
+		"- 模型：`qwen3.8:27b`",
+		"## 轮次 1",
+		"**👤 你**",
+		"**🔧 工具 `write_file`**（ok，31ms，输出 18 字节）",
+		"````text",
+		"```go",
+		"**🤖 模型回答**",
+		"**✅ 执行结果**（completed）",
+		"🔀 已切换",
+	} {
+		if !strings.Contains(md, want) {
+			t.Fatalf("export missing %q\n---\n%s", want, md)
+		}
+	}
+	if !strings.Contains(out.Filename, ".md") {
+		t.Fatalf("filename %q", out.Filename)
+	}
+	if strings.Contains(md, "⏪ 已恢复") {
+		t.Fatalf("model_switched mislabeled:\n%s", md)
+	}
+}

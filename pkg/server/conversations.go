@@ -122,6 +122,140 @@ func (s *Server) handleGetConversation(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.viewConversation(c))
 }
 
+// renderConversationMarkdown renders the transcript as an archive-friendly
+// Markdown document: a header block, then the messages in order with
+// per-kind labels — model replies keep their raw markdown, tool calls carry
+// args/output in fenced blocks, and each new request opens a `## 轮次` heading.
+// Texts come from the stored (secret-scrubbed) conversation.
+func renderConversationMarkdown(c *Conversation) string {
+	var b strings.Builder
+	title := c.Title
+	if strings.TrimSpace(title) == "" {
+		title = c.ID
+	}
+	fmt.Fprintf(&b, "# %s\n\n", title)
+	fmt.Fprintf(&b, "- 项目目录：`%s`\n", c.WorkDir)
+	if c.Settings.Model != "" {
+		fmt.Fprintf(&b, "- 模型：`%s`", c.Settings.Model)
+		if c.Settings.BaseURL != "" {
+			fmt.Fprintf(&b, "（Base URL `%s`）", c.Settings.BaseURL)
+		}
+		b.WriteString("\n")
+	}
+	fmt.Fprintf(&b, "- 导出时间：%s\n", time.Now().Format("2006-01-02 15:04"))
+
+	turn := 0
+	prevEnded := true
+	for _, m := range c.Messages {
+		text := strings.TrimSpace(m.Text)
+		switch m.Kind {
+		case kindUser:
+			if prevEnded {
+				turn++
+				fmt.Fprintf(&b, "\n---\n\n## 轮次 %d\n\n", turn)
+			}
+			fmt.Fprintf(&b, "**👤 你**\n\n%s\n\n", text)
+			prevEnded = false
+		case kindModelReply:
+			fmt.Fprintf(&b, "**🤖 模型回答**\n\n%s\n\n", text)
+		case kindToolActivity:
+			tool := ""
+			ok := true
+			durMS := int64(0)
+			outLen := 0
+			head, tail, args := "", "", ""
+			if m.Tool != nil {
+				tool = m.Tool.Tool
+				ok = m.Tool.OK
+				durMS = m.Tool.DurationMS
+				outLen = m.Tool.OutputLen
+				head, tail, args = m.Tool.OutputHead, m.Tool.OutputTail, m.Tool.Args
+			}
+			status := "ok"
+			if !ok {
+				status = "失败"
+			}
+			name := tool
+			if name == "" {
+				name = oneLine(m.Outcome, 40)
+			}
+			fmt.Fprintf(&b, "**🔧 工具 `%s`**（%s", name, status)
+			if durMS > 0 {
+				fmt.Fprintf(&b, "，%dms", durMS)
+			}
+			if outLen > 0 {
+				fmt.Fprintf(&b, "，输出 %d 字节", outLen)
+			}
+			b.WriteString("）\n\n")
+			if args != "" {
+				fmt.Fprintf(&b, "- 参数：\n\n````text\n%s\n````\n", args)
+			}
+			if head != "" || tail != "" {
+				fmt.Fprintf(&b, "- 输出：\n\n````text\n%s\n", head)
+				if tail != "" {
+					b.WriteString("⋯\n")
+					b.WriteString(tail)
+				}
+				fmt.Fprintf(&b, "\n````\n")
+			}
+			b.WriteString("\n")
+		case kindAsk:
+			fmt.Fprintf(&b, "**❓ 模型提问**\n\n%s\n\n", text)
+		case kindAskAnswer:
+			fmt.Fprintf(&b, "**👤 你的回答**\n\n%s\n\n", text)
+		case kindRunFinished:
+			fmt.Fprintf(&b, "**✅ 执行结果**（%s）\n\n%s\n\n", m.Outcome, text)
+			prevEnded = true
+		default:
+			if text == "" {
+				continue
+			}
+			label := "ℹ️"
+			switch m.Outcome {
+			case "turn_rolled_back":
+				label = "↩️ 已撤销"
+			case "model_switched":
+				label = "🔀 已切换"
+			case "checkpoint_restored":
+				label = "⏪ 已恢复"
+			case "approval_pending", "approval_approved", "approval_rejected":
+				label = "🛡️ 审批"
+			}
+			fmt.Fprintf(&b, "%s %s\n\n", label, text)
+		}
+	}
+	return b.String()
+}
+
+func (s *Server) handleExportConversation(w http.ResponseWriter, r *http.Request) {
+	c, err := s.loadConv(r.PathValue("id"))
+	if err != nil {
+		writeJSON(w, statusForConvErr(err), map[string]string{"error": err.Error()})
+		return
+	}
+	if latest, e2 := loadConversation(s.dataDir, c.ID); e2 == nil {
+		c = latest
+	}
+	md := renderConversationMarkdown(c)
+	w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+	writeJSON(w, http.StatusOK, map[string]string{
+		"markdown":      md,
+		"filename": fmt.Sprintf("%s.md", strings.Map(func(rr rune) rune {
+			switch {
+			case rr >= 'a' && rr <= 'z', rr >= 'A' && rr <= 'Z', rr >= '0' && rr <= '9':
+				return rr
+			// Keep CJK: Chinese titles read better than a dash run.
+			case rr >= 0x4E00 && rr <= 0x9FFF:
+				return rr
+			case rr == '-' || rr == '_' || rr == '.':
+				return rr
+			default:
+				return '-'
+			}
+		}, fmt.Sprintf("%s-%s", time.Now().Format("20060102"), c.Title))),
+	})
+}
+
 func (s *Server) handleDeleteConversation(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	c, err := s.loadConv(id)

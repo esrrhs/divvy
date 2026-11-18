@@ -470,6 +470,7 @@ export function ConversationView() {
   const [settingsBusy, setSettingsBusy] = useState(false)
   const [modelDraft, setModelDraft] = useState('')
   const [baseDraft, setBaseDraft] = useState('')
+  const [exporting, setExporting] = useState(false)
   const [askText, setAskText] = useState('')
   const [askBusy, setAskBusy] = useState(false)
   const [apiKey, setApiKey] = useState('')
@@ -888,6 +889,30 @@ export function ConversationView() {
             }}
           >
             换模型
+          </button>
+          <button
+            type="button"
+            className="shrink-0 text-[10.5px] text-slate-600 hover:text-brand-200"
+            title="导出对话为 Markdown 存档（含轮次、工具产出）"
+            onClick={async () => {
+              setExporting(true)
+              try {
+                const { markdown, filename } = await api.exportConversation(conv.id)
+                const blob = new Blob([markdown], { type: 'text/markdown;charset=utf-8' })
+                const url = URL.createObjectURL(blob)
+                const a = document.createElement('a')
+                a.href = url
+                a.download = filename
+                a.click()
+                URL.revokeObjectURL(url)
+              } catch (e) {
+                useStore.setState({ actionError: e instanceof Error ? e.message : String(e) })
+              } finally {
+                setExporting(false)
+              }
+            }}
+          >
+            {exporting ? '导出中…' : '导出'}
           </button>
           <span className="ml-auto text-[11px] text-slate-600">
             工作日志 {conv.work_log?.length ?? 0}/8 轮
