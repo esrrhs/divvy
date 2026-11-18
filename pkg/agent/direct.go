@@ -1901,10 +1901,6 @@ func isDirectCompactionNote(m llm.Message) bool {
 	return strings.Contains(s, "earlier transcript messages were omitted from this request")
 }
 
-func directTrimNote(dropped int) string {
-	return fmt.Sprintf("(%d earlier transcript messages were omitted from this request to fit the context budget. The full transcript remains on disk. Continue from the recent history below; do not assume omitted tool results.)", dropped)
-}
-
 type directToolEvent struct {
 	name   string
 	args   map[string]any

@@ -173,9 +173,6 @@ func TestDirect_HTTPContextLengthShrinksAndRepairs(t *testing.T) {
 			cfg.DirectContextChars = 200000
 			cfg.Stream = false
 			msgs := seedContextRetryHistory(native)
-			if !native {
-				// Keep later steps on the JSON protocol after resume.
-			}
 			path := filepath.Join(data, cfg.SessionID+".direct.json")
 			st := &directState{Version: 1, Messages: msgs, Step: 0, JSONFallback: !native}
 			if err := saveDirectState(path, st, cfg.APIKey); err != nil {
