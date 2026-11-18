@@ -16,6 +16,7 @@ import {
   parseSlashCommand,
   sameRelPath,
   slashHints,
+  wholeFileRange,
   shortWorkdir,
   lineRangeFromOffsets,
   selectionLabel,
@@ -259,5 +260,13 @@ describe('slash commands', () => {
     expect(slashHints('/').map((c) => c.name)).toEqual(['/pause', '/resume', '/abort', '/undo'])
     expect(slashHints('/x')).toEqual([])
     expect(slashHints('pause')).toEqual([])
+  })
+})
+
+describe('wholeFileRange', () => {
+  it('covers all lines and ignores the trailing newline', () => {
+    expect(wholeFileRange('a\nb\nc\n')).toEqual({ start_line: 1, end_line: 3 })
+    expect(wholeFileRange('a\nb')).toEqual({ start_line: 1, end_line: 2 })
+    expect(wholeFileRange('')).toEqual({ start_line: 1, end_line: 1 })
   })
 })

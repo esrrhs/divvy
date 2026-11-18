@@ -137,6 +137,26 @@ describe('FileViewer search reveal and draft protection', () => {
     expect(useStore.getState().fileView?.path).toBe(FILE)
     expect((host.querySelector('textarea') as HTMLTextAreaElement).value).toMatch(/draft change/)
   })
+  it('⌘K in the turn-diff view switches back to the file and selects the whole file', async () => {
+    await renderViewer()
+    // The turn-diff view is up and has no editor textarea.
+    expect(host.textContent).toMatch(/下面是这一轮对该文件的改动/)
+    expect(host.querySelector('textarea')).toBeNull()
+
+    await act(async () => {
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', metaKey: true, bubbles: true }))
+      await Promise.resolve()
+    })
+
+    // The viewer switched back to the file (editor exists) and the AI-rewrite
+    // dialog opened with the whole file as the selection.
+    const ta = host.querySelector('textarea') as HTMLTextAreaElement
+    expect(ta).toBeTruthy()
+    const st = useStore.getState()
+    expect(st.aiEditOpen).toBe(true)
+    expect(st.aiEditPath).toBe(FILE)
+    expect(st.aiEditSelection).toEqual({ start_line: 1, end_line: 5 })
+  })
 })
 
 // A pending AI rewrite is reviewed IN PLACE: the panel shows the file with the
@@ -686,4 +706,5 @@ describe('FileViewer per-file streaming in multi-file rounds', () => {
     expect(added?.className).toContain('bg-emerald-950')
     expect((host.textContent ?? '').includes('line two rewritten')).toBe(false)
   })
+
 })

@@ -1,6 +1,6 @@
 import { useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import { ApiError, api } from '../api/client'
-import { sameRelPath } from '../lib/conversation'
+import { sameRelPath, wholeFileRange } from '../lib/conversation'
 import { useStore } from '../store'
 import type { FileChange, FsFileResponse, TurnChange } from '../types'
 import { lineRangeFromOffsets } from '../lib/conversation'
@@ -587,11 +587,20 @@ export function FileViewer({ sessionId, path }: { sessionId: string | null; path
       setAttachNote('请先打开一个项目对话，再在编辑器里用 AI 改写。')
       return
     }
-    const range = lineRangeFromOffsets(draft, sel.start, sel.end)
-    const selection = sel.end !== sel.start
-      ? { start_line: range.start_line, end_line: range.end_line }
-      : // No selection: Cursor-style "generate here" inserts at the caret line.
-        { insert_line: range.start_line }
+    // ⌘K while the turn-diff view is up: the user reviewed this turn's
+    // changes and wants the AI on the file as a whole. Switch back to the
+    // file view (the editor textarea only exists there) and treat the whole
+    // file as the selection instead of a caret line at the top.
+    const fromDiff = showDiff
+    if (fromDiff) setShowDiff(false)
+    const range = fromDiff
+      ? wholeFileRange(draft)
+      : lineRangeFromOffsets(draft, sel.start, sel.end)
+    const selection =
+      fromDiff || sel.end !== sel.start
+        ? { start_line: range.start_line, end_line: range.end_line }
+        : // No selection: Cursor-style "generate here" inserts at the caret line.
+          { insert_line: range.start_line }
     if (aiEditOpen) {
       // ⌘K on another file while the dialog is open joins the SAME round.
       // A second press on a file already in the round just updates its range.
@@ -611,9 +620,10 @@ export function FileViewer({ sessionId, path }: { sessionId: string | null; path
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-    // aiEdit closes over the current draft/selection, so rebind when they change.
+    // aiEdit closes over the current draft/selection/diff-mode, so rebind
+    // when they change.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [canEdit, dirty, currentConvId, draft, sel, path])
+  }, [canEdit, dirty, currentConvId, draft, sel, path, showDiff])
 
   async function reload() {
     setLoading(true)

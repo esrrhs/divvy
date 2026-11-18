@@ -262,6 +262,15 @@ export interface CodeSpan {
 }
 
 /** 1-based line range covered by a character offset selection in `content`. */
+// The whole-file line range for an AI rewrite opened over the turn-diff
+// view: the user reviewed the changes and wants the AI on the file as a
+// whole. A trailing newline does not count as an extra line.
+export function wholeFileRange(content: string): CodeSpan {
+  const lines = content.split('\n')
+  const n = lines.length > 1 && lines[lines.length - 1] === '' ? lines.length - 1 : lines.length
+  return { start_line: 1, end_line: Math.max(n, 1) }
+}
+
 export function lineRangeFromOffsets(content: string, start: number, end: number): CodeSpan {
   const from = Math.max(0, Math.min(start, end, content.length))
   let to = Math.max(0, Math.min(Math.max(start, end), content.length))
