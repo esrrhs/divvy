@@ -52,12 +52,13 @@ type benchConfig struct {
 	// Loop is loopTree or loopDirect; empty means tree.
 	Loop string
 
-	MaxSteps   int
-	MaxRetries int
-	Parallel   int
-	Isolate    bool
-	GitCommit  bool
-	Timeout    time.Duration
+	MaxSteps          int
+	MaxRetries        int
+	RequestTimeoutSec int
+	Parallel          int
+	Isolate           bool
+	GitCommit         bool
+	Timeout           time.Duration
 
 	// NativeTools runs the agent over OpenAI tool_calls instead of the JSON
 	// action protocol. The two are not interchangeable for a weak model: the
@@ -263,6 +264,9 @@ func runGoal(ctx context.Context, g Goal, repeat int, bc benchConfig) RunResult 
 	}
 	if steps := g.leafSteps(bc.MaxSteps); steps > 0 {
 		cfg.MaxSteps = steps
+	}
+	if bc.RequestTimeoutSec > 0 {
+		cfg.RequestTimeout = time.Duration(bc.RequestTimeoutSec) * time.Second
 	}
 	if bc.MaxRetries > 0 {
 		cfg.MaxRetries = bc.MaxRetries

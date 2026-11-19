@@ -39,6 +39,7 @@ func run(args []string) error {
 	out := fs.String("out", "", "JSON report path (default: <root>/report.json)")
 	repeat := fs.Int("repeat", 1, "run the whole corpus this many times")
 	timeout := fs.Duration("timeout", 20*time.Minute, "per-goal wall-clock budget")
+	requestTimeout := fs.Duration("request-timeout", 0, "per-LLM-request timeout (0 = engine default 120s); raise for slow local models")
 	maxSteps := fs.Int("max-steps", 15, "worker tool-call budget per leaf")
 	maxRetries := fs.Int("max-retries", 2, "leaf retry budget")
 	parallel := fs.Int("parallel", 1, "concurrent leaves per run")
@@ -94,20 +95,21 @@ func run(args []string) error {
 	defer stop()
 
 	bc := benchConfig{
-		BaseURL:     *baseURL,
-		Model:       *model,
-		APIKey:      *apiKey,
-		ExtraJSON:   *extra,
-		MaxSteps:    *maxSteps,
-		MaxRetries:  *maxRetries,
-		Parallel:    *parallel,
-		Isolate:     *isolate,
-		GitCommit:   *gitCommit,
-		Timeout:     *timeout,
-		Root:        rootDir,
-		Loop:        loopName,
-		NativeTools: *nativeTools,
-		Pricing:     cost.DefaultPricing(),
+		BaseURL:           *baseURL,
+		Model:             *model,
+		APIKey:            *apiKey,
+		ExtraJSON:         *extra,
+		RequestTimeoutSec: int(requestTimeout.Seconds()),
+		MaxSteps:          *maxSteps,
+		MaxRetries:        *maxRetries,
+		Parallel:          *parallel,
+		Isolate:           *isolate,
+		GitCommit:         *gitCommit,
+		Timeout:           *timeout,
+		Root:              rootDir,
+		Loop:              loopName,
+		NativeTools:       *nativeTools,
+		Pricing:           cost.DefaultPricing(),
 	}
 
 	meta := reportMeta{
