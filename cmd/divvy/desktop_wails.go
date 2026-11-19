@@ -26,6 +26,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -92,7 +93,8 @@ func runDesktop(cfg agent.Config, log *agent.Logger) error {
 	// Own the single-instance lock for this run: serve the ping/focus
 	// endpoints on it for any later launch. A foreign process on the port
 	// only costs us the lock — the app still runs.
-	shell := &desktopShell{backendPort: target.Port(), proxy: proxy, dist: dist}
+	framePath := filepath.Join(cfg.DataDir, "desktop-window.json")
+	shell := &desktopShell{backendPort: target.Port(), proxy: proxy, dist: dist, framePath: framePath}
 	shell.onFocus = func() {
 		appCtx := shell.appContext()
 		if appCtx == nil {
@@ -156,10 +158,25 @@ func runDesktop(cfg agent.Config, log *agent.Logger) error {
 			// placeholder page (served through the middleware).
 			Handler: shell.middleware(),
 		},
-		OnStartup: func(c context.Context) { shell.setAppContext(c) },
-		OnBeforeClose: func(context.Context) bool {
+		OnStartup: func(c context.Context) {
+			shell.setAppContext(c)
+			// Restore the last window frame, if one was saved.
+			if f, ok := shell.loadFrame(); ok {
+				wruntime.WindowSetPosition(c, f.X, f.Y)
+				wruntime.WindowSetSize(c, f.W, f.H)
+			}
+		},
+		OnBeforeClose: func(c context.Context) bool {
+			// Persist the frame so the next launch reopens where the user
+			// left it. Signal-driven quits save via OnShutdown instead.
+			shell.saveFrameFromWindow(c)
 			stop()
 			return false // allow the window to close; cleanup happens after Run
+		},
+		OnShutdown: func(context.Context) {
+			// Signal-driven shutdown skips OnBeforeClose (the window never
+			// closes itself); save what the frame looks like now.
+			shell.saveFrameFromWindow(shell.appContext())
 		},
 		Mac: &mac.Options{
 			TitleBar: mac.TitleBarDefault(),
@@ -186,6 +203,7 @@ type desktopShell struct {
 	proxy       http.Handler
 	dist        fs.FS
 	onFocus     func()
+	framePath   string
 
 	mu        sync.Mutex
 	appCtx    context.Context
@@ -352,5 +370,55 @@ func postDesktopFocus(port int) error {
 func (s *desktopShell) fireFocus() {
 	if s.onFocus != nil {
 		s.onFocus()
+	}
+}
+
+// desktopFrame is the persisted window geometry.
+type desktopFrame struct {
+	X int `json:"x"`
+	Y int `json:"y"`
+	W int `json:"w"`
+	H int `json:"h"`
+}
+
+// saveFrame writes the given frame to disk. Sane-only: a frame that would
+// open the window entirely off-screen or microscopic is refused.
+func (s *desktopShell) saveFrame(f desktopFrame) error {
+	if f.W < 400 || f.H < 300 || f.X < -2000 || f.Y < -2000 || f.X > 20000 || f.Y > 20000 {
+		return fmt.Errorf("implausible window frame %+v", f)
+	}
+	data, err := json.MarshalIndent(f, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(s.framePath, data, 0644)
+}
+
+// loadFrame reads the persisted frame. ok=false when missing, unreadable or
+// implausible (the caller then keeps the defaults).
+func (s *desktopShell) loadFrame() (desktopFrame, bool) {
+	data, err := os.ReadFile(s.framePath)
+	if err != nil {
+		return desktopFrame{}, false
+	}
+	var f desktopFrame
+	if json.Unmarshal(data, &f) != nil {
+		return desktopFrame{}, false
+	}
+	if f.W < 400 || f.H < 300 || f.X < -2000 || f.Y < -2000 || f.X > 20000 || f.Y > 20000 {
+		return desktopFrame{}, false
+	}
+	return f, true
+}
+
+// saveFrameFromWindow reads the current frame from the window and saves it.
+func (s *desktopShell) saveFrameFromWindow(c context.Context) {
+	if c == nil {
+		return
+	}
+	x, y := wruntime.WindowGetPosition(c)
+	w, h := wruntime.WindowGetSize(c)
+	if err := s.saveFrame(desktopFrame{X: x, Y: y, W: w, H: h}); err != nil {
+		fmt.Fprintf(os.Stderr, "desktop frame save: %v\n", err)
 	}
 }
