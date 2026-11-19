@@ -500,6 +500,11 @@ export function ConversationView() {
   const scroller = useRef<HTMLDivElement>(null)
   const area = useRef<HTMLTextAreaElement>(null)
   const searchGen = useRef(0)
+  // Per-conversation sent history for the composer's ↑ recall. In-memory
+  // only: it lives as long as the view does, which is exactly how long the
+  // user needs "the thing I just sent".
+  const sentHistory = useRef<string[]>([])
+  const historyIdx = useRef<number | null>(null)
   // Per-conversation, per-operation tokens. Visible busy/ask/recover flags
   // are aggregated from this table so one dialogue's completion cannot clear
   // another request's lock, including after a switch or unmount.
@@ -824,6 +829,13 @@ export function ConversationView() {
       setPaths([])
       setPicker(null)
       setAutoDropped(false)
+      // Record what actually got sent (the edited text, not a copied draft)
+      // for the composer's ↑ recall; skip back-to-back duplicates.
+      const sent = text.trim()
+      if (sentHistory.current[sentHistory.current.length - 1] !== sent) {
+        sentHistory.current.push(sent)
+      }
+      historyIdx.current = null
       // The user's own message must be visible: re-stick after sending.
       stickToBottom.current = true
       setShowJump(false)
@@ -873,6 +885,33 @@ export function ConversationView() {
       if (e.key === 'Escape') {
         e.preventDefault()
         setPicker(null)
+        return
+      }
+    }
+    // ↑ recalls the last sent message when the composer is empty; while
+    // recalling, ↑/↓ walk the history (caret rules relax — the user is
+    // navigating, not editing) until ↓ passes the newest, which restores the
+    // empty composer. Never hijacks cursor movement inside a fresh draft.
+    const recalling = historyIdx.current != null
+    const atStart = area.current && area.current.selectionStart === 0 && area.current.selectionEnd === 0
+    if (!picker && sentHistory.current.length > 0 && area.current && (recalling || (atStart && text === ''))) {
+      if (e.key === 'ArrowUp') {
+        e.preventDefault()
+        const idx = historyIdx.current == null ? sentHistory.current.length - 1 : Math.max(0, historyIdx.current - 1)
+        historyIdx.current = idx
+        setText(sentHistory.current[idx])
+        return
+      }
+      if (e.key === 'ArrowDown' && recalling) {
+        e.preventDefault()
+        const idx = (historyIdx.current ?? sentHistory.current.length - 1) + 1
+        if (idx >= sentHistory.current.length) {
+          historyIdx.current = null
+          setText('')
+        } else {
+          historyIdx.current = idx
+          setText(sentHistory.current[idx])
+        }
         return
       }
     }

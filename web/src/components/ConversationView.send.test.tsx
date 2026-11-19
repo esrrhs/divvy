@@ -634,6 +634,42 @@ describe('ConversationView send continuation', () => {
       expect(sendDone.disabled).toBe(true)
     }
   })
+  it('↑ recalls the last sent message on an empty composer; ↓ walks forward', async () => {
+    vi.spyOn(api, 'postMessage').mockResolvedValue(conv('a'))
+    vi.spyOn(api, 'getConversation').mockImplementation(async (id) => conv(id))
+    await useStore.getState().openConversation('a')
+    await mountView()
+
+    const ta = host.querySelector('textarea') as HTMLTextAreaElement
+    expect(ta).toBeTruthy()
+
+    const typeAndSubmit = async (message: string) => {
+      await act(async () => {
+        Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!.call(ta, message)
+        ta.dispatchEvent(new Event('input', { bubbles: true }))
+      })
+      await act(async () => {
+        host.querySelector('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+      })
+    }
+    await typeAndSubmit('第一轮指令')
+    await typeAndSubmit('第二轮指令')
+
+    // Empty composer, ↑ recalls the newest; ↑ again walks back.
+    const key = (k: string) =>
+      act(() => ta.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true })))
+    await key('ArrowUp')
+    expect(ta.value).toBe('第二轮指令')
+    await key('ArrowUp')
+    expect(ta.value).toBe('第一轮指令')
+    await key('ArrowDown')
+    expect(ta.value).toBe('第二轮指令')
+    await key('ArrowDown')
+    expect(ta.value).toBe('')
+    // ↓ past the newest keeps the composer empty (no crash).
+    await key('ArrowDown')
+    expect(ta.value).toBe('')
+  })
 })
 
 describe('ConversationView auto context chip', () => {
@@ -1160,4 +1196,5 @@ describe('ConversationView attachment chips open the viewer', () => {
     // The still-running call keeps its flat row.
     expect(host.textContent).toContain('开始 run_bash go test')
   })
+
 })
