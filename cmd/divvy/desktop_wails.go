@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -29,6 +30,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
@@ -43,9 +45,24 @@ import (
 
 func desktopSupported() bool { return true }
 
+// desktopLockPort is the loopback port the FIRST desktop instance binds as
+// its single-instance lock and focus-signaling endpoint. A second launch
+// probes it: a live divvy shell answers, gets a focus request, and exits.
+const desktopLockPort = 29571
+
 func runDesktop(cfg agent.Config, log *agent.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Single instance: if another divvy desktop shell owns the lock port,
+	// ask it to focus its window and exit quietly.
+	if probeDesktopLock(desktopLockPort) {
+		if focusErr := postDesktopFocus(desktopLockPort); focusErr != nil {
+			return fmt.Errorf("已有 divvy 桌面窗口在运行（聚焦失败：%v）", focusErr)
+		}
+		fmt.Println("已有 divvy 桌面窗口在运行，已将其聚焦。")
+		return nil
+	}
 
 	mgr := agent.NewRunManagerWithContext(ctx)
 	srv, err := newServerForShell(cfg, log, mgr)
@@ -72,7 +89,46 @@ func runDesktop(cfg agent.Config, log *agent.Logger) error {
 
 	dist, distOK := web.DistFS()
 	_ = distOK
+	// Own the single-instance lock for this run: serve the ping/focus
+	// endpoints on it for any later launch. A foreign process on the port
+	// only costs us the lock — the app still runs.
 	shell := &desktopShell{backendPort: target.Port(), proxy: proxy, dist: dist}
+	shell.onFocus = func() {
+		appCtx := shell.appContext()
+		if appCtx == nil {
+			return
+		}
+		// Surface the window: show/unminimise via the runtime, then flash
+		// the title so the user notices which window it was.
+		wruntime.WindowShow(appCtx)
+		wruntime.WindowUnminimise(appCtx)
+		wruntime.WindowSetTitle(appCtx, "divvy — 已聚焦")
+		time.Sleep(1500 * time.Millisecond)
+		shell.mu.Lock()
+		title := "divvy"
+		if shell.lastTitle != "" {
+			title = shell.lastTitle + " — divvy"
+		}
+		shell.mu.Unlock()
+		wruntime.WindowSetTitle(appCtx, title)
+	}
+	if lockLn, lerr := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", desktopLockPort)); lerr == nil {
+		go func() {
+			mux := http.NewServeMux()
+			mux.HandleFunc("GET /api/desktop/ping", func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				fmt.Fprint(w, `{"app":"divvy","desktop":true}`)
+			})
+			mux.HandleFunc("POST /api/desktop/focus", func(w http.ResponseWriter, r *http.Request) {
+				shell.fireFocus()
+				w.Header().Set("Content-Type", "application/json")
+				fmt.Fprint(w, `{"ok":true}`)
+			})
+			_ = http.Serve(lockLn, mux)
+		}()
+	} else {
+		log.Warnf("desktop lock port busy (%v); starting without single-instance lock", lerr)
+	}
 
 	// Wails lifecycle: closing the window stops the signal context, which
 	// checkpoints every live run; Ctrl+C quits the window via the runtime.
@@ -129,6 +185,7 @@ type desktopShell struct {
 	backendPort string
 	proxy       http.Handler
 	dist        fs.FS
+	onFocus     func()
 
 	mu        sync.Mutex
 	appCtx    context.Context
@@ -258,4 +315,42 @@ func newServerForShell(cfg agent.Config, log *agent.Logger, mgr *agent.RunManage
 		opts = append(opts, server.WithStatic(dist))
 	}
 	return server.New(mgr, cfg.DataDir, opts...)
+}
+
+// probeDesktopLock reports whether another divvy desktop shell owns the
+// lock port (identified by its ping marker, so a foreign process on the
+// port does not count).
+func probeDesktopLock(port int) bool {
+	client := &http.Client{Timeout: 500 * time.Millisecond}
+	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/api/desktop/ping", port))
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	var v struct {
+		App     string `json:"app"`
+		Desktop bool   `json:"desktop"`
+	}
+	return json.NewDecoder(resp.Body).Decode(&v) == nil && v.App == "divvy" && v.Desktop
+}
+
+func postDesktopFocus(port int) error {
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Post(fmt.Sprintf("http://127.0.0.1:%d/api/desktop/focus", port), "application/json", nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("focus endpoint returned %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// fireFocus runs the shell's focus action synchronously: the second
+// instance's request returns after the window has actually been surfaced.
+func (s *desktopShell) fireFocus() {
+	if s.onFocus != nil {
+		s.onFocus()
+	}
 }

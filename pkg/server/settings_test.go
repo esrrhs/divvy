@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/esrrhs/divvy/pkg/agent"
 	"github.com/esrrhs/divvy/pkg/llm"
@@ -218,7 +219,7 @@ func TestConversationExport(t *testing.T) {
 	c.appendMessage("system", kindToolActivity, "write_file ok", "s1", "write_file", secrets)
 	c.Messages[len(c.Messages)-1].Tool = &ToolActivity{
 		Tool: "write_file", OK: true,
-		Args: `{"content":"` + "```go\nx\n```" + `"}`,
+		Args:       `{"content":"` + "```go\nx\n```" + `"}`,
 		OutputHead: "wrote hello.txt", OutputLen: 18, DurationMS: 31,
 	}
 	c.appendMessage("assistant", kindModelReply, "**完成**：改好了", "s1", "model", secrets)
@@ -334,5 +335,50 @@ func TestConversationSettingsUpdate_RequestTimeout(t *testing.T) {
 	}
 	if rec := postSettings(t, s, c.ID, `{}`); rec.Code != http.StatusBadRequest {
 		t.Fatalf("empty update must 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestDesktopFocusEndpoint covers the single-instance lock's signaling: the
+// ping identifies the app, and the focus endpoint fires the shell callback
+// only when one is registered.
+func TestDesktopFocusEndpoint(t *testing.T) {
+	data := t.TempDir()
+	m := agent.NewRunManager()
+	defer m.Shutdown(0)
+	// Desktop-only endpoints: the desktop shell runs with auth off.
+	s, err := New(m, data, WithNoAuth())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fired := make(chan struct{})
+	reqPing := httptest.NewRequest("GET", "http://localhost/api/desktop/ping", nil)
+	recPing := httptest.NewRecorder()
+	s.Handler().ServeHTTP(recPing, reqPing)
+	if recPing.Code != http.StatusOK {
+		t.Fatalf("ping status=%d", recPing.Code)
+	}
+	if !strings.Contains(recPing.Body.String(), `"app":"divvy"`) {
+		t.Fatalf("ping body=%s", recPing.Body.String())
+	}
+
+	reqFocus := httptest.NewRequest("POST", "http://localhost/api/desktop/focus", nil)
+	recFocus := httptest.NewRecorder()
+	s.Handler().ServeHTTP(recFocus, reqFocus)
+	if recFocus.Code != http.StatusNotFound {
+		t.Fatalf("focus without shell must 404, got %d", recFocus.Code)
+	}
+
+	// Register the shell callback and fire again.
+	s.desktopFocus = func() { close(fired) }
+	recFocus = httptest.NewRecorder()
+	s.Handler().ServeHTTP(recFocus, reqFocus)
+	if recFocus.Code != http.StatusOK {
+		t.Fatalf("focus with shell status=%d", recFocus.Code)
+	}
+	select {
+	case <-fired:
+	case <-time.After(time.Second):
+		t.Fatal("focus callback did not fire")
 	}
 }

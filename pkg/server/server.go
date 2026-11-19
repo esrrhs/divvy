@@ -28,12 +28,13 @@ const defaultHeartbeat = 15 * time.Second
 
 // Server is the loopback HTTP surface for one RunManager.
 type Server struct {
-	mgr     *agent.RunManager
-	dataDir string
-	workdir string
-	token   string
-	noAuth  bool
-	static  fs.FS
+	mgr          *agent.RunManager
+	dataDir      string
+	workdir      string
+	token        string
+	noAuth       bool
+	desktopFocus func()
+	static       fs.FS
 
 	heartbeat time.Duration
 	logf      func(format string, args ...any)
@@ -62,6 +63,13 @@ type Option func(*Server)
 // WithToken pins the startup token instead of generating one (tests).
 func WithToken(token string) Option {
 	return func(s *Server) { s.token = token }
+}
+
+// WithDesktopFocus registers the callback the desktop single-instance lock
+// uses: a second launch asks the running shell to focus its window. Without
+// the callback the focus endpoint answers 404.
+func WithDesktopFocus(f func()) Option {
+	return func(s *Server) { s.desktopFocus = f }
 }
 
 // WithNoAuth disables the /api token check. For the desktop shell: the
@@ -177,6 +185,17 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/conversations", s.handleCreateConversation)
 	mux.HandleFunc("GET /api/conversations/{id}", s.handleGetConversation)
 	mux.HandleFunc("GET /api/conversations/{id}/export", s.handleExportConversation)
+	mux.HandleFunc("GET /api/desktop/ping", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{"app": "divvy", "desktop": s.desktopFocus != nil})
+	})
+	mux.HandleFunc("POST /api/desktop/focus", func(w http.ResponseWriter, r *http.Request) {
+		if s.desktopFocus == nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no desktop shell"})
+			return
+		}
+		go s.desktopFocus()
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	})
 	mux.HandleFunc("DELETE /api/conversations/{id}", s.handleDeleteConversation)
 	mux.HandleFunc("POST /api/conversations/{id}/messages", s.handlePostMessage)
 	mux.HandleFunc("POST /api/conversations/{id}/key", s.handleSetConversationKey)
