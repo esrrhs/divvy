@@ -16,6 +16,7 @@ interface FormState {
   browser: boolean
   maxCost: string
   budgetTokens: string
+  requestTimeoutSec: string
   approvalMode: ApprovalMode
   agentMode: AgentMode
 }
@@ -32,6 +33,7 @@ const initial: FormState = {
   browser: false,
   maxCost: '',
   budgetTokens: '',
+  requestTimeoutSec: '',
   approvalMode: 'auto',
   agentMode: 'direct',
 }
@@ -100,6 +102,7 @@ export function ProjectForm() {
         browser: f.browser,
         max_cost: f.maxCost ? Number(f.maxCost) : undefined,
         budget_tokens: f.budgetTokens ? Number(f.budgetTokens) : undefined,
+        request_timeout_sec: f.requestTimeoutSec ? Number(f.requestTimeoutSec) : undefined,
         approval_mode: f.approvalMode,
         agent_mode: f.agentMode,
       })
@@ -220,6 +223,23 @@ export function ProjectForm() {
             value={f.budgetTokens}
             onChange={(e) => set('budgetTokens', e.target.value)}
             placeholder="0 = 不限"
+          />
+        </div>
+      </div>
+      <div className="grid grid-cols-2 gap-3">
+        <div>
+          <label className="label" htmlFor="reqtimeout">
+            单步超时 (秒)
+          </label>
+          <input
+            id="reqtimeout"
+            type="number"
+            min={0}
+            step="30"
+            className="input"
+            value={f.requestTimeoutSec}
+            onChange={(e) => set('requestTimeoutSec', e.target.value)}
+            placeholder="留空 = 默认 120s；慢模型调大"
           />
         </div>
       </div>

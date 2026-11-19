@@ -239,7 +239,7 @@ func (s *Server) handleExportConversation(w http.ResponseWriter, r *http.Request
 	md := renderConversationMarkdown(c)
 	w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
 	writeJSON(w, http.StatusOK, map[string]string{
-		"markdown":      md,
+		"markdown": md,
 		"filename": fmt.Sprintf("%s.md", strings.Map(func(rr rune) rune {
 			switch {
 			case rr >= 'a' && rr <= 'z', rr >= 'A' && rr <= 'Z', rr >= '0' && rr <= '9':
@@ -391,8 +391,9 @@ func (s *Server) handleUpdateConversationSettings(w http.ResponseWriter, r *http
 		return
 	}
 	var req struct {
-		Model   string `json:"model"`
-		BaseURL string `json:"base_url"`
+		Model             string `json:"model"`
+		BaseURL           string `json:"base_url"`
+		RequestTimeoutSec *int   `json:"request_timeout_sec"`
 	}
 	if err := decodeBody(r, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -400,8 +401,15 @@ func (s *Server) handleUpdateConversationSettings(w http.ResponseWriter, r *http
 	}
 	model := strings.TrimSpace(req.Model)
 	baseURL := strings.TrimSpace(req.BaseURL)
-	if model == "" && baseURL == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "model and base_url cannot both be empty"})
+	// The timeout is a pointer: absent (nil) = no change, a value = set it
+	// (0 resets to the engine default for this conversation).
+	timeout := req.RequestTimeoutSec
+	if timeout != nil && (*timeout < 0 || *timeout > 3600) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "request_timeout_sec must be between 0 and 3600"})
+		return
+	}
+	if model == "" && baseURL == "" && timeout == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "nothing to update: send model, base_url or request_timeout_sec"})
 		return
 	}
 	if baseURL != "" && !strings.HasPrefix(baseURL, "http://") && !strings.HasPrefix(baseURL, "https://") {
@@ -430,6 +438,16 @@ func (s *Server) handleUpdateConversationSettings(w http.ResponseWriter, r *http
 	if baseURL != "" && baseURL != c.Settings.BaseURL {
 		changed = append(changed, "Base URL → "+baseURL)
 		c.Settings.BaseURL = baseURL
+	}
+	if timeout != nil && *timeout != c.Settings.RequestTimeoutSec {
+		label := "单步超时 → "
+		if *timeout == 0 {
+			label += "默认（120s）"
+		} else {
+			label += fmt.Sprintf("%ds", *timeout)
+		}
+		changed = append(changed, label)
+		c.Settings.RequestTimeoutSec = *timeout
 	}
 	if len(changed) > 0 {
 		c.appendMessage("system", kindNotice, "已切换 "+strings.Join(changed, "，")+"。下一轮运行使用新设置。", c.CurrentSessionID, "model_switched", secrets)
@@ -914,17 +932,18 @@ func joinChangeNames(changes []turnChangeSummary) string {
 
 func (s *Server) configForConversation(c *Conversation) (agent.Config, error) {
 	p := sessionParams{
-		WorkDir:      c.WorkDir,
-		Model:        c.Settings.Model,
-		BaseURL:      c.Settings.BaseURL,
-		Isolate:      c.Settings.Isolate,
-		GitCommit:    c.Settings.GitCommit,
-		Web:          c.Settings.Web,
-		Browser:      c.Settings.Browser,
-		ApprovalMode: c.Settings.ApprovalMode,
-		BudgetTokens: c.Settings.BudgetTokens,
-		MaxCost:      c.Settings.MaxCost,
-		Parallel:     c.Settings.Parallel,
+		WorkDir:           c.WorkDir,
+		Model:             c.Settings.Model,
+		BaseURL:           c.Settings.BaseURL,
+		Isolate:           c.Settings.Isolate,
+		GitCommit:         c.Settings.GitCommit,
+		Web:               c.Settings.Web,
+		Browser:           c.Settings.Browser,
+		ApprovalMode:      c.Settings.ApprovalMode,
+		BudgetTokens:      c.Settings.BudgetTokens,
+		RequestTimeoutSec: c.Settings.RequestTimeoutSec,
+		MaxCost:           c.Settings.MaxCost,
+		Parallel:          c.Settings.Parallel,
 	}
 	if key := s.getAPIKey(c.ID); key != "" {
 		p.APIKey = key
@@ -961,17 +980,18 @@ func settingsFromParams(p sessionParams) ConversationSettings {
 	// field. Callers that leave it zero get isolate=false only if they
 	// explicitly stored it that way. New conversations from the UI send true.
 	return ConversationSettings{
-		Model:        p.Model,
-		BaseURL:      p.BaseURL,
-		Parallel:     p.Parallel,
-		Isolate:      isolate,
-		GitCommit:    p.GitCommit,
-		Web:          p.Web,
-		Browser:      p.Browser,
-		ApprovalMode: mode,
-		BudgetTokens: p.BudgetTokens,
-		MaxCost:      p.MaxCost,
-		AgentMode:    normalizeAgentMode(p.AgentMode),
+		Model:             p.Model,
+		BaseURL:           p.BaseURL,
+		Parallel:          p.Parallel,
+		Isolate:           isolate,
+		GitCommit:         p.GitCommit,
+		Web:               p.Web,
+		Browser:           p.Browser,
+		ApprovalMode:      mode,
+		BudgetTokens:      p.BudgetTokens,
+		RequestTimeoutSec: p.RequestTimeoutSec,
+		MaxCost:           p.MaxCost,
+		AgentMode:         normalizeAgentMode(p.AgentMode),
 	}
 }
 

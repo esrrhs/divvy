@@ -129,7 +129,7 @@ interface AppState {
   postMessage: (text: string, opts?: { apiKey?: string; paths?: string[]; selections?: CodeSelection[]; mode?: 'start' | 'queue' | 'takeover' | 'steer' }) => Promise<boolean>
   cancelQueue: () => Promise<boolean>
   cancelSteer: () => Promise<boolean>
-  updateConversationSettings: (settings: { model?: string; base_url?: string }) => Promise<boolean>
+  updateConversationSettings: (settings: { model?: string; base_url?: string; request_timeout_sec?: number }) => Promise<boolean>
   renameConversation: (id: string, title: string) => Promise<boolean>
   loadTurnChanges: (sessionId?: string) => Promise<void>
   applyTurnHunks: (payload: ApplyHunkRequest, sessionId?: string) => Promise<boolean>

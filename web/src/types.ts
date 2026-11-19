@@ -43,6 +43,7 @@ export interface SessionParams {
   browser?: boolean
   approval_mode?: ApprovalMode
   budget_tokens?: number
+  request_timeout_sec?: number
   max_cost?: number
   agent_mode?: AgentMode
 }
@@ -311,6 +312,7 @@ export interface ConversationSettings {
   browser: boolean
   approval_mode?: ApprovalMode
   budget_tokens?: number
+  request_timeout_sec?: number
   max_cost?: number
   agent_mode?: AgentMode
 }

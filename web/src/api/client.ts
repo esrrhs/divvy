@@ -243,7 +243,7 @@ export const api = {
 
   cancelQueue: (id: string) => request<Conversation>('DELETE', `/conversations/${id}/queue`),
 
-  updateConversationSettings: (id: string, settings: { model?: string; base_url?: string }) =>
+  updateConversationSettings: (id: string, settings: { model?: string; base_url?: string; request_timeout_sec?: number }) =>
     request<Conversation>('POST', `/conversations/${id}/settings`, settings),
 
   renameConversation: (id: string, title: string) =>

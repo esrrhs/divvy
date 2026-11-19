@@ -25,27 +25,28 @@ const deleteWindDownTimeout = 5 * time.Second
 // optional: absent fields fall back to DefaultConfig, which already carries
 // OPENAI_* environment values. The API key never appears in any response.
 type sessionParams struct {
-	Goal         string  `json:"goal"`
-	WorkDir      string  `json:"workdir"`
-	Model        string  `json:"model"`
-	BaseURL      string  `json:"base_url"`
-	APIKey       string  `json:"api_key"`
-	Parallel     int     `json:"parallel"`
-	Isolate      bool    `json:"isolate"`
-	GitCommit    bool    `json:"git_commit"`
-	Web          bool    `json:"web"`
-	Browser      bool    `json:"browser"`
-	SearchURL    string  `json:"search_url"`
-	ApprovalMode string  `json:"approval_mode"`
-	BudgetTokens int     `json:"budget_tokens"`
-	MaxCost      float64 `json:"max_cost"`
-	MaxRetries   int     `json:"max_retries"`
-	MaxDepth     int     `json:"max_depth"`
-	MaxSubtasks  int     `json:"max_subtasks"`
-	MaxStall     int     `json:"max_stall"`
-	MaxTokens    int     `json:"max_tokens"`
-	Temperature  float64 `json:"temperature"`
-	AgentMode    string  `json:"agent_mode"`
+	Goal              string  `json:"goal"`
+	WorkDir           string  `json:"workdir"`
+	Model             string  `json:"model"`
+	BaseURL           string  `json:"base_url"`
+	APIKey            string  `json:"api_key"`
+	Parallel          int     `json:"parallel"`
+	Isolate           bool    `json:"isolate"`
+	GitCommit         bool    `json:"git_commit"`
+	Web               bool    `json:"web"`
+	Browser           bool    `json:"browser"`
+	SearchURL         string  `json:"search_url"`
+	ApprovalMode      string  `json:"approval_mode"`
+	BudgetTokens      int     `json:"budget_tokens"`
+	RequestTimeoutSec int     `json:"request_timeout_sec"`
+	MaxCost           float64 `json:"max_cost"`
+	MaxRetries        int     `json:"max_retries"`
+	MaxDepth          int     `json:"max_depth"`
+	MaxSubtasks       int     `json:"max_subtasks"`
+	MaxStall          int     `json:"max_stall"`
+	MaxTokens         int     `json:"max_tokens"`
+	Temperature       float64 `json:"temperature"`
+	AgentMode         string  `json:"agent_mode"`
 }
 
 const maxLogPageLines = 2000
@@ -171,6 +172,9 @@ func (s *Server) configFromParams(p sessionParams) agent.Config {
 	}
 	if cfg.AgentLoop == agent.AgentLoopDirect {
 		cfg.NativeTools = true
+	}
+	if p.RequestTimeoutSec > 0 {
+		cfg.RequestTimeout = time.Duration(p.RequestTimeoutSec) * time.Second
 	}
 	if p.BudgetTokens > 0 {
 		cfg.BudgetTokens = p.BudgetTokens

@@ -57,16 +57,20 @@ type PendingSteer struct {
 // ConversationSettings are the knobs reused on every turn in a conversation.
 // API keys must never appear here or in the conversation file.
 type ConversationSettings struct {
-	Model        string  `json:"model,omitempty"`
-	BaseURL      string  `json:"base_url,omitempty"`
-	Parallel     int     `json:"parallel,omitempty"`
-	Isolate      bool    `json:"isolate"`
-	GitCommit    bool    `json:"git_commit"`
-	Web          bool    `json:"web"`
-	Browser      bool    `json:"browser"`
-	ApprovalMode string  `json:"approval_mode,omitempty"`
-	BudgetTokens int     `json:"budget_tokens,omitempty"`
-	MaxCost      float64 `json:"max_cost,omitempty"`
+	Model        string `json:"model,omitempty"`
+	BaseURL      string `json:"base_url,omitempty"`
+	Parallel     int    `json:"parallel,omitempty"`
+	Isolate      bool   `json:"isolate"`
+	GitCommit    bool   `json:"git_commit"`
+	Web          bool   `json:"web"`
+	Browser      bool   `json:"browser"`
+	ApprovalMode string `json:"approval_mode,omitempty"`
+	BudgetTokens int    `json:"budget_tokens,omitempty"`
+	// RequestTimeoutSec bounds one model request (0 = engine default 120s).
+	// Slow local endpoints (big models to load, long generations) need more
+	// than the default.
+	RequestTimeoutSec int     `json:"request_timeout_sec,omitempty"`
+	MaxCost           float64 `json:"max_cost,omitempty"`
 	// AgentMode is "direct" (persistent tool loop) or "guided" (task tree).
 	// Empty is treated as guided so older conversation files stay compatible.
 	AgentMode string `json:"agent_mode,omitempty"`

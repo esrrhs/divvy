@@ -470,6 +470,7 @@ export function ConversationView() {
   const [settingsBusy, setSettingsBusy] = useState(false)
   const [modelDraft, setModelDraft] = useState('')
   const [baseDraft, setBaseDraft] = useState('')
+  const [timeoutDraft, setTimeoutDraft] = useState('')
   const [exporting, setExporting] = useState(false)
   const [askText, setAskText] = useState('')
   const [askBusy, setAskBusy] = useState(false)
@@ -907,6 +908,7 @@ export function ConversationView() {
               setSettingsOpen((o) => !o)
               setModelDraft(conv.settings.model ?? '')
               setBaseDraft(conv.settings.base_url ?? '')
+              setTimeoutDraft(conv.settings.request_timeout_sec ? String(conv.settings.request_timeout_sec) : '')
             }}
           >
             换模型
@@ -960,15 +962,27 @@ export function ConversationView() {
                   onChange={(e) => setBaseDraft(e.target.value)}
                 />
               </label>
+              <label className="flex items-center gap-1.5 text-[11px] text-slate-500">
+                单步超时(秒)
+                <input
+                  className="input w-20 py-1 font-mono text-[11.5px]"
+                  value={timeoutDraft}
+                  placeholder="120"
+                  onChange={(e) => setTimeoutDraft(e.target.value)}
+                />
+              </label>
               <button
                 type="button"
                 className="btn-primary px-2.5 py-1 text-[11px]"
-                disabled={settingsBusy || (!modelDraft.trim() && !baseDraft.trim())}
+                disabled={settingsBusy || (!modelDraft.trim() && !baseDraft.trim() && timeoutDraft.trim() === '')}
                 onClick={async () => {
                   setSettingsBusy(true)
+                  const t = timeoutDraft.trim()
+                  const num = t === '' ? undefined : Number(t)
                   const ok = await updateConversationSettings({
                     model: modelDraft.trim(),
                     base_url: baseDraft.trim(),
+                    ...(num != null && Number.isFinite(num) ? { request_timeout_sec: num } : {}),
                   })
                   setSettingsBusy(false)
                   if (ok) setSettingsOpen(false)

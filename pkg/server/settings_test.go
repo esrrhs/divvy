@@ -131,7 +131,10 @@ func TestConversationSettingsUpdate_Guards(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = h.Abort() }()
+	defer func() {
+		_ = h.Abort()
+		<-h.Done() // the aborted run still writes traces async; let it finish before TempDir cleanup
+	}()
 	c.CurrentSessionID = h.SessionID()
 	c.SessionIDs = append(c.SessionIDs, h.SessionID())
 	if err := saveConversation(data, c, nil); err != nil {
@@ -261,5 +264,75 @@ func TestConversationExport(t *testing.T) {
 	}
 	if strings.Contains(md, "⏪ 已恢复") {
 		t.Fatalf("model_switched mislabeled:\n%s", md)
+	}
+}
+
+// TestConversationSettingsUpdate_RequestTimeout covers the per-step model
+// request timeout knob: set, reset to default, and the nothing-to-update
+// refusal. Slow local endpoints (model loads, long generations) need more
+// than the built-in 120s — the web smoke run tripped it.
+func TestConversationSettingsUpdate_RequestTimeout(t *testing.T) {
+	data := t.TempDir()
+	m := agent.NewRunManager()
+	defer m.Shutdown(0)
+	s, err := New(m, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := newConversation(t.TempDir(), ConversationSettings{AgentMode: agent.AgentLoopDirect}, "timeout-knob")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.setAPIKey(c.ID, "test-key") // configForConversation refuses keyless remote models
+	if err := saveConversation(data, c, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Set to 300s.
+	if rec := postSettings(t, s, c.ID, `{"request_timeout_sec":300}`); rec.Code != http.StatusOK {
+		t.Fatalf("set timeout failed: %d %s", rec.Code, rec.Body.String())
+	}
+	latest, err := loadConversation(data, c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest.Settings.RequestTimeoutSec != 300 {
+		t.Fatalf("timeout not persisted: %+v", latest.Settings)
+	}
+
+	// The launch config honors it.
+	cfg, err := s.configForConversation(latest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RequestTimeout != 300*1000000000 {
+		t.Fatalf("launch config timeout = %v, want 300s", cfg.RequestTimeout)
+	}
+
+	// Reset to 0 → engine default again.
+	if rec := postSettings(t, s, c.ID, `{"request_timeout_sec":0}`); rec.Code != http.StatusOK {
+		t.Fatalf("reset failed: %d %s", rec.Code, rec.Body.String())
+	}
+	latest, err = loadConversation(data, c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest.Settings.RequestTimeoutSec != 0 {
+		t.Fatalf("reset not persisted: %+v", latest.Settings)
+	}
+	cfg, err = s.configForConversation(latest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RequestTimeout != agent.DefaultConfig().RequestTimeout {
+		t.Fatalf("reset config timeout = %v, want the engine default", cfg.RequestTimeout)
+	}
+
+	// Out of range / nothing-to-update refusals.
+	if rec := postSettings(t, s, c.ID, `{"request_timeout_sec":9999}`); rec.Code != http.StatusBadRequest {
+		t.Fatalf("over-range must 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if rec := postSettings(t, s, c.ID, `{}`); rec.Code != http.StatusBadRequest {
+		t.Fatalf("empty update must 400, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
