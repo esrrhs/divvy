@@ -34,6 +34,8 @@ import (
 	"time"
 
 	"github.com/wailsapp/wails/v2"
+	"github.com/wailsapp/wails/v2/pkg/menu"
+	menukeys "github.com/wailsapp/wails/v2/pkg/menu/keys"
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
 	"github.com/wailsapp/wails/v2/pkg/options/mac"
@@ -145,12 +147,35 @@ func runDesktop(cfg agent.Config, log *agent.Logger) error {
 	fmt.Printf("  data    %s\n", cfg.DataDir)
 	fmt.Printf("  backend %s (loopback; the window talks to it directly)\n", accessURL)
 
+	// App menu: File > 新建对话 (⌘N) creates a conversation in the default
+	// workdir through the loopback backend; the UI discovers it via its list
+	// refresh. The standard App/Edit/Window menus keep text-editing roles.
+	backendURL := accessURL
+	newConv := func(*menu.CallbackData) {
+		go func() {
+			body, _ := json.Marshal(map[string]any{
+				"workdir":  cfg.WorkDir,
+				"model":    cfg.Model,
+				"base_url": cfg.BaseURL,
+			})
+			resp, cerr := http.Post(backendURL+"/api/conversations", "application/json", bytes.NewReader(body))
+			if cerr != nil {
+				return
+			}
+			resp.Body.Close()
+		}()
+	}
+	fileSub := menu.NewMenu()
+	fileSub.Append(&menu.MenuItem{Label: "新建对话", Accelerator: menukeys.CmdOrCtrl("n"), Click: newConv})
+	fileItem := &menu.MenuItem{Label: "文件", Type: menu.SubmenuType, SubMenu: fileSub}
+
 	err = wails.Run(&options.App{
 		Title:     "divvy",
 		Width:     1440,
 		Height:    900,
 		MinWidth:  960,
 		MinHeight: 600,
+		Menu:      menu.NewMenuFromItems(menu.AppMenu(), fileItem, menu.EditMenu(), menu.WindowMenu()),
 		AssetServer: &assetserver.Options{
 			// Static files (web/dist) served by the asset server itself;
 			// /api + SSE hit the desktop middleware below. A Go-only build
