@@ -147,26 +147,13 @@ func runDesktop(cfg agent.Config, log *agent.Logger) error {
 	fmt.Printf("  data    %s\n", cfg.DataDir)
 	fmt.Printf("  backend %s (loopback; the window talks to it directly)\n", accessURL)
 
-	// App menu: File > 新建对话 (⌘N) creates a conversation in the default
-	// workdir through the loopback backend; the UI discovers it via its list
-	// refresh. The standard App/Edit/Window menus keep text-editing roles.
-	backendURL := accessURL
-	newConv := func(*menu.CallbackData) {
-		go func() {
-			body, _ := json.Marshal(map[string]any{
-				"workdir":  cfg.WorkDir,
-				"model":    cfg.Model,
-				"base_url": cfg.BaseURL,
-			})
-			resp, cerr := http.Post(backendURL+"/api/conversations", "application/json", bytes.NewReader(body))
-			if cerr != nil {
-				return
-			}
-			resp.Body.Close()
-		}()
-	}
+	shell.backendURL = accessURL
+	// App menu: File > 新建对话 (⌘N) creates a conversation in the project
+	// the window is showing (falls back to the launch workdir) through the
+	// loopback backend; the UI discovers it via its list refresh. The
+	// standard App/Edit/Window menus keep text-editing roles.
 	fileSub := menu.NewMenu()
-	fileSub.Append(&menu.MenuItem{Label: "新建对话", Accelerator: menukeys.CmdOrCtrl("n"), Click: newConv})
+	fileSub.Append(&menu.MenuItem{Label: "新建对话", Accelerator: menukeys.CmdOrCtrl("n"), Click: func(*menu.CallbackData) { go shell.newConversationFromMenu(cfg) }})
 	fileItem := &menu.MenuItem{Label: "文件", Type: menu.SubmenuType, SubMenu: fileSub}
 
 	err = wails.Run(&options.App{
@@ -228,6 +215,11 @@ type desktopShell struct {
 	proxy       http.Handler
 	dist        fs.FS
 	onFocus     func()
+	// backendURL is where menu actions POST (the shell's own loopback
+	// backend); lastWorkdir remembers the project of the conversation the
+	// window is showing, so 新建对话 lands in the same project.
+	backendURL  string
+	lastWorkdir string
 	framePath   string
 
 	mu        sync.Mutex
@@ -446,4 +438,27 @@ func (s *desktopShell) saveFrameFromWindow(c context.Context) {
 	if err := s.saveFrame(desktopFrame{X: x, Y: y, W: w, H: h}); err != nil {
 		fmt.Fprintf(os.Stderr, "desktop frame save: %v\n", err)
 	}
+}
+
+// newConversationFromMenu creates a conversation in the project the window
+// is currently showing (or the launch workdir), so the menu's 新建对话 lands
+// in the right place. Runs async; failures are silent — the menu item is a
+// convenience, not a contract.
+func (s *desktopShell) newConversationFromMenu(cfg agent.Config) {
+	workdir := cfg.WorkDir
+	s.mu.Lock()
+	if s.lastWorkdir != "" {
+		workdir = s.lastWorkdir
+	}
+	s.mu.Unlock()
+	body, _ := json.Marshal(map[string]any{
+		"workdir":  workdir,
+		"model":    cfg.Model,
+		"base_url": cfg.BaseURL,
+	})
+	resp, err := http.Post(s.backendURL+"/api/conversations", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	resp.Body.Close()
 }
