@@ -26,6 +26,28 @@ import type {
 // 10k-event NFR; the event stream itself stays complete on disk.
 const eventViewCap = 1000
 
+// The last conversation the user opened, persisted so the desktop app
+// reopens where they left off (Cursor's workspace restore). Cleared when
+// that conversation is deleted or the user closes it.
+const LAST_CONV_KEY = 'divvy.lastConv'
+
+export function rememberLastConv(id: string | null) {
+  try {
+    if (id) localStorage.setItem(LAST_CONV_KEY, id)
+    else localStorage.removeItem(LAST_CONV_KEY)
+  } catch {
+    // Private-mode storage: the restore simply won't happen.
+  }
+}
+
+export function storedLastConv(): string | null {
+  try {
+    return localStorage.getItem(LAST_CONV_KEY)
+  } catch {
+    return null
+  }
+}
+
 // aiEditAbort cancels the in-flight inline edit when the dialog closes or a
 // second generation starts. Kept outside the store: it is request-scoped state
 // that should never be rendered or persisted.
@@ -326,6 +348,7 @@ export const useStore = create<AppState>((set, get) => ({
     const cgen = beginConvNavigation(set, get, convId)
     if (!convId) {
       set({ currentConvId: null, conversation: null, pendingSelections: [] })
+      rememberLastConv(null)
       await get().openSession('', { convNavGen: cgen })
       return
     }
@@ -343,6 +366,7 @@ export const useStore = create<AppState>((set, get) => ({
         apiError: null,
         pendingSelections: selectionsFor(get().pendingSelectionsByConv, convId),
       })
+      rememberLastConv(convId)
       const lastSid = conversation.current_session_id || conversation.run_session_id || conversation.session_ids?.[conversation.session_ids.length - 1]
       if (lastSid) void get().loadTurnChanges(lastSid)
       const sid = conversation.current_session_id || conversation.run_session_id
@@ -669,6 +693,7 @@ export const useStore = create<AppState>((set, get) => ({
         pendingSelectionsByConv: byConv,
         pendingSelections: get().currentConvId === id ? [] : selectionsFor(byConv, get().currentConvId),
       })
+      rememberLastConv(null)
       if (get().currentConvId === id) {
         await get().openConversation('')
       }

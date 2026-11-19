@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useEffect, useRef } from 'react'
 import { CenterMain } from './components/CenterMain'
 import { RightPanel } from './components/RightPanel'
 import { Sidebar } from './components/Sidebar'
@@ -8,7 +8,7 @@ import { AiEditDialog } from './components/AiEditDialog'
 import { ActionToast } from './components/ActionToast'
 import { ErrorBoundary } from './components/ErrorBoundary'
 import { getToken } from './api/client'
-import { useStore } from './store'
+import { rememberLastConv, storedLastConv, useStore } from './store'
 
 export default function App() {
   const currentId = useStore((s) => s.currentId)
@@ -42,6 +42,36 @@ export default function App() {
     }, 5000)
     return () => clearInterval(t)
   }, [refreshSessions, refreshConversations])
+
+  // Desktop-app state restore: reopen the conversation the user had open
+  // last time, once, after the first list load. A stored id that no longer
+  // exists (deleted externally) is silently dropped; an explicit close
+  // cleared the key already.
+  const restoreTried = useRef(false)
+  const conversations = useStore((s) => s.conversations)
+  const conversationsLoading = useStore((s) => s.conversationsLoading)
+  const currentConvId = useStore((s) => s.currentConvId)
+  useEffect(() => {
+    if (restoreTried.current) return
+    if (currentConvId) {
+      restoreTried.current = true
+      return
+    }
+    if (conversationsLoading) return
+    const stored = storedLastConv()
+    if (!stored) {
+      restoreTried.current = true
+      return
+    }
+    restoreTried.current = true
+    if (conversations.some((c) => c.id === stored)) {
+      void openConversation(stored)
+    } else {
+      // The stored conversation is gone (deleted externally): drop the key
+      // so a later mount does not retry it.
+      rememberLastConv(null)
+    }
+  }, [conversationsLoading, conversations, currentConvId, openConversation])
 
   return (
     <ErrorBoundary>
