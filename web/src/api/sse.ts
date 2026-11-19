@@ -35,7 +35,13 @@ export class EventSourceClient {
     if (this.closedByUser) return
     this.handlers.onStatus?.('connecting')
     // The token rides in the query: EventSource cannot set Authorization.
-    const url = `/api/sessions/${encodeURIComponent(this.sessionId)}/events?token=${encodeURIComponent(this.token)}`
+    // Desktop shell: absolute loopback URL (SSE must ride the real HTTP
+    // server; the custom scheme buffers responses).
+    const apiBase =
+      typeof window !== 'undefined' && '__DIVVY_BACKEND_PORT' in window
+        ? `http://127.0.0.1:${(window as { __DIVVY_BACKEND_PORT?: number }).__DIVVY_BACKEND_PORT}`
+        : ''
+    const url = `${apiBase}/api/sessions/${encodeURIComponent(this.sessionId)}/events?token=${encodeURIComponent(this.token)}`
     const es = new EventSource(url)
     this.es = es
 

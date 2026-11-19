@@ -52,12 +52,20 @@ export class ApiError extends Error {
 
 let token = typeof window !== 'undefined' ? initToken() : ''
 
+// Desktop shell: the page loads from the wails:// scheme, so every dynamic
+// request must target the backend's loopback port, which the desktop wrapper
+// injects into the page. Empty in the browser (relative URLs as before).
+const API_BASE =
+  typeof window !== 'undefined' && '__DIVVY_BACKEND_PORT' in window
+    ? `http://127.0.0.1:${(window as { __DIVVY_BACKEND_PORT?: number }).__DIVVY_BACKEND_PORT}`
+    : ''
+
 export function getToken(): string {
   return token
 }
 
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
-  const res = await fetch(`/api${path}`, {
+  const res = await fetch(`${API_BASE}/api${path}`, {
     method,
     headers: {
       ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
