@@ -32,6 +32,7 @@ type Server struct {
 	dataDir string
 	workdir string
 	token   string
+	noAuth  bool
 	static  fs.FS
 
 	heartbeat time.Duration
@@ -61,6 +62,14 @@ type Option func(*Server)
 // WithToken pins the startup token instead of generating one (tests).
 func WithToken(token string) Option {
 	return func(s *Server) { s.token = token }
+}
+
+// WithNoAuth disables the /api token check. For the desktop shell: the
+// webview talks to the loopback listener through an in-process proxy with no
+// token to inject, and a desktop app running as the user has no stronger
+// attacker model than its own local processes.
+func WithNoAuth() Option {
+	return func(s *Server) { s.noAuth = true }
 }
 
 // WithHeartbeat overrides the SSE heartbeat interval (tests).
@@ -214,6 +223,13 @@ func hostAllowlist(host string) bool {
 
 func (s *Server) hostGuard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The desktop shell serves its own webview: the requests carry the
+		// webview's custom-scheme host, not a loopback one, and there is no
+		// third-party page to run a rebinding attack from.
+		if s.noAuth {
+			next.ServeHTTP(w, r)
+			return
+		}
 		if !hostAllowlist(r.Host) {
 			writeJSON(w, http.StatusForbidden, map[string]string{
 				"error": "forbidden host: this service only accepts loopback Host headers",
@@ -229,7 +245,7 @@ func (s *Server) hostGuard(next http.Handler) http.Handler {
 // in its first API calls instead).
 func (s *Server) tokenGuard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasPrefix(r.URL.Path, "/api/") {
+		if s.noAuth || !strings.HasPrefix(r.URL.Path, "/api/") {
 			next.ServeHTTP(w, r)
 			return
 		}

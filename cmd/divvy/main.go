@@ -84,6 +84,7 @@ func run(args []string) error {
 	pricing := fs.String("pricing", cfg.PricingJSON, "custom price table as JSON text or path to a JSON file ({\"model\":{\"input\":0.15,\"output\":0.6}} per 1M tokens)")
 	resume := fs.Bool("resume", false, "resume a previous session")
 	serve := fs.Bool("serve", false, "start the local web UI server (loopback HTTP + SSE) and open the browser")
+	app := fs.Bool("app", false, "run the web UI inside a native desktop window (no browser; macOS)")
 	port := fs.Int("port", 0, "with -serve: port to listen on (0 = pick a free port)")
 	noOpen := fs.Bool("no-open", false, "with -serve: do not open a browser automatically")
 	interactive := fs.Bool("interactive", false, "interactive REPL mode (multi-turn)")
@@ -195,6 +196,28 @@ func run(args []string) error {
 	}
 	if *solo && *plan {
 		return fmt.Errorf("-solo and -plan are mutually exclusive: -plan builds a task tree, -solo deliberately has none")
+	}
+
+	// No mode flags + an interactive terminal = the desktop app (the
+	// product's default face, like double-clicking Cursor). Scripts and
+	// pipes keep the CLI behavior.
+	if !*app && !*serve && !*interactive && !*guided && !*plan && !*resume && !*solo && !*listSessions && !*status && !*report && !*prune && !*showLog && !*showEvents {
+		if stat, serr := os.Stdout.Stat(); serr == nil && stat.Mode()&os.ModeCharDevice != 0 {
+			*app = true
+		}
+	}
+
+	if *app {
+		if *serve || *interactive || *guided || *plan || *resume {
+			return fmt.Errorf("-app is mutually exclusive with -serve/-interactive/-guided/-plan/-resume; drive runs from the desktop window instead")
+		}
+		if fs.NArg() > 0 {
+			return fmt.Errorf("-app takes no goal argument; create sessions in the desktop window")
+		}
+		if !desktopSupported() {
+			return fmt.Errorf("desktop mode is not available in this build; use -serve")
+		}
+		return runDesktop(cfg, log)
 	}
 
 	if *serve {
