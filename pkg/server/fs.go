@@ -279,9 +279,9 @@ func (s *Server) handleFSFile(w http.ResponseWriter, r *http.Request) {
 }
 
 type fsWriteRequest struct {
-	Path         string `json:"path"`
-	Content      string `json:"content"`
-	BaseHash     string `json:"base_hash"`
+	Path     string `json:"path"`
+	Content  string `json:"content"`
+	BaseHash string `json:"base_hash"`
 	// Create allows writing a file that does not exist yet (code-block
 	// "apply" from a model reply). Existing files always require the
 	// base_hash conflict check.
