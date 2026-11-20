@@ -421,7 +421,6 @@ export function FileViewer({ sessionId, path }: { sessionId: string | null; path
     // landed while watching — a typical one-edit turn) or grew. Both are the
     // ghost moment.
     if (seen !== null && seen === changeKey) return
-(fix(web): ghost 网关改为『被观看的 session』——脚本化端点实测暴露的时序洞)
     setShowDiff(true)
     requestAnimationFrame(() => {
       const el = diffScrollRef.current

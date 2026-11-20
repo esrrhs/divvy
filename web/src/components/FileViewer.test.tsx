@@ -383,14 +383,15 @@ describe('FileViewer ghost diff during a live run', () => {
     // No change yet: editor mode, and the ghost did not fire.
     expect(diffVisible()).toBe(false)
 
-    // First sight of a change: remember, but do not yank.
+    // The first edit landing mid-run IS the ghost moment — a typical turn
+    // makes exactly one edit, so "second version only" would never fire.
     await setChanges([{ path: FILE, status: 'modified', old_content: 'a', new_content: 'UNIQUE_V1' }])
     await act(async () => {
       await Promise.resolve()
     })
-    expect(diffVisible()).toBe(false)
+    expect(diffVisible()).toBe(true)
 
-    // The edit grows (second version): ghost diff surfaces, live run.
+    // It grows: still the diff.
     await setChanges([{ path: FILE, status: 'modified', old_content: 'a', new_content: 'UNIQUE_V2' }])
     await act(async () => {
       await Promise.resolve()
